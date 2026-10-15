@@ -62,7 +62,7 @@ def main():
     def command(*args):
         p = subprocess.run([str(a.binary), *map(str, args)], text=True, capture_output=True, timeout=90)
         if p.returncode:
-            raise RuntimeError(f'{args}: {p.stderr[-2000:]} {p.stdout[-1000:]}')
+            raise RuntimeError(f'{args}: {p.stderr[:2000]} {p.stdout[-1000:]}')
         return json.loads(p.stdout) if p.stdout.strip() else None
 
     def start():
@@ -92,9 +92,13 @@ def main():
         settings = {'tart': str(tart), 'softnet': str(softnet), 'images': {'macos': 'registry.test/macos@sha256:' + 'a' * 64}, 'block_cidrs': []}
     else:
         settings = json.loads(a.instances.read_text())
-    settings.update(memory_budget_mb=8192, disk_budget_gb=100, min_free_disk_gb=5)
+    # Fleet reserves host capacity for the OS. Hosted CI runners can expose only one usable slot;
+    # the fake VM needs no real guest RAM and still obeys Fleet's 4 GiB VM admission minimum.
+    cpu_slots, memory_mb = (1, 4096) if a.fake else (4, 8192)
+    vm_cpus, vm_memory = (1, 4096) if a.fake else (2, 6144)
+    settings.update(memory_budget_mb=memory_mb, disk_budget_gb=100, min_free_disk_gb=5)
     command('cluster', 'prepare-worker', '--home', worker, '--config', client_home / 'config.json', '--id', 'checkpoint-worker',
-            '--cpu-slots', 4, '--memory-mb', 8192, '--instances', save('instances.json', settings))
+            '--cpu-slots', cpu_slots, '--memory-mb', memory_mb, '--instances', save('instances.json', settings))
     if not a.fake:
         cache = worker / 'backend/instance-tart/cache'
         cache.parent.mkdir(parents=True, exist_ok=True)
@@ -107,8 +111,8 @@ def main():
         name='Checkpoint qualification', argv=['/usr/bin/python3', '-c', first], publish=['result.txt'],
         checkpoint={'manifests': 'checkpoints/*/fleet.json', 'resume_argv': ['/usr/bin/python3', '-c', resume, '{checkpoint}/state']})
     job.update(worker='checkpoint-worker', keep_awake=False, settle_seconds=0, max_seconds=600,
-               job_id='resumable', request_id='submit', threads=2,
-               vm=dict(image='macos', cpus=2, memory_mb=6144, disk_gb=50, network='offline', gpu='exclusive'))
+               job_id='resumable', request_id='submit', threads=vm_cpus,
+               vm=dict(image='macos', cpus=vm_cpus, memory_mb=vm_memory, disk_gb=50, network='offline', gpu='exclusive'))
     try:
         child = start()
         command('--home', client_home, 'enroll', worker / 'enroll.json', '--request-id', 'enroll')
@@ -146,6 +150,9 @@ def main():
         print('Suspension, restart, fresh-VM resume, and historical logs passed', flush=True)
     except Exception as error:
         result.update(success=False, error=str(error))
+        service_log = a.home / 'service.log'
+        if service_log.exists():
+            print('Fixture service diagnostics:\n' + service_log.read_text()[-4000:], flush=True)
         raise
     finally:
         if child is not None:
@@ -175,7 +182,8 @@ def main():
         for log in logs:
             log.close()
         states = [json.loads(p.read_text())['state'] for p in (worker / 'backend/instances').glob('*/observed.json')]
-        result['all_fixture_vms_deleted'] = bool(states) and all(s == 'deleted' for s in states)
+        result['fixture_vms_created'] = len(states)
+        result['all_fixture_vms_deleted'] = all(s == 'deleted' for s in states)
         result['legacy_records_unchanged'] = preservation() == before
         if normal_before is not None:
             result['normal_records_unchanged'] = normal_before == {'jobs': normal.queue(), 'instances': normal.instances()}

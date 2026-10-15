@@ -69,6 +69,9 @@ jobs:
           if [ -f /tmp/fleet-control-ci/qualification.json ]; then
             cp /tmp/fleet-control-ci/qualification.json ci-evidence/
           fi
+          if [ -f /tmp/fleet-control-checkpoint-ci/qualification.json ]; then
+            cp /tmp/fleet-control-checkpoint-ci/qualification.json ci-evidence/checkpoint-qualification.json
+          fi
           # Never upload fixture homes: they contain private identity keys and databases.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
