@@ -19,7 +19,9 @@ use std::{
     time::Duration,
 };
 
+mod checkpoints;
 mod observe;
+pub use checkpoints::{captured as captured_checkpoints, files_dir as checkpoint_files_dir};
 pub use observe::{Progress, output_revision};
 
 pub const MAX_INPUTS: usize = 128;
@@ -275,6 +277,9 @@ impl Runner {
         self.save()
     }
     fn check(&self) -> Result<()> {
+        if self.dir.join("suspend.json").exists() {
+            bail!("VM job suspended at its verified checkpoint");
+        }
         if self.dir.join("cancel").exists() {
             bail!("VM job cancelled");
         }
@@ -341,6 +346,7 @@ impl Runner {
             }
             if id == "execute" && last_observation.elapsed() >= Duration::from_secs(5) {
                 self.observe(false)?;
+                self.capture_checkpoints()?;
                 last_observation = std::time::Instant::now();
             }
             let i = instances::info(&self.home, &self.status.instance)?;
@@ -474,6 +480,7 @@ impl Runner {
         }
         self.phase(Phase::Collecting)?;
         self.observe(true)?;
+        self.capture_checkpoints()?;
         Ok(Exit {
             code: Some(code),
             signal: None,
@@ -534,6 +541,17 @@ impl Runner {
         let inputs = self.dir.join("vm-inputs");
         if inputs.exists() {
             fs::remove_dir_all(inputs)?;
+        }
+        let checkpoints = self.dir.join("checkpoints");
+        if checkpoints.exists() {
+            for entry in fs::read_dir(checkpoints)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir()
+                    && entry.file_name().to_string_lossy().starts_with("pending-")
+                {
+                    fs::remove_dir_all(entry.path())?;
+                }
+            }
         }
         if let Some(error) = &self.status.error {
             let diagnostic = format!("\nfleet: {error}\n");
@@ -630,6 +648,7 @@ pub fn run(dir: &Path) -> Result<()> {
     if r.status.outcome.is_none() {
         let result = r.execute();
         let cancelled = dir.join("cancel").exists();
+        let suspended = dir.join("suspend.json").exists();
         let timed_out = r.status.phase == Phase::Executing
             && jobs::read_json::<u64>(&dir.join("vm-deadline.json"))?
                 .is_some_and(|d| jobs::now() >= d);
@@ -637,6 +656,8 @@ pub fn run(dir: &Path) -> Result<()> {
             Ok(mut exit) => {
                 if cancelled {
                     exit.reason = EndReason::Cancelled;
+                } else if suspended {
+                    exit.reason = EndReason::Suspended;
                 }
                 exit
             }
@@ -647,6 +668,8 @@ pub fn run(dir: &Path) -> Result<()> {
                     signal: None,
                     reason: if cancelled {
                         EndReason::Cancelled
+                    } else if suspended {
+                        EndReason::Suspended
                     } else if timed_out {
                         EndReason::TimeLimit
                     } else {

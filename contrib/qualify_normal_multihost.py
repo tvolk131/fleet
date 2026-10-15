@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Normal CLI/Python queue and service roles on three replicas, in fresh /tmp homes.
+"""Normal CLI/JSON queue and service roles on three replicas, in fresh /tmp homes.
 
 Uses the same guarded fixture transport as the lower-level failure qualification. No
 installed services, legacy state, host firewall or training configuration are modified.
@@ -14,7 +14,7 @@ from pathlib import Path
 import time
 
 from control_host_fixture import process_identity, validate_service
-from fleet import Fleet
+from cli_fixture import api_result
 from qualify_control_multihost import Host
 
 
@@ -124,7 +124,7 @@ def main():
     replicas, jobs, service_configs = {}, [], {}
     source = Path(__file__).resolve().parents[1]
     paths = sorted((source / 'src').rglob('*.rs')) + [source / p for p in (
-        'Cargo.toml', 'Cargo.lock', 'contrib/qualify_normal_multihost.py', 'contrib/control_host_fixture.py', 'contrib/fleet.py')]
+        'Cargo.toml', 'Cargo.lock', 'contrib/qualify_normal_multihost.py', 'contrib/control_host_fixture.py', 'contrib/cli_fixture.py')]
     result['source_sha256'] = {str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
 
     def normal(*args, **kwargs):
@@ -215,7 +215,9 @@ def main():
         return wait(lambda: normal('job', name), lambda v: v['phase'] == phase)
 
     def supervisor(h, name):
-        return h.read(f'worker/backend/jobs/exec-{name}/supervisor.json')
+        record = h.read(f'worker/backend/jobs/exec-{name}-a1/supervisor.json')
+        assert record, 'missing supervisor record for active attempt'
+        return record
 
     def fetch(name):
         normal('fetch', name, a.home / f'capture-{name}')
@@ -264,15 +266,16 @@ def main():
         submit(local, 'short', 1)
         job_phase('short', 'succeeded')
         fetch('short')
-        client_api = Fleet(client, local.spec['binary'])
-        python_job = client_api.submit('Python qualification canary', ['/bin/sh', '-c', 'echo python-once'], worker=local.spec['name'],
-                                      memory_mb=128, max_seconds=20, keep_awake=False, settle_seconds=0, job_id='python-canary', request_id='python-submit')
-        jobs.append((local, python_job))
-        job_phase(python_job, 'succeeded')
-        assert client_api.logs(python_job)['data'] == 'python-once\n'
+        api_result(local.spec['binary'], client, op='submit', id='json-canary', request_id='json-submit',
+                   worker=local.spec['name'], memory_mb=128,
+                   job={'name': 'JSON qualification canary', 'argv': ['/bin/sh', '-c', 'echo json-once'],
+                        'max_seconds': 20, 'keep_awake': False, 'settle_seconds': 0})
+        jobs.append((local, 'json-canary'))
+        job_phase('json-canary', 'succeeded')
+        assert api_result(local.spec['binary'], client, op='logs', id='json-canary')['Logs']['data'] == 'json-once\n'
         assert normal('retry', 'submit-short')['reply']['Accepted']['job'] == 'short'
         assert len([j for j in normal('queue') if j['id'] == 'short']) == 1
-        phase('normal_cli_python_queue_inputs_outputs_and_idempotent_retry')
+        phase('normal_cli_json_queue_inputs_outputs_and_idempotent_retry')
 
         # Queued dependency reserves no additional capacity on the occupied one-slot M1.
         submit(m1, 'dependent', 1, after=['continuity'])
@@ -353,7 +356,7 @@ def main():
             h.cli('cluster', 'rebind-worker', '--home', h.root / 'worker', '--manifest', h.root / 'recovery.json')
             h.spawn('worker-service', 'service', 'run', '--config', service_configs[h.spec['name'], 'worker-service'])
         wait(state, lambda v: len(v['recovery']['inventories']) == 2)
-        assert normal('job', 'forgotten')['assignment']['execution'] == 'exec-forgotten'
+        assert normal('job', 'forgotten')['assignment']['execution'] == 'exec-forgotten-a1'
         assert supervisor(local, 'forgotten') == forgotten and supervisor(m1, 'continuity') == original
         normal('resume-recovery', '--request-id', 'resume')
         for name in ['continuity', 'forgotten']:
@@ -381,7 +384,7 @@ def main():
         errors = []
         for h, name in jobs:
             try:
-                directory = f'worker/backend/jobs/exec-{name}'
+                directory = f'worker/backend/jobs/exec-{name}-a1'
                 if h.read(f'{directory}/job.json') and not h.read(f'{directory}/exit.json'):
                     h.write(f'{directory}/cancel', b'qualification cleanup\n', raw=True)
                     wait(lambda: h.read(f'{directory}/exit.json'), bool, seconds=20)

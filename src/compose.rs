@@ -131,6 +131,7 @@ pub fn job_from_command(cwd: &Path, command: &[String], extra: &[PathBuf]) -> Re
         None => program,
     };
     Ok(JobFile {
+        checkpoint: None,
         vm: None,
         name,
         argv,

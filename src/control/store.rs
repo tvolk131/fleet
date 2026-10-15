@@ -61,6 +61,77 @@ fn put<T: Serialize>(table: &mut redb::Table<&str, &[u8]>, key: &str, value: &T)
 }
 
 impl Store {
+    /// Convert an idle singleton at its applied boundary. Historical log bytes remain in the backup;
+    /// the new snapshot anchors the same term/index, identity, membership, receipts, and worker IDs.
+    pub(crate) fn upgrade_v5(db: &Database, path: &Path, preview: bool) -> Result<State> {
+        let tx = db.begin_read()?;
+        let table = tx.open_table(META)?;
+        let identity: (u32, String, u64) =
+            read(&table, "identity")?.context("missing controller identity")?;
+        if identity.0 == FORMAT {
+            return read(&table, "state")?.context("missing state");
+        }
+        ensure!(identity.0 == 5, "unsupported source format");
+        let state = super::upgrade::state(read(&table, "state")?.context("missing state")?)?;
+        let applied = state
+            .last_applied
+            .context("controller has never applied a committed state")?;
+        ensure!(
+            state.cluster == identity.1
+                && state.membership.voter_ids().collect::<Vec<_>>() == vec![identity.2],
+            "upgrade requires the surviving sole voter"
+        );
+        let committed: Option<LogId<u64>> =
+            read::<Option<LogId<u64>>>(&table, "committed")?.flatten();
+        ensure!(
+            committed.is_none_or(|c| c.index <= applied.index),
+            "apply committed entries with the old binary before upgrade"
+        );
+        let logs = tx.open_table(LOG)?;
+        ensure!(
+            logs.last()?
+                .is_none_or(|(index, _)| index.value() <= applied.index),
+            "unapplied log suffix; let the old singleton settle before upgrading"
+        );
+        let data = serde_json::to_vec(&state)?;
+        ensure!(
+            data.len() <= MAX_SNAPSHOT,
+            "upgraded metadata exceeds snapshot limit"
+        );
+        if preview {
+            return Ok(state);
+        }
+        drop(logs);
+        drop(table);
+        drop(tx);
+        super::upgrade::backup(path)?;
+        let hash = snapshot_id(&data);
+        let mut tx = db.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        {
+            let mut meta = tx.open_table(META)?;
+            put(&mut meta, "identity", &(FORMAT, identity.1, identity.2))?;
+            put(&mut meta, "state", &state)?;
+            put(
+                &mut meta,
+                "snapshot",
+                &SavedSnapshot {
+                    meta: SnapshotMeta {
+                        last_log_id: Some(applied),
+                        last_membership: state.membership.clone(),
+                        snapshot_id: hash.clone(),
+                    },
+                    hash,
+                    data,
+                },
+            )?;
+            put(&mut meta, "purged", &applied)?;
+            put(&mut meta, "committed", &Some(applied))?;
+        }
+        tx.open_table(LOG)?.retain(|_, _| false)?;
+        tx.commit()?;
+        Ok(state)
+    }
     /// Acquire redb's exclusive process lock without creating or initializing a missing source.
     /// Only the applied image is exported; a locally present log suffix is not proof of commit.
     pub fn recovery_source(path: &Path, cluster: &str, node: u64, backup: &Path) -> Result<State> {
@@ -115,8 +186,8 @@ impl Store {
         .await
     }
 
-    /// The lab stores a bounded, whole metadata image transactionally. Production table/index
-    /// layout is deliberately deferred until the persistence and replication contract is qualified.
+    /// State and request receipts share one transaction. A future table/index layout can change
+    /// this storage detail without changing deterministic command application.
     pub fn open(path: &Path, cluster: &str, node: u64) -> Result<Self> {
         ensure!(!cluster.is_empty(), "empty cluster ID");
         if let Some(parent) = path.parent() {

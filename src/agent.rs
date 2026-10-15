@@ -860,7 +860,10 @@ async fn watch(home: PathBuf, events: Arc<EventLog>, store: Store, origins: Orig
             {
                 stopping.insert(job.id.clone());
             }
-            if job.state == State::Suspended && states.get(&job.id) != Some(&job.state) {
+            if job.state == State::Suspended
+                && job.vm.is_none()
+                && states.get(&job.id) != Some(&job.state)
+            {
                 // A continuation needs the checkpoint by hash: record it before the state is reported.
                 if let Err(e) = record_checkpoint(&home, &job.id, &store).await {
                     tracing::warn!(job = %job.id, "recording the checkpoint failed: {e:#}");

@@ -117,32 +117,6 @@ includes sparse capacity. Allocated bytes come from per-file filesystem block co
 blocks, so summing them is neither unique physical usage nor reclaimable space. The scanner skips symlinks and
 has entry/time limits. It performs no deletion, capacity changes, or cache pruning.
 
-## Python client
-
-`contrib/fleet.py` uses the same local coordinator socket as the CLI. Guest methods require an explicit operation
-ID so callers can persist it before sending a request:
-
-```python
-from fleet import Fleet
-f = Fleet()
-f.instance_ready("m4pro", "devbox", wait=True)
-f.instance_upload("m4pro", "devbox", "./program", "/Users/admin/work/program", operation="upload-program")
-assert f.instance_wait("m4pro", "devbox", "upload-program")["state"] == "succeeded"
-f.instance_exec("m4pro", "devbox", ["/Users/admin/work/program"],
-                operation="run-program", cwd="/Users/admin/work", timeout_seconds=600)
-result = f.instance_wait("m4pro", "devbox", "run-program",
-                         on_output=lambda stderr, data: print(data.decode(errors="replace"), end=""))
-assert result["state"] == "succeeded", result
-f.instance_download("m4pro", "devbox", "/Users/admin/work/result.json", "./result.json",
-                    operation="capture-result")
-```
-
-`instance_wait` returns failed/interrupted records as well as successes; inspect `state` and `exit_code`.
-Its client timeout does not cancel execution. `instance_logs` returns `(bytes, next, done)`; use an incremental
-text decoder when preserving split characters matters. Reconnect through `instance_operation`, `instance_wait`
-and `instance_fetch`. Inventory/lifecycle methods are `instances`, `instance`, `instance_create`, `instance_set`.
-`instance_operations` returns summaries; `instance_storage` returns the storage report.
-
 The local daemon adds `instance_guest`, `instance_upload` and `instance_download`. The remote authenticated
 protocol adds `InstanceGuest`, gated at minor 5. The coordinator stages/fetches blobs, the worker validates
 ownership and VM revision, and the detached supervisor drives Tart. Neither the native job scheduler nor Tart

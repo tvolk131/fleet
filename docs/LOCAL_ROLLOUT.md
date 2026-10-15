@@ -28,7 +28,7 @@ them. This does not install system boot services. The persistent M4 system daemo
 is qualified separately.
 
 The suite uses separate identities, redb databases, worker homes and loopback
-ports. It covers CLI/Python submission, verified inputs and outputs, dependency
+ports. It covers CLI/JSON submission, verified inputs and outputs, dependency
 cancellation, duplicate retry, leader and combined-service loss, replica rotation,
 three-to-one-to-three membership, quorum outage, lost-quorum recovery, client
 authority safeguards, worker inventory reconciliation, and cold restart of the
@@ -39,7 +39,7 @@ no ML training, host firewall change, or adoption of existing jobs.
 
 The workflow runs on Linux and macOS using the pinned Rust toolchain and locked
 dependencies. It runs the Rust suite (including simulated Tart backend contracts
-and headless Material 3 GUI tests), Clippy, Python clients and fixture safeguards,
+and headless Material 3 GUI tests), Clippy, JSON CLI contracts and fixture safeguards,
 then the three-process local scenarios above. Actions are pinned to immutable
 commits and receive read-only repository permissions. Artifacts contain only test
 logs and the qualification summary, never private keys or complete fixture homes.

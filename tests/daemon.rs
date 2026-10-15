@@ -149,6 +149,7 @@ impl Fleet {
 
     fn job(&self, name: &str, script: &str) -> JobFile {
         JobFile {
+            checkpoint: None,
             vm: None,
             name: name.into(),
             argv: vec!["/bin/sh".into(), "-c".into(), script.into()],

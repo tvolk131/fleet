@@ -77,7 +77,9 @@ enum Message {
     Requires(String),
     Submit,
     Cancel(String, u64),
-    Instance(String, u64, crate::control::workload::Desired),
+    Suspend(String, u64, String),
+    Resume(String, u64),
+    Instance(String, u64, crate::control::workload::InstanceDesired),
     Fetch,
     Retry,
     Acted(Result<Value, String>),
@@ -180,8 +182,17 @@ impl App {
                                 .as_array()
                                 .cloned()
                                 .unwrap_or_default();
-                            let log = if let Some(id) = &selected {
+                            // Pin the log read to the attempt in this queue snapshot. A resume can
+                            // commit between these requests; never mix its log with the old offset.
+                            let attempt = jobs
+                                .iter()
+                                .find(|j| j["id"].as_str() == selected.as_deref())
+                                .and_then(|j| j.pointer("/assignment/attempt/number"))
+                                .and_then(Value::as_u64)
+                                .and_then(|n| u32::try_from(n).ok());
+                            let log = if let (Some(id), Some(attempt)) = (&selected, attempt) {
                                 c.execute(ApiRequest::Logs {
+                                    attempt: Some(attempt),
                                     id: id.clone(),
                                     stderr,
                                     from,
@@ -236,10 +247,23 @@ impl App {
                     Err(e) => self.error = Some(e),
                     Ok(r) => {
                         self.error = None;
+                        let selected_execution = |jobs: &[Value]| {
+                            jobs.iter()
+                                .find(|j| j["id"].as_str() == self.selected.as_deref())
+                                .and_then(|j| j.pointer("/assignment/execution"))
+                                .cloned()
+                        };
+                        let attempt_changed =
+                            selected_execution(&self.jobs) != selected_execution(&r.jobs);
+                        if attempt_changed {
+                            self.log.clear();
+                            self.log_next = 0;
+                        }
                         self.jobs = r.jobs;
                         self.workers = r.workers;
                         self.instances = r.instances;
-                        if r.selected == self.selected
+                        if !attempt_changed
+                            && r.selected == self.selected
                             && r.stderr == self.stderr
                             && let Some(l) = r.log.and_then(|v| v.get("Logs").cloned())
                         {
@@ -325,6 +349,21 @@ impl App {
                     expected_revision: revision,
                 });
             }
+            Message::Suspend(job, revision, checkpoint) => {
+                return self.act(ApiRequest::Suspend {
+                    request_id: id(),
+                    id: job,
+                    expected_revision: revision,
+                    checkpoint,
+                });
+            }
+            Message::Resume(job, revision) => {
+                return self.act(ApiRequest::Resume {
+                    request_id: id(),
+                    id: job,
+                    expected_revision: revision,
+                });
+            }
             Message::Instance(instance, revision, desired) => {
                 return self.act(ApiRequest::InstanceSet {
                     request_id: id(),
@@ -336,6 +375,7 @@ impl App {
             Message::Fetch => {
                 if let Some(id) = &self.selected {
                     return self.act(ApiRequest::Fetch {
+                        attempt: None,
                         id: id.clone(),
                         destination: PathBuf::from(&self.destination),
                     });
@@ -519,8 +559,50 @@ impl App {
                         )),
                 );
             }
+            if phase == "suspended" {
+                heading = heading.push(
+                    button("Resume")
+                        .variant(ButtonVariant::Tonal)
+                        .size(ButtonSize::Small)
+                        .disabled(self.acting)
+                        .on_press(Message::Resume(
+                            id.into(),
+                            j["revision"].as_u64().unwrap_or(0),
+                        )),
+                );
+            } else if phase == "running"
+                && let Some(checkpoint) = j.pointer("/latest_checkpoint/id").and_then(Value::as_str)
+            {
+                heading = heading.push(
+                    button("Suspend at saved checkpoint")
+                        .variant(ButtonVariant::Tonal)
+                        .size(ButtonSize::Small)
+                        .disabled(self.acting)
+                        .on_press(Message::Suspend(
+                            id.into(),
+                            j["revision"].as_u64().unwrap_or(0),
+                            checkpoint.into(),
+                        )),
+                );
+            }
             let mut card =
                 column![heading, typography(id, TypeScale::BodySmall).style(muted)].spacing(8);
+            if let Some(attempt) = j
+                .pointer("/assignment/attempt/number")
+                .and_then(Value::as_u64)
+            {
+                card = card.push(
+                    typography(format!("Attempt {attempt}"), TypeScale::BodySmall).style(muted),
+                );
+            }
+            if let Some(cp) = j.get("latest_checkpoint").filter(|v| !v.is_null()) {
+                let position = cp
+                    .pointer("/content/manifest/position")
+                    .and_then(Value::as_u64)
+                    .map(|p| format!(" at position {p}"))
+                    .unwrap_or_default();
+                card = card.push(typography(format!("Verified checkpoint{position}, stored on this worker. Suspending discards work after it."), TypeScale::BodySmall).style(muted));
+            }
             if let Some(worker) = j.pointer("/assignment/worker").and_then(Value::as_str) {
                 card = card.push(
                     typography(format!("Worker: {worker}"), TypeScale::BodySmall).style(muted),
@@ -618,7 +700,7 @@ impl App {
             for vm in &self.instances {
                 let id = vm["id"].as_str().unwrap_or("");
                 let rev = vm["revision"].as_u64().unwrap_or(0);
-                use crate::control::workload::Desired;
+                use crate::control::workload::InstanceDesired;
                 let action = |label, desired| {
                     button(label)
                         .variant(ButtonVariant::Tonal)
@@ -632,14 +714,14 @@ impl App {
                             format!(
                                 "{id} · {} · desired {}",
                                 vm["worker"].as_str().unwrap_or("unknown"),
-                                vm["desired"].as_str().unwrap_or("unknown")
+                                vm["desired"]["Instance"].as_str().unwrap_or("unknown")
                             ),
                             TypeScale::BodyMedium
                         )
                         .width(Length::Fill),
-                        action("Start", Desired::Running),
-                        action("Stop", Desired::Stopped),
-                        action("Delete", Desired::Deleted).variant(ButtonVariant::Outlined),
+                        action("Start", InstanceDesired::Running),
+                        action("Stop", InstanceDesired::Stopped),
+                        action("Delete", InstanceDesired::Deleted).variant(ButtonVariant::Outlined),
                     ]
                     .spacing(12)
                     .align_y(Alignment::Center),
@@ -825,6 +907,54 @@ mod tests {
                     .any(|m| matches!(m, Message::Stderr(true)))
             );
         }
+    }
+    #[test]
+    fn checkpoint_actions_and_attempt_log_reset() {
+        let mut app = sample();
+        app.jobs[0]["latest_checkpoint"] =
+            json!({"id":"saved-point","content":{"manifest":{"position":48}}});
+        app.jobs[0]["assignment"]["attempt"] = json!({"number":1});
+        app.selected = Some("training".into());
+        let mut ui = simulator(&app);
+        ui.click("Suspend at saved checkpoint").unwrap();
+        assert!(ui.into_messages().any(
+            |m| matches!(m, Message::Suspend(id,2,cp) if id=="training" && cp=="saved-point")
+        ));
+        for (phase, filename) in [
+            ("running", "checkpoint-running"),
+            ("suspended", "checkpoint-suspended"),
+        ] {
+            app.jobs[0]["phase"] = json!(phase);
+            let snapshot = simulator(&app).snapshot(&app.theme()).unwrap();
+            if let Some(dir) = std::env::var_os("FLEET_GUI_PREVIEW") {
+                assert!(
+                    snapshot
+                        .matches_image(PathBuf::from(dir).join(filename))
+                        .unwrap()
+                );
+            }
+        }
+        let mut ui = simulator(&app);
+        ui.click("Resume").unwrap();
+        assert!(
+            ui.into_messages()
+                .any(|m| matches!(m, Message::Resume(id,2) if id=="training"))
+        );
+        app.log = "old-attempt".into();
+        app.log_next = 11;
+        let mut jobs = app.jobs.clone();
+        jobs[0]["assignment"]["execution"] = json!("exec-training-a2");
+        let _ = app.update(Message::Refreshed(Ok(Refresh {
+            jobs,
+            workers: vec![],
+            instances: vec![],
+            selected: Some("training".into()),
+            stderr: false,
+            log: Some(json!({"Logs":{"data":"wrong-offset","next":20}})),
+            events: vec![],
+        })));
+        assert!(app.log.is_empty());
+        assert_eq!(app.log_next, 0);
     }
     fn simulator(app: &App) -> iced_test::Simulator<'_, Message, Theme> {
         iced_test::Simulator::with_size(

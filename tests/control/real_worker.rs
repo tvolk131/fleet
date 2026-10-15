@@ -26,7 +26,7 @@ fn hello() -> proto::Hello {
 fn job(script: &str) -> jobs::JobSpec {
     serde_json::from_value(serde_json::json!({"name":"control canary", "argv":["/bin/sh", "-c", script], "threads":1, "keep_awake":false, "max_seconds":30, "shutdown_grace_seconds":0, "settle_seconds":0, "publish":["result.txt"]})).unwrap()
 }
-fn workload(script: &str) -> Workload {
+pub(super) fn workload(script: &str) -> Workload {
     Workload::Job {
         spec: Box::new(job(script)),
         gpu: false,
@@ -144,7 +144,12 @@ async fn wait(c: &mut Cluster, w: &mut Worker, id: &str, wanted: WorkPhase) -> A
     let end = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
         w.tick().await.unwrap();
-        let a = c.client.read(WAIT).await.unwrap().assignments[id].clone();
+        let state = c.client.read(WAIT).await.unwrap();
+        let a = state
+            .current_attempt(id)
+            .or_else(|| state.assignments.get(id))
+            .unwrap()
+            .clone();
         if a.observed
             .as_ref()
             .is_some_and(|(r, o)| *r == a.revision && o.phase == wanted)
@@ -221,7 +226,13 @@ async fn native_worker_survives_lost_reply_restart_and_replica_replacement() {
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let reply = c.client.write(request.clone(), WAIT).await.unwrap();
     assert_eq!(c.client.write(request, WAIT).await.unwrap(), reply);
-    wait(&mut c, &mut w, "native", WorkPhase::Running).await;
+    wait(
+        &mut c,
+        &mut w,
+        "native",
+        WorkPhase::Job(AttemptPhase::Running),
+    )
+    .await;
     let started: jobs::Started =
         jobs::read_json(&home.join("backend/jobs/exec-native/supervisor.json"))
             .unwrap()
@@ -264,7 +275,13 @@ async fn native_worker_survives_lost_reply_restart_and_replica_replacement() {
         .shutdown()
         .await
         .unwrap();
-    wait(&mut c, &mut w, "native", WorkPhase::Running).await;
+    wait(
+        &mut c,
+        &mut w,
+        "native",
+        WorkPhase::Job(AttemptPhase::Running),
+    )
+    .await;
     let after: jobs::Started =
         jobs::read_json(&home.join("backend/jobs/exec-native/supervisor.json"))
             .unwrap()
@@ -273,8 +290,14 @@ async fn native_worker_survives_lost_reply_restart_and_replica_replacement() {
     assert!(!w.client.peers.contains_key(&leader));
     let request = c.membership_request("shrink", 2, &[4]);
     c.changed(request).await;
-    desire(&mut c, "native", 1, Desired::Cancelled).await;
-    wait(&mut c, &mut w, "native", WorkPhase::Cancelled).await;
+    desire(&mut c, "native", 1, Desired::Job(JobDesired::Cancelled)).await;
+    wait(
+        &mut c,
+        &mut w,
+        "native",
+        WorkPhase::Job(AttemptPhase::Cancelled),
+    )
+    .await;
     assert_eq!(
         std::fs::read_to_string(home.join("backend/jobs/exec-native/stdout.log")).unwrap(),
         "started\n"
@@ -298,7 +321,13 @@ async fn worker_outage_keeps_work_and_journal_then_recovers_without_rerun() {
         )
         .await
         .unwrap();
-    wait(&mut c, &mut w, "outage", WorkPhase::Running).await;
+    wait(
+        &mut c,
+        &mut w,
+        "outage",
+        WorkPhase::Job(AttemptPhase::Running),
+    )
+    .await;
     c.replicas.remove(&1).unwrap().shutdown().await.unwrap();
     w.tick().await.unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -312,7 +341,13 @@ async fn worker_outage_keeps_work_and_journal_then_recovers_without_rerun() {
     w.shutdown().await.unwrap();
     c.start(1).await;
     let mut w = Worker::start(&home, config, hello()).await.unwrap();
-    wait(&mut c, &mut w, "outage", WorkPhase::Succeeded).await;
+    wait(
+        &mut c,
+        &mut w,
+        "outage",
+        WorkPhase::Job(AttemptPhase::Succeeded),
+    )
+    .await;
     assert_eq!(
         std::fs::read_to_string(home.join("backend/jobs/exec-outage/stdout.log")).unwrap(),
         "once\n"
@@ -349,8 +384,14 @@ async fn worker_cancellation_before_inputs_and_uncertain_launch_hold_reservation
         .await
         .unwrap();
     w.tick().await.unwrap();
-    desire(&mut c, "pending", 1, Desired::Cancelled).await;
-    wait(&mut c, &mut w, "pending", WorkPhase::Cancelled).await;
+    desire(&mut c, "pending", 1, Desired::Job(JobDesired::Cancelled)).await;
+    wait(
+        &mut c,
+        &mut w,
+        "pending",
+        WorkPhase::Job(AttemptPhase::Cancelled),
+    )
+    .await;
     assert!(!home.join("backend/jobs/exec-pending/job.json").exists());
     let mut spec = job("echo must-not-run > result.txt");
     spec.threads = 4;
@@ -383,7 +424,13 @@ async fn worker_cancellation_before_inputs_and_uncertain_launch_hold_reservation
     .unwrap();
     instances::write(&dir.join("gpu-allocation.json"), &false).unwrap();
     instances::write(&dir.join("launch-attempt.json"), &jobs::now()).unwrap();
-    wait(&mut c, &mut w, "uncertain", WorkPhase::Uncertain).await;
+    wait(
+        &mut c,
+        &mut w,
+        "uncertain",
+        WorkPhase::Job(AttemptPhase::Uncertain),
+    )
+    .await;
     assert!(matches!(
         c.client
             .write(assign("blocked", workload("true")), WAIT)
@@ -393,7 +440,13 @@ async fn worker_cancellation_before_inputs_and_uncertain_launch_hold_reservation
     ));
     w.shutdown().await.unwrap();
     let mut w = Worker::start(&home, config, hello()).await.unwrap();
-    wait(&mut c, &mut w, "uncertain", WorkPhase::Uncertain).await;
+    wait(
+        &mut c,
+        &mut w,
+        "uncertain",
+        WorkPhase::Job(AttemptPhase::Uncertain),
+    )
+    .await;
     assert!(!dir.join("work/result.txt").exists());
     w.shutdown().await.unwrap();
     c.close().await;
@@ -469,13 +522,25 @@ async fn tart_job_and_persistent_instances_use_replicated_intent_and_shared_budg
         Reply::Rejected { .. }
     ));
     for id in ["one", "two"] {
-        wait(&mut c, &mut w, id, WorkPhase::Running).await;
+        wait(
+            &mut c,
+            &mut w,
+            id,
+            WorkPhase::Instance(InstancePhase::Running),
+        )
+        .await;
     }
     w.shutdown().await.unwrap();
     let mut w = Worker::start(&home, config.clone(), hello()).await.unwrap();
     for id in ["one", "two"] {
-        desire(&mut c, id, 1, Desired::Deleted).await;
-        wait(&mut c, &mut w, id, WorkPhase::Deleted).await;
+        desire(&mut c, id, 1, Desired::Instance(InstanceDesired::Deleted)).await;
+        wait(
+            &mut c,
+            &mut w,
+            id,
+            WorkPhase::Instance(InstancePhase::Deleted),
+        )
+        .await;
     }
     let mut spec = job("echo vm-output > result.txt; echo guest-log");
     spec.vm = Some(vm_spec());
@@ -494,7 +559,13 @@ async fn tart_job_and_persistent_instances_use_replicated_intent_and_shared_budg
         )
         .await
         .unwrap();
-    wait(&mut c, &mut w, "vm-job", WorkPhase::Succeeded).await;
+    wait(
+        &mut c,
+        &mut w,
+        "vm-job",
+        WorkPhase::Job(AttemptPhase::Succeeded),
+    )
+    .await;
     let store = fleet::blobs::open(&c.home.0.join("capture-store"))
         .await
         .unwrap();
@@ -567,7 +638,7 @@ async fn worker_process_sigkill_preserves_supervisor_and_durable_cancellation() 
     let before: jobs::Started = jobs::read_json(&path).unwrap().unwrap();
     child.0.kill().unwrap();
     child.0.wait().unwrap();
-    desire(&mut c, "process", 1, Desired::Cancelled).await;
+    desire(&mut c, "process", 1, Desired::Job(JobDesired::Cancelled)).await;
     let restarted = start();
     let end = tokio::time::Instant::now() + WAIT;
     loop {
@@ -575,7 +646,7 @@ async fn worker_process_sigkill_preserves_supervisor_and_durable_cancellation() 
         if state.assignments["process"]
             .observed
             .as_ref()
-            .is_some_and(|(_, o)| o.phase == WorkPhase::Cancelled)
+            .is_some_and(|(_, o)| o.phase == WorkPhase::Job(AttemptPhase::Cancelled))
         {
             break;
         }
@@ -659,7 +730,7 @@ async fn admission_and_observations_reject_conflicts_gaps_and_stale_release() {
         assignment: "a".into(),
         revision: 1,
         observation: Observation {
-            phase: WorkPhase::Stopped,
+            phase: WorkPhase::Instance(InstancePhase::Stopped),
             detail: None,
         },
     };
@@ -694,7 +765,7 @@ async fn admission_and_observations_reject_conflicts_gaps_and_stale_release() {
         Mutation::Desire {
             id: "a".into(),
             expected_revision: 1,
-            desired: Desired::Stopped,
+            desired: Desired::Instance(InstanceDesired::Stopped),
         },
     );
     let mut large = job("true");
@@ -749,14 +820,14 @@ async fn admission_and_observations_reject_conflicts_gaps_and_stale_release() {
             Mutation::Desire {
                 id: "a".into(),
                 expected_revision: 2,
-                desired: Desired::Deleted
+                desired: Desired::Instance(InstanceDesired::Deleted)
             }
         ),
         Reply::Accepted { .. }
     ));
     report.sequence = 3;
     report.revision = 3;
-    report.observation.phase = WorkPhase::Deleted;
+    report.observation.phase = WorkPhase::Instance(InstancePhase::Deleted);
     assert_eq!(
         apply(
             &mut state,
@@ -767,7 +838,7 @@ async fn admission_and_observations_reject_conflicts_gaps_and_stale_release() {
     );
     report.sequence = 4;
     report.revision = 1;
-    report.observation.phase = WorkPhase::Running;
+    report.observation.phase = WorkPhase::Instance(InstancePhase::Running);
     assert_eq!(
         apply(&mut state, &principal, Mutation::WorkerReport(report)),
         Reply::Recorded
@@ -809,10 +880,16 @@ async fn published_native_job_without_launch_is_recovered_exactly_once() {
     )
     .unwrap();
     instances::write(&dir.join("gpu-allocation.json"), &false).unwrap();
-    wait(&mut c, &mut w, "gap", WorkPhase::Running).await;
+    wait(&mut c, &mut w, "gap", WorkPhase::Job(AttemptPhase::Running)).await;
     fleet::vm_job::launch(&dir, &w.config.supervisor).unwrap();
     fleet::vm_job::launch(&dir, &w.config.supervisor).unwrap();
-    wait(&mut c, &mut w, "gap", WorkPhase::Succeeded).await;
+    wait(
+        &mut c,
+        &mut w,
+        "gap",
+        WorkPhase::Job(AttemptPhase::Succeeded),
+    )
+    .await;
     let started = jobs::read_json::<jobs::Started>(&dir.join("supervisor.json"))
         .unwrap()
         .unwrap();
@@ -837,7 +914,13 @@ async fn missing_backend_or_worker_journal_cannot_reexecute_an_accepted_job() {
         .write(assign("lost-records", workload("echo once; sleep 2")), WAIT)
         .await
         .unwrap();
-    wait(&mut c, &mut w, "lost-records", WorkPhase::Running).await;
+    wait(
+        &mut c,
+        &mut w,
+        "lost-records",
+        WorkPhase::Job(AttemptPhase::Running),
+    )
+    .await;
     w.shutdown().await.unwrap();
     let dir = home.join("backend/jobs/exec-lost-records");
     let end = tokio::time::Instant::now() + WAIT;
@@ -848,7 +931,13 @@ async fn missing_backend_or_worker_journal_cannot_reexecute_an_accepted_job() {
     // Simulate lost backend records after side effects but before a terminal journal observation.
     std::fs::rename(&dir, home.join("lost-backend-records")).unwrap();
     let mut w = Worker::start(&home, config.clone(), hello()).await.unwrap();
-    wait(&mut c, &mut w, "lost-records", WorkPhase::Uncertain).await;
+    wait(
+        &mut c,
+        &mut w,
+        "lost-records",
+        WorkPhase::Job(AttemptPhase::Uncertain),
+    )
+    .await;
     assert!(!dir.exists());
     w.shutdown().await.unwrap();
     std::fs::rename(home.join("worker.redb"), home.join("saved-worker.redb")).unwrap();
@@ -896,7 +985,7 @@ async fn queued_native_jobs_schedule_once_and_dependencies_wait_for_success() {
         let state = c.client.read(WAIT).await.unwrap();
         if state
             .assignments
-            .get("second")
+            .get("second-a1")
             .is_some_and(|a| a.terminal())
         {
             break;
@@ -906,7 +995,7 @@ async fn queued_native_jobs_schedule_once_and_dependencies_wait_for_success() {
     }
     for id in ["first", "second"] {
         assert_eq!(
-            std::fs::read_to_string(home.join(format!("backend/jobs/exec-{id}/stdout.log")))
+            std::fs::read_to_string(home.join(format!("backend/jobs/exec-{id}-a1/stdout.log")))
                 .unwrap(),
             "started-once\n"
         );
@@ -914,3 +1003,9 @@ async fn queued_native_jobs_schedule_once_and_dependencies_wait_for_success() {
     w.shutdown().await.unwrap();
     c.close().await;
 }
+
+#[path = "checkpoints.rs"]
+mod checkpoints;
+
+#[path = "upgrade.rs"]
+mod upgrade;

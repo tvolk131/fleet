@@ -101,7 +101,7 @@ def wait_phase(name, phase, seconds=150):
     while time.monotonic() < end:
         state = read()
         item = state['assignments'].get(name)
-        if item and item['observed'] and item['observed'][0] == item['revision'] and item['observed'][1]['phase'] == phase:
+        if item and item['observed'] and item['observed'][0] == item['revision'] and item['observed'][1]['phase'] == {('Instance' if 'Instance' in item['workload'] else 'Job'): phase}:
             print(f'{name}: {phase}', flush=True)
             return item
         time.sleep(.5)
@@ -156,7 +156,7 @@ try:
     spawn('worker', 'serve', '--home', cluster / f'node-{leader}', '--config', cluster / f'node-{leader}/config.json', '--worker-home', worker_home)
     result['combined_mode_recovery'] = True
     wait_phase('vm-canary', 'Running')
-    request('cancel-vm', {'Desire': {'id': 'vm-canary', 'expected_revision': 1, 'desired': 'Cancelled'}})
+    request('cancel-vm', {'Desire': {'id': 'vm-canary', 'expected_revision': 1, 'desired': {'Job': 'Cancelled'}}})
     wait_phase('vm-canary', 'Cancelled')
     final_logs = data('logs', {'Logs': {'execution': 'exec-vm-canary', 'stderr': False, 'from': 0, 'max': 524288}})
     assert final_logs['Logs']['data'].count('started-once') == 1, final_logs
@@ -164,9 +164,9 @@ try:
     # Persistent instance lifecycle uses the same replicated worker path.
     request('create-instance', {'Assign': {'id': 'persistent', 'execution': 'exec-persistent', 'worker': 'canary', 'workload': {'Instance': {'spec': vm}}}})
     wait_phase('persistent', 'Running')
-    request('stop-instance', {'Desire': {'id': 'persistent', 'expected_revision': 1, 'desired': 'Stopped'}})
+    request('stop-instance', {'Desire': {'id': 'persistent', 'expected_revision': 1, 'desired': {'Instance': 'Stopped'}}})
     wait_phase('persistent', 'Stopped')
-    request('delete-instance', {'Desire': {'id': 'persistent', 'expected_revision': 2, 'desired': 'Deleted'}})
+    request('delete-instance', {'Desire': {'id': 'persistent', 'expected_revision': 2, 'desired': {'Instance': 'Deleted'}}})
     wait_phase('persistent', 'Deleted')
     result['persistent_instance_lifecycle'] = True
     result['state'] = read()
@@ -177,11 +177,12 @@ finally:
     try:
         state = read()
         for name, item in state['assignments'].items():
-            phase = item['observed'][1]['phase'] if item['observed'] else None
+            kind = 'Instance' if 'Instance' in item['workload'] else 'Job'
+            phase = item['observed'][1]['phase'][kind] if item['observed'] else None
             target = 'Deleted' if 'Instance' in item['workload'] else 'Cancelled'
             if phase not in ('Deleted', 'Succeeded', 'Failed', 'Cancelled'):
-                if item['desired'] != target:
-                    request(f'cleanup-{name}', {'Desire': {'id': name, 'expected_revision': item['revision'], 'desired': target}})
+                if item['desired'] != {kind: target}:
+                    request(f'cleanup-{name}', {'Desire': {'id': name, 'expected_revision': item['revision'], 'desired': {kind: target}}})
                 wait_phase(name, target)
     finally:
         for child in children.values():

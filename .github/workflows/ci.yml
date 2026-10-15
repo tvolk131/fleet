@@ -47,11 +47,15 @@ jobs:
         run: cargo fmt --all --check
       - name: Build normal and historical regression clients
         run: cargo build --all-features --bins --locked
+      - name: Checkpoint JSON CLI lifecycle with isolated Tart test backend
+        run: |
+          python3 contrib/qualify_checkpoint_tart.py --fake --binary "$PWD/target/debug/fleet" \
+            --home /tmp/fleet-control-checkpoint-ci 2>&1 | tee checkpoint-client.log
       - name: Rust tests (including Raft, redb, workers, and headless M3 GUI)
         run: cargo test --all-features --locked --no-fail-fast -- --test-threads=2 2>&1 | tee rust-tests.log
       - name: Clippy
         run: cargo clippy --all-features --all-targets --locked -- -D warnings
-      - name: Python clients and fixture safeguards
+      - name: JSON CLI contracts and fixture safeguards
         run: python3 -m unittest discover -s contrib -p 'test_*.py' -v 2>&1 | tee python-tests.log
       - name: Three-replica CLI/service failure scenarios
         run: |
@@ -64,6 +68,9 @@ jobs:
           cp *.log ci-evidence/ 2>/dev/null || true
           if [ -f /tmp/fleet-control-ci/qualification.json ]; then
             cp /tmp/fleet-control-ci/qualification.json ci-evidence/
+          fi
+          if [ -f /tmp/fleet-control-checkpoint-ci/qualification.json ]; then
+            cp /tmp/fleet-control-checkpoint-ci/qualification.json ci-evidence/checkpoint-qualification.json
           fi
           # Never upload fixture homes: they contain private identity keys and databases.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

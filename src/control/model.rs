@@ -20,7 +20,7 @@ pub struct Command {
     pub request: Request,
 }
 
-/// Lab commands intentionally use explicit placement; production scheduling is a later milestone.
+/// Deterministic application commands. External effects are reconciled by workers after commit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Mutation {
     Enqueue(super::queue::Submission),
@@ -60,41 +60,25 @@ pub enum Mutation {
         desired: super::workload::Desired,
     },
     WorkerReport(super::workload::Report),
+    CheckpointReady(super::checkpoint::Ready),
+    SuspendJob {
+        id: String,
+        expected_revision: u64,
+        checkpoint: String,
+    },
+    ResumeJob {
+        id: String,
+        expected_revision: u64,
+    },
     /// Prepare a durable, serialized administrative transition; completion is observed separately.
     ChangeMembership {
         expected_revision: u64,
         voters: BTreeMap<u64, Peer>,
     },
-    Submit {
-        job: String,
-        execution: String,
-        worker: String,
-        payload: String,
-    },
-    Cancel {
-        job: String,
-        expected_revision: u64,
-    },
     /// Release only this principal's full response. Its key and fingerprint remain reserved.
     Release {
         request_id: String,
     },
-    /// Only lab administrators can submit simulated worker reports.
-    Observe {
-        worker: String,
-        incarnation: String,
-        sequence: u64,
-        execution: String,
-        revision: u64,
-        phase: Phase,
-    },
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub enum Phase {
-    Running,
-    Cancelled,
-    Succeeded,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -119,26 +103,16 @@ impl Reply {
 pub struct Receipt {
     pub origin: String,
     pub fingerprint: String,
-    pub command: Option<Mutation>,
+    pub command: Option<serde_json::Value>,
     pub response: Option<Reply>,
     pub resource: Option<String>,
     pub index: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Job {
-    pub job: String,
-    pub execution: String,
-    pub worker: String,
-    pub payload: String,
-    pub revision: u64,
-    pub cancelled: bool,
-    pub observed: Option<(u64, Phase)>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct State {
-    pub queue: BTreeMap<String, super::queue::QueuedJob>,
+    pub jobs: BTreeMap<String, super::queue::Job>,
+    pub checkpoints: BTreeMap<String, super::checkpoint::Checkpoint>,
     pub drained: std::collections::BTreeSet<String>,
     pub recovery: Option<Box<super::recovery::Recovery>>,
     pub format: u32,
@@ -149,7 +123,6 @@ pub struct State {
     pub membership_operations: BTreeMap<String, MembershipOperation>,
     pub workers: BTreeMap<String, super::workload::Registration>,
     pub assignments: BTreeMap<String, super::workload::Assignment>,
-    pub jobs: BTreeMap<String, Job>,
     pub receipts: BTreeMap<String, Receipt>,
     pub cursors: BTreeMap<String, u64>,
 }
@@ -162,7 +135,8 @@ pub fn key(principal: &str, id: &str) -> String {
 impl State {
     pub fn new(cluster: String) -> Self {
         Self {
-            queue: BTreeMap::new(),
+            jobs: BTreeMap::new(),
+            checkpoints: BTreeMap::new(),
             drained: Default::default(),
             recovery: None,
             format: super::FORMAT,
@@ -173,7 +147,6 @@ impl State {
             membership_operations: BTreeMap::new(),
             workers: BTreeMap::new(),
             assignments: BTreeMap::new(),
-            jobs: BTreeMap::new(),
             receipts: BTreeMap::new(),
             cursors: BTreeMap::new(),
         }
@@ -212,7 +185,7 @@ impl State {
             Receipt {
                 origin: request.origin,
                 fingerprint,
-                command: Some(request.mutation),
+                command: Some(serde_json::to_value(request.mutation).expect("mutation serializes")),
                 response: Some(reply.clone()),
                 resource,
                 index,
@@ -228,16 +201,6 @@ impl State {
         mutation: &Mutation,
         index: u64,
     ) -> Reply {
-        if self.recovery.is_some()
-            && matches!(
-                mutation,
-                Mutation::Submit { .. } | Mutation::Cancel { .. } | Mutation::Observe { .. }
-            )
-        {
-            return Reply::rejected(
-                "simulated workloads require manual recovery; use real worker assignments",
-            );
-        }
         match mutation {
             Mutation::Enqueue(s) => self.enqueue(s, index),
             Mutation::Stage { id, worker } => self.stage_job(id, worker),
@@ -278,66 +241,20 @@ impl State {
                 desired,
             } => self.desire(id, *expected_revision, *desired),
             Mutation::WorkerReport(report) => self.report(principal, report),
+            Mutation::CheckpointReady(ready) => self.checkpoint_ready(principal, ready),
+            Mutation::SuspendJob {
+                id,
+                expected_revision,
+                checkpoint,
+            } => self.suspend_job(id, *expected_revision, checkpoint),
+            Mutation::ResumeJob {
+                id,
+                expected_revision,
+            } => self.resume_job(id, *expected_revision),
             Mutation::ChangeMembership {
                 expected_revision,
                 voters,
             } => self.prepare_membership(principal, request_id, *expected_revision, voters),
-            Mutation::Submit {
-                job,
-                execution,
-                worker,
-                payload,
-            } => {
-                if job.is_empty()
-                    || execution.is_empty()
-                    || worker.is_empty()
-                    || payload.len() > 4096
-                {
-                    return Reply::rejected(
-                        "nonempty IDs and payload of at most 4096 bytes required",
-                    );
-                }
-                if self.jobs.contains_key(job)
-                    || self.jobs.values().any(|j| &j.execution == execution)
-                {
-                    return Reply::rejected("job or execution ID already exists");
-                }
-                self.jobs.insert(
-                    job.clone(),
-                    Job {
-                        job: job.clone(),
-                        execution: execution.clone(),
-                        worker: worker.clone(),
-                        payload: payload.clone(),
-                        revision: 1,
-                        cancelled: false,
-                        observed: None,
-                    },
-                );
-                Reply::Accepted {
-                    job: job.clone(),
-                    revision: 1,
-                }
-            }
-            Mutation::Cancel {
-                job,
-                expected_revision,
-            } => {
-                let Some(j) = self.jobs.get_mut(job) else {
-                    return Reply::rejected("unknown job");
-                };
-                if j.revision != *expected_revision {
-                    return Reply::rejected("revision conflict");
-                }
-                if !j.cancelled {
-                    j.revision += 1;
-                    j.cancelled = true;
-                }
-                Reply::Accepted {
-                    job: job.clone(),
-                    revision: j.revision,
-                }
-            }
             Mutation::Release { request_id: target } => {
                 if target == request_id {
                     return Reply::rejected("cannot release this request itself");
@@ -347,43 +264,6 @@ impl State {
                 };
                 r.command = None;
                 r.response = None;
-                Reply::Recorded
-            }
-            Mutation::Observe {
-                worker,
-                incarnation,
-                sequence,
-                execution,
-                revision,
-                phase,
-            } => {
-                if incarnation.is_empty() {
-                    return Reply::rejected("missing journal incarnation");
-                }
-                let cursor_key = key(worker, incarnation);
-                let old = *self.cursors.get(&cursor_key).unwrap_or(&0);
-                if *sequence <= old {
-                    return Reply::Recorded;
-                }
-                if old.checked_add(1) != Some(*sequence) {
-                    return Reply::rejected("worker event gap");
-                }
-                let Some(j) = self
-                    .jobs
-                    .values_mut()
-                    .find(|j| &j.execution == execution && &j.worker == worker)
-                else {
-                    return Reply::rejected("unknown worker execution");
-                };
-                if *revision > j.revision {
-                    return Reply::rejected("observation ahead of desired revision");
-                }
-                let previous = j.observed;
-                let terminal = previous.is_some_and(|(_, p)| p != Phase::Running);
-                if !terminal && previous.is_none_or(|(r, _)| *revision >= r) {
-                    j.observed = Some((*revision, *phase));
-                }
-                self.cursors.insert(cursor_key, *sequence);
                 Reply::Recorded
             }
         }

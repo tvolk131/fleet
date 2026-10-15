@@ -1,5 +1,7 @@
 # Fleet distributed control plane design
 
+Current implementation: [normal clients/services](NORMAL_FLEET.md) and [logical jobs, attempts, checkpoints](CHECKPOINT_JOBS.md). The target-design history below predates those milestones.
+
 Target design, updated 2026-10-13. The first isolated implementation is described in
 [CONTROL_PLANE_LAB.md](CONTROL_PLANE_LAB.md), including its qualification and remaining work.
 The isolated [membership milestone](CONTROL_PLANE_MEMBERSHIP.md) implements replica replacement and
@@ -275,7 +277,7 @@ configured cluster is unreachable. The old in-process fallback is removed from t
 
 There is no SQLite importer, legacy protocol adapter, or live workload adoption in this milestone.
 The new client, control plane, and worker interfaces are versioned independently from the legacy
-protocol and reject legacy peers. CLI commands, GUI bindings, and Python callers are updated together;
+protocol and reject legacy peers. CLI commands, GUI bindings, and JSON callers are updated together;
 existing user scripts may require changes. New enrollment uses fresh cluster and worker state under
 separate directories and service configuration, so legacy files cannot be mistaken for new records.
 
@@ -326,5 +328,5 @@ The real-worker milestone now qualifies the isolated native/Tart integration thr
 and read-only data protocols, including combined-process operation. See
 [CONTROL_PLANE_WORKERS.md](CONTROL_PLANE_WORKERS.md) for the implemented surface, qualification, and limits.
 The next integration is implemented in [NORMAL_FLEET.md](NORMAL_FLEET.md): the durable queue, automatic
-placement, shared CLI/GUI/Python clients, and persistent service roles. Qualification and idle-worker
+placement, shared CLI/GUI clients, JSON automation, and persistent service roles. Qualification and idle-worker
 handoff are recorded separately from the earlier lab results. Blob lifecycle remains separate work.

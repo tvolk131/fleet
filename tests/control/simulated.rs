@@ -1,6 +1,9 @@
 //! A durable simulated worker. Effects are counters in redb, never processes or VMs.
-use super::model::{Job, Mutation, Phase};
 use anyhow::{Context, Result, ensure};
+use fleet::control::{
+    Mutation,
+    workload::{Assignment, AttemptPhase, Desired, JobDesired, Observation, Report, WorkPhase},
+};
 use redb::{Database, Durability, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
@@ -9,7 +12,7 @@ const DATA: TableDefinition<&str, &[u8]> = TableDefinition::new("simulated_worke
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Execution {
-    pub desired: Job,
+    pub desired: Assignment,
     pub starts: u64,
     pub event: Mutation,
 }
@@ -45,15 +48,17 @@ impl SimulatedWorker {
                 .transpose()?;
             if let Some(old) = old {
                 ensure!(
-                    old.format == super::FORMAT && old.cluster == cluster && old.worker == worker,
+                    old.format == fleet::control::FORMAT
+                        && old.cluster == cluster
+                        && old.worker == worker,
                     "worker identity mismatch"
                 );
             } else {
                 let state = WorkerState {
-                    format: super::FORMAT,
+                    format: fleet::control::FORMAT,
                     cluster: cluster.into(),
                     worker: worker.into(),
-                    incarnation: format!("{:032x}", rand::random::<u128>()),
+                    incarnation: "simulated-journal".into(),
                     sequence: 0,
                     executions: BTreeMap::new(),
                     events: Vec::new(),
@@ -65,7 +70,7 @@ impl SimulatedWorker {
         Ok(Self { db })
     }
 
-    pub fn ensure(&self, desired: &Job) -> Result<Execution> {
+    pub fn ensure(&self, desired: &Assignment) -> Result<Execution> {
         let mut tx = self.db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         let execution = {
@@ -77,34 +82,42 @@ impl SimulatedWorker {
             let old = state.executions.get(&desired.execution);
             if let Some(old) = old {
                 ensure!(
-                    old.desired.job == desired.job && old.desired.payload == desired.payload,
+                    old.desired.id == desired.id && old.desired.workload == desired.workload,
                     "execution contents conflict"
                 );
                 if desired.revision == old.desired.revision {
                     ensure!(
-                        desired.cancelled == old.desired.cancelled,
+                        desired.desired == old.desired.desired,
                         "revision contents conflict"
                     );
                     return Ok(old.clone());
                 }
-                if desired.revision < old.desired.revision || old.desired.cancelled {
+                if desired.revision < old.desired.revision
+                    || old.desired.desired == Desired::Job(JobDesired::Cancelled)
+                {
                     return Ok(old.clone());
                 }
             }
-            let starts = old.map_or(u64::from(!desired.cancelled), |o| o.starts);
+            let starts = old.map_or(
+                u64::from(desired.desired != Desired::Job(JobDesired::Cancelled)),
+                |o| o.starts,
+            );
             state.sequence += 1;
-            let event = Mutation::Observe {
+            let event = Mutation::WorkerReport(Report {
                 worker: state.worker.clone(),
                 incarnation: state.incarnation.clone(),
                 sequence: state.sequence,
-                execution: desired.execution.clone(),
+                assignment: desired.id.clone(),
                 revision: desired.revision,
-                phase: if desired.cancelled {
-                    Phase::Cancelled
-                } else {
-                    Phase::Running
+                observation: Observation {
+                    phase: if desired.desired == Desired::Job(JobDesired::Cancelled) {
+                        WorkPhase::Job(AttemptPhase::Cancelled)
+                    } else {
+                        WorkPhase::Job(AttemptPhase::Running)
+                    },
+                    detail: None,
                 },
-            };
+            });
             let execution = Execution {
                 desired: desired.clone(),
                 starts,

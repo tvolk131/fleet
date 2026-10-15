@@ -86,7 +86,7 @@ checkpoint transaction. A worker/disk loss can still lose bytes even when metada
 
 The library can query a known worker directly during a controller outage. The current `data`/`fetch` CLI
 first resolves the worker from a strong control-plane read, so those convenience commands require quorum.
-The normal CLI, Material 3 GUI and Python client expose the replicated queue through [NORMAL_FLEET.md](NORMAL_FLEET.md).
+The normal CLI, Material 3 GUI and JSON interface expose the replicated queue through [NORMAL_FLEET.md](NORMAL_FLEET.md).
 The legacy clients remain separate. All configured administrators can read worker
 outputs; per-user ACLs and reader-key rotation are not implemented.
 
@@ -177,6 +177,6 @@ VM jobs, captures live metrics/files, kills a replica leader and worker, cancels
 deletes a persistent instance. It cleans up only its own resources. It does not reserve capacity through a
 second coordinator; run it only with the physical machine idle and no legacy queue waiting to start.
 
-The normal queue uses storage/protocol format **5** (`fleet/control/5`); the read-only data ALPN is `fleet/worker-data/1`.
-Use fresh experimental homes. No format-1/2/3 importer, worker adoption, mixed-release rollout, power-failure
+The normal queue uses storage/protocol format **6** (`fleet/control/6`); the read-only data ALPN is `fleet/worker-data/1`.
+Use fresh homes or the [explicit idle format-5 upgrade](CHECKPOINT_JOBS.md#explicit-format-5-upgrade). No format-1/2/3 importer, worker adoption, mixed-release rollout, power-failure
 qualification, or production service cutover is included.

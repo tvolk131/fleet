@@ -29,6 +29,8 @@ pub struct JobSpec {
     /// Absent executes as a trusted native process; present provisions one disposable Tart VM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm: Option<crate::instances::Spec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<crate::checkpoint::Policy>,
     pub name: String,
     /// The command. A first element containing `/` is a path inside the working directory (for example
     /// `bin/dominion-ai-gpu`); otherwise it is looked up on the agent's `PATH`.
@@ -199,6 +201,12 @@ impl JobSpec {
         }
         if self.argv.is_empty() {
             bail!("a job needs a command");
+        }
+        if let Some(policy) = &self.checkpoint {
+            if self.vm.is_none() {
+                bail!("manifest checkpoints require a VM job");
+            }
+            policy.validate()?;
         }
         if let Some(vm) = &self.vm {
             crate::vm_job::validate(self, vm)?;

@@ -212,7 +212,7 @@ def main():
 
     def running(name):
         return wait(lambda s: s['assignments'][name]['observed'] and
-                    s['assignments'][name]['observed'][1]['phase'] == 'Running')
+                    s['assignments'][name]['observed'][1]['phase'] == {'Job': 'Running'})
 
     def supervisor(h, name):
         return h.read(f'worker/backend/jobs/exec-{name}/supervisor.json')
@@ -258,7 +258,7 @@ def main():
         running('continuity')
         original = supervisor(hosts[1], 'continuity')
         submit(local, 'short', 1)
-        wait(lambda s: s['assignments']['short']['observed'] and s['assignments']['short']['observed'][1]['phase'] == 'Succeeded')
+        wait(lambda s: s['assignments']['short']['observed'] and s['assignments']['short']['observed'][1]['phase'] == {'Job': 'Succeeded'})
         fetch('short')
         phase('native_workers_and_verified_cross_host_transfers')
 
@@ -280,7 +280,7 @@ def main():
         assert inspect(leader)['blocked_peers']
         isolated = local.cli('read', *creds, '--replica', leader, check=False)
         assert isolated.returncode != 0, 'minority served a strong read'
-        mutation = {'Submit': {'job': 'partition', 'execution': 'partition-exec', 'worker': 'simulated', 'payload': 'metadata canary'}}
+        mutation = {'Enqueue': {'id': 'partition', 'workload': {'Job': {'spec': {'name': 'metadata canary', 'argv': ['/bin/true'], 'threads': 1}, 'memory_mb': 128, 'gpu': False}}, 'worker': None, 'requires': ['qualification:never-schedule']}}
         failed = request('partition-write', mutation, check=False, replica=leader)
         assert failed.returncode != 0, 'minority acknowledged a mutation'
         assert 'partition' not in read()['jobs']
@@ -370,8 +370,8 @@ def main():
         phase('recovered_cluster_returns_to_three_physical_voters')
         for h, name in [(hosts[1], 'continuity'), (local, 'forgotten')]:
             revision = read()['assignments'][name]['revision']
-            request(f'cancel-{name}', {'Desire': {'id': name, 'expected_revision': revision, 'desired': 'Cancelled'}})
-            wait(lambda s: s['assignments'][name]['observed'][1]['phase'] == 'Cancelled')
+            request(f'cancel-{name}', {'Desire': {'id': name, 'expected_revision': revision, 'desired': {'Job': 'Cancelled'}}})
+            wait(lambda s: s['assignments'][name]['observed'][1]['phase'] == {'Job': 'Cancelled'})
             assert h.read(f'worker/backend/jobs/exec-{name}/stdout.log', raw=True) == b'started-once\n'
             fetch(name)
         phase('cancellation_and_verified_outputs_after_recovery')
@@ -381,7 +381,7 @@ def main():
         for i in [7, 8]:
             start(i)
         state = read()
-        assert all(state['assignments'][name]['observed'][1]['phase'] == 'Cancelled'
+        assert all(state['assignments'][name]['observed'][1]['phase'] == {'Job': 'Cancelled'}
                    for name in ['continuity', 'forgotten'])
         assert state['recovery']['manifest'] == manifest and state['recovery']['resumed']
         assert len(state['recovery']['inventories']) == 2

@@ -1,7 +1,7 @@
 use super::*;
 use fleet::control::recovery::{Manifest, accept_client, recover};
 
-async fn restore(c: &mut Cluster, source: u64, name: &str) -> (PathBuf, Manifest) {
+pub(super) async fn restore(c: &mut Cluster, source: u64, name: &str) -> (PathBuf, Manifest) {
     for (_, replica) in std::mem::take(&mut c.replicas) {
         replica.shutdown().await.unwrap();
     }
@@ -44,7 +44,7 @@ fn scoped(c: &Cluster, mut request: Request) -> Request {
     request.origin = c.config.cluster.clone();
     request
 }
-async fn resume(c: &mut Cluster, unavailable: &[&str]) {
+pub(super) async fn resume(c: &mut Cluster, unavailable: &[&str]) {
     let reply = c
         .client
         .write(
@@ -61,7 +61,7 @@ async fn resume(c: &mut Cluster, unavailable: &[&str]) {
         .unwrap();
     assert_eq!(reply, Reply::Recorded);
 }
-async fn reconciled(c: &mut Cluster, worker: &mut Worker) {
+pub(super) async fn reconciled(c: &mut Cluster, worker: &mut Worker) {
     for _ in 0..5 {
         worker.tick().await.unwrap();
         if !c
@@ -86,7 +86,13 @@ async fn recovery_imports_forgotten_running_native_work_and_fences_old_authority
     let mut worker = Worker::start(&home, config.clone(), hello()).await.unwrap();
     let known = assign("known", workload("echo known > result.txt"));
     let known_reply = c.client.write(known.clone(), WAIT).await.unwrap();
-    wait(&mut c, &mut worker, "known", WorkPhase::Succeeded).await;
+    wait(
+        &mut c,
+        &mut worker,
+        "known",
+        WorkPhase::Job(AttemptPhase::Succeeded),
+    )
+    .await;
     // Ensure the selected survivor contains both the receipt and enrollment, then let it fall behind.
     let end = tokio::time::Instant::now() + WAIT;
     while !c.replicas[&1]
@@ -107,7 +113,13 @@ async fn recovery_imports_forgotten_running_native_work_and_fences_old_authority
         workload("echo started-once; echo result > result.txt; sleep 25"),
     );
     c.client.write(missing.clone(), WAIT).await.unwrap();
-    wait(&mut c, &mut worker, "missing", WorkPhase::Running).await;
+    wait(
+        &mut c,
+        &mut worker,
+        "missing",
+        WorkPhase::Job(AttemptPhase::Running),
+    )
+    .await;
     let supervisor: jobs::Started =
         jobs::read_json(&home.join("backend/jobs/exec-missing/supervisor.json"))
             .unwrap()
@@ -201,14 +213,20 @@ async fn recovery_imports_forgotten_running_native_work_and_fences_old_authority
         mutation: Mutation::Desire {
             id: "missing".into(),
             expected_revision: 1,
-            desired: Desired::Cancelled,
+            desired: Desired::Job(JobDesired::Cancelled),
         },
     };
     assert!(matches!(
         c.client.write(cancel, WAIT).await.unwrap(),
         Reply::Accepted { .. }
     ));
-    wait(&mut c, &mut worker, "missing", WorkPhase::Cancelled).await;
+    wait(
+        &mut c,
+        &mut worker,
+        "missing",
+        WorkPhase::Job(AttemptPhase::Cancelled),
+    )
+    .await;
     // Forgetting the submission receipt remains an unknown outcome even after inventory import.
     assert!(matches!(
         c.client.write(missing, WAIT).await.unwrap(),
@@ -238,7 +256,13 @@ async fn recovery_holds_undelivered_vms_and_unavailable_workers() {
         )
         .await
         .unwrap();
-    wait(&mut c, &mut worker, "existing-vm", WorkPhase::Running).await;
+    wait(
+        &mut c,
+        &mut worker,
+        "existing-vm",
+        WorkPhase::Instance(InstancePhase::Running),
+    )
+    .await;
     // A committed assignment never reached the worker. Recovery must not blindly start it.
     c.client
         .write(
@@ -276,14 +300,20 @@ async fn recovery_holds_undelivered_vms_and_unavailable_workers() {
         mutation: Mutation::Desire {
             id: "undelivered".into(),
             expected_revision: 1,
-            desired: Desired::Deleted,
+            desired: Desired::Instance(InstanceDesired::Deleted),
         },
     };
     assert!(matches!(
         c.client.write(delete, WAIT).await.unwrap(),
         Reply::Accepted { .. }
     ));
-    wait(&mut c, &mut worker, "undelivered", WorkPhase::Deleted).await;
+    wait(
+        &mut c,
+        &mut worker,
+        "undelivered",
+        WorkPhase::Instance(InstancePhase::Deleted),
+    )
+    .await;
     let instance = scoped(
         &c,
         assign("fresh-vm", Workload::Instance { spec: vm_spec() }),
@@ -292,29 +322,47 @@ async fn recovery_holds_undelivered_vms_and_unavailable_workers() {
         c.client.write(instance, WAIT).await.unwrap(),
         Reply::Accepted { .. }
     ));
-    wait(&mut c, &mut worker, "fresh-vm", WorkPhase::Running).await;
+    wait(
+        &mut c,
+        &mut worker,
+        "fresh-vm",
+        WorkPhase::Instance(InstancePhase::Running),
+    )
+    .await;
     let delete = Request {
         origin: c.config.cluster.clone(),
         id: "delete-fresh".into(),
         mutation: Mutation::Desire {
             id: "fresh-vm".into(),
             expected_revision: 1,
-            desired: Desired::Deleted,
+            desired: Desired::Instance(InstanceDesired::Deleted),
         },
     };
     c.client.write(delete, WAIT).await.unwrap();
-    wait(&mut c, &mut worker, "fresh-vm", WorkPhase::Deleted).await;
+    wait(
+        &mut c,
+        &mut worker,
+        "fresh-vm",
+        WorkPhase::Instance(InstancePhase::Deleted),
+    )
+    .await;
     let delete = Request {
         origin: c.config.cluster.clone(),
         id: "delete-existing".into(),
         mutation: Mutation::Desire {
             id: "existing-vm".into(),
             expected_revision: 1,
-            desired: Desired::Deleted,
+            desired: Desired::Instance(InstanceDesired::Deleted),
         },
     };
     c.client.write(delete, WAIT).await.unwrap();
-    wait(&mut c, &mut worker, "existing-vm", WorkPhase::Deleted).await;
+    wait(
+        &mut c,
+        &mut worker,
+        "existing-vm",
+        WorkPhase::Instance(InstancePhase::Deleted),
+    )
+    .await;
     worker.shutdown().await.unwrap();
     c.close().await;
 }
@@ -455,6 +503,7 @@ async fn recovery_inventory_conflicts_are_atomic_and_old_receipts_remain_reserve
     let mut assignment = state.assignments["reserved"].clone();
     assignment.workload = workload("false");
     let inventory = Inventory {
+        checkpoints: BTreeMap::new(),
         held: BTreeSet::new(),
         registration: config.registration.clone(),
         sequence: 0,
@@ -610,11 +659,17 @@ async fn repeated_recovery_preserves_holds_and_repairs_interrupted_worker_rebind
         mutation: Mutation::Desire {
             id: "never-start".into(),
             expected_revision: 1,
-            desired: Desired::Cancelled,
+            desired: Desired::Job(JobDesired::Cancelled),
         },
     };
     c.client.write(cancel, WAIT).await.unwrap();
-    wait(&mut c, &mut worker, "never-start", WorkPhase::Cancelled).await;
+    wait(
+        &mut c,
+        &mut worker,
+        "never-start",
+        WorkPhase::Job(AttemptPhase::Cancelled),
+    )
+    .await;
     worker.shutdown().await.unwrap();
     c.close().await;
 }
@@ -680,7 +735,13 @@ async fn recovered_worker_does_not_start_accepted_pending_work_before_explicit_r
         "pause must survive restart"
     );
     resume(&mut c, &[]).await;
-    wait(&mut c, &mut worker, "pending", WorkPhase::Succeeded).await;
+    wait(
+        &mut c,
+        &mut worker,
+        "pending",
+        WorkPhase::Job(AttemptPhase::Succeeded),
+    )
+    .await;
     assert_eq!(
         std::fs::read_to_string(home.join("backend/jobs/exec-pending/stdout.log")).unwrap(),
         "started-once\n"
@@ -752,11 +813,17 @@ async fn recovery_startup_does_not_run_legacy_vm_repair_before_authorization() {
         mutation: Mutation::Desire {
             id: "reserved-vm-job".into(),
             expected_revision: 1,
-            desired: Desired::Cancelled,
+            desired: Desired::Job(JobDesired::Cancelled),
         },
     };
     c.client.write(cancel, WAIT).await.unwrap();
-    wait(&mut c, &mut worker, "reserved-vm-job", WorkPhase::Cancelled).await;
+    wait(
+        &mut c,
+        &mut worker,
+        "reserved-vm-job",
+        WorkPhase::Job(AttemptPhase::Cancelled),
+    )
+    .await;
     worker.shutdown().await.unwrap();
     c.close().await;
 }

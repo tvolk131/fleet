@@ -39,6 +39,8 @@ pub struct WorkerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JournalState {
     starts_allowed: bool,
+    checkpoints: BTreeMap<String, super::checkpoint::Checkpoint>,
+    known_checkpoints: BTreeSet<String>,
     format: u32,
     held: BTreeSet<String>,
     recovery_inventory: Option<super::recovery::Inventory>,
@@ -89,6 +91,8 @@ impl Journal {
                 );
                 let state = JournalState {
                     starts_allowed: true,
+                    checkpoints: BTreeMap::new(),
+                    known_checkpoints: BTreeSet::new(),
                     format: super::FORMAT,
                     held: BTreeSet::new(),
                     recovery_inventory: None,
@@ -148,21 +152,24 @@ impl Journal {
                     new.execution == old.execution
                         && new.worker == old.worker
                         && new.workload == old.workload
+                        && new.attempt == old.attempt
                         && new.revision >= old.revision,
                     "accepted assignment changed or regressed"
                 );
                 ensure!(
-                    new.revision != old.revision || new.desired == old.desired,
+                    new.revision != old.revision
+                        || (new.desired == old.desired
+                            && new.suspend_checkpoint == old.suspend_checkpoint),
                     "same revision changed intent"
                 );
             }
             for a in view.assignments {
                 ensure!(a.worker == s.registration.id, "wrong assigned worker");
-                instances::valid_id(&a.execution)?;
-                a.workload.validate(&s.registration)?;
+                a.validate(&s.registration)?;
                 s.assignments.insert(a.id.clone(), a);
             }
             ensure!(!view.recovery_required, "worker recovery has not committed");
+            s.known_checkpoints = view.checkpoints;
             s.held = view.held;
             s.starts_allowed = view.starts_allowed;
             s.recovery_inventory = None;
@@ -332,6 +339,40 @@ pub struct Worker {
 }
 
 impl Worker {
+    pub(crate) fn upgrade_v5(
+        db: &Database,
+        home: &Path,
+        expected: &super::State,
+        preview: bool,
+    ) -> Result<()> {
+        let tx = db.begin_read()?;
+        let table = tx.open_table(JOURNAL)?;
+        let raw: serde_json::Value =
+            serde_json::from_slice(table.get("state")?.context("missing worker state")?.value())?;
+        let already = raw["format"] == super::FORMAT;
+        let converted = super::upgrade::journal(raw)?;
+        let state: JournalState = serde_json::from_value(converted)?;
+        ensure!(
+            state.cluster == expected.cluster
+                && expected.workers.get(&state.registration.id) == Some(&state.registration),
+            "worker does not belong to this controller state"
+        );
+        if already {
+            return Ok(());
+        }
+        if preview {
+            return Ok(());
+        }
+        drop(table);
+        drop(tx);
+        super::upgrade::backup(&home.join("worker.redb"))?;
+        let mut tx = db.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        tx.open_table(JOURNAL)?
+            .insert("state", serde_json::to_vec(&state)?.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
     /// Preparation creates the journal before enrollment/start. A missing journal on a later
     /// startup is never treated as a fresh worker with the old incarnation.
     pub fn initialize(home: &Path, config: &WorkerConfig) -> Result<()> {
@@ -375,6 +416,7 @@ impl Worker {
                     }
                 }
                 s.recovery_inventory = Some(super::recovery::Inventory {
+                    checkpoints: s.checkpoints.clone(),
                     held: s.held.clone(),
                     registration: s.registration.clone(),
                     sequence: s.sequence,
@@ -526,6 +568,7 @@ impl Worker {
                                 }
                             }
                             s.recovery_inventory = Some(super::recovery::Inventory {
+                                checkpoints: s.checkpoints.clone(),
                                 held: s.held.clone(),
                                 registration: s.registration.clone(),
                                 sequence: s.sequence,
@@ -576,9 +619,7 @@ impl Worker {
             return Ok(());
         }
         for a in journal.assignments.values() {
-            if journal.held.contains(&a.id)
-                || (!journal.starts_allowed && a.desired == Desired::Running)
-            {
+            if journal.held.contains(&a.id) || (!journal.starts_allowed && a.desired.running()) {
                 // Detached supervisors continue; this agent cannot initiate new Running effects
                 // until it has durably observed the administrator's recovery resume.
                 continue;
@@ -586,13 +627,42 @@ impl Worker {
             let observation = match self.reconcile(a).await {
                 Ok(o) => o,
                 Err(e) => Observation {
-                    phase: WorkPhase::Pending,
+                    phase: a.workload.pending(),
                     detail: Some(format!("{e:#}").chars().take(1000).collect()),
                 },
             };
+            if let Err(e) = self.persist_checkpoints(a).await {
+                tracing::warn!(attempt=%a.id,error=%e,"checkpoint remains unavailable");
+            }
             self.journal.observe(a, observation)?;
         }
         if online {
+            let saved = self.journal.read()?;
+            for checkpoint in saved
+                .checkpoints
+                .values()
+                .filter(|c| !saved.known_checkpoints.contains(&c.id))
+            {
+                let reply = self
+                    .client
+                    .write(
+                        Request {
+                            origin: self.config.cluster.clone(),
+                            id: format!("checkpoint-{}", checkpoint.id),
+                            mutation: Mutation::CheckpointReady(super::checkpoint::Ready {
+                                incarnation: r.incarnation.clone(),
+                                checkpoint: checkpoint.clone(),
+                            }),
+                        },
+                        Duration::from_secs(2),
+                    )
+                    .await?;
+                ensure!(reply == Reply::Recorded, "checkpoint rejected: {reply:?}");
+                self.journal.change(|s| {
+                    s.known_checkpoints.insert(checkpoint.id.clone());
+                    Ok(())
+                })?;
+            }
             for report in self.journal.read()?.outbox.values().take(64) {
                 let reply = self
                     .client
@@ -614,20 +684,65 @@ impl Worker {
         Ok(())
     }
 
+    async fn persist_checkpoints(&self, a: &Assignment) -> Result<()> {
+        let Workload::Job { spec, .. } = &a.workload else {
+            return Ok(());
+        };
+        if spec.checkpoint.is_none() {
+            return Ok(());
+        }
+        let dir = jobs::jobs_dir(&self.home.join("backend")).join(&a.execution);
+        for content in vm_job::captured_checkpoints(&dir)? {
+            let checkpoint = super::checkpoint::Checkpoint::new(a, content)?;
+            checkpoint.validate(a)?;
+            if self
+                .journal
+                .read()?
+                .checkpoints
+                .contains_key(&checkpoint.id)
+            {
+                continue;
+            }
+            let root = vm_job::checkpoint_files_dir(&dir, &checkpoint.content.id)?;
+            for file in &checkpoint.content.files {
+                checkpoint.content.verify_file(&root, file)?;
+                let imported = self
+                    .store
+                    .blobs()
+                    .add_path(root.join(&file.path))
+                    .with_named_tag(format!("checkpoint/{}/{}", checkpoint.id, file.path))
+                    .await?;
+                ensure!(
+                    imported.hash == file.hash,
+                    "checkpoint import hash mismatch"
+                );
+            }
+            self.store.sync_db().await?;
+            self.journal.change(|s| {
+                s.checkpoints
+                    .insert(checkpoint.id.clone(), checkpoint.clone());
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
     async fn reconcile(&self, a: &Assignment) -> Result<Observation> {
         let home = self.home.join("backend");
         let owner = self.config.registration.peer.identity;
         let id = &a.execution;
         let journal = self.journal.read()?;
         if let Some((_, old)) = journal.observations.get(&a.id) {
-            let finished = match a.workload {
-                Workload::Job { .. } => matches!(
-                    old.phase,
-                    WorkPhase::Succeeded | WorkPhase::Failed | WorkPhase::Cancelled
-                ),
-                Workload::Instance { .. } => old.phase == WorkPhase::Deleted,
-            };
+            let finished = old.phase.terminal();
             if finished {
+                if old.phase == WorkPhase::Job(AttemptPhase::Suspended)
+                    && a.desired == Desired::Job(JobDesired::Cancelled)
+                {
+                    return Ok(Observation {
+                        phase: WorkPhase::Job(AttemptPhase::Cancelled),
+                        detail: None,
+                    });
+                }
                 return Ok(old.clone());
             }
         }
@@ -637,15 +752,36 @@ impl Worker {
                 let dir = jobs::jobs_dir(&home).join(id);
                 if attempted
                     && !dir.join("job.json").exists()
-                    && !(a.desired == Desired::Cancelled
+                    && !(a.desired == Desired::Job(JobDesired::Cancelled)
                         && spec.vm.is_some()
                         && instances::directory(&home, &vm_job::instance_id(id))?
                             .join("desired.json")
                             .exists())
                 {
-                    return Ok(Observation { phase: WorkPhase::Uncertain, detail: Some("backend records missing after an execution attempt; refusing to recreate work".into()) });
+                    return Ok(Observation { phase: WorkPhase::Job(AttemptPhase::Uncertain), detail: Some("backend records missing after an execution attempt; refusing to recreate work".into()) });
                 }
-                if a.desired == Desired::Cancelled {
+                if a.desired == Desired::Job(JobDesired::Suspended) {
+                    let checkpoint = a
+                        .suspend_checkpoint
+                        .as_ref()
+                        .context("suspension has no checkpoint")?;
+                    let c = journal
+                        .checkpoints
+                        .get(checkpoint)
+                        .context("verified checkpoint missing from worker journal")?;
+                    ensure!(
+                        c.attempt.as_ref() == a.id,
+                        "suspension checkpoint belongs to another attempt"
+                    );
+                    if !dir.join("exit.json").exists() && !dir.join("suspend.json").exists() {
+                        let root = vm_job::checkpoint_files_dir(&dir, &c.content.id)?;
+                        for file in &c.content.files {
+                            c.content.verify_file(&root, file)?;
+                        }
+                        instances::write(&dir.join("suspend.json"), checkpoint)?;
+                        instances::release_job(&home, id, instances::Desired::Stopped)?;
+                    }
+                } else if a.desired == Desired::Job(JobDesired::Cancelled) {
                     if spec.vm.is_some() {
                         self.agent
                             .handle(
@@ -658,7 +794,7 @@ impl Worker {
                             .await?;
                     } else if !dir.join("job.json").exists() {
                         return Ok(Observation {
-                            phase: WorkPhase::Cancelled,
+                            phase: WorkPhase::Job(AttemptPhase::Cancelled),
                             detail: None,
                         });
                     } else {
@@ -711,34 +847,47 @@ impl Worker {
                     && let Some(lock) = instances::try_lock(&dir.join("native-supervisor.lock"))?
                 {
                     if dir.join("launch-attempt.json").exists() {
-                        return Ok(Observation { phase: WorkPhase::Uncertain, detail: Some("supervisor ended without a durable exit; launch is not retried and reservation is retained".into()) });
+                        return Ok(Observation { phase: WorkPhase::Job(AttemptPhase::Uncertain), detail: Some("supervisor ended without a durable exit; launch is not retried and reservation is retained".into()) });
                     }
                     drop(lock);
                     vm_job::launch(&dir, &self.config.supervisor)?;
                 }
                 match jobs::info(&dir)?.state {
-                    jobs::State::Starting => WorkPhase::Pending,
-                    jobs::State::Running | jobs::State::Paused => WorkPhase::Running,
-                    jobs::State::Succeeded => WorkPhase::Succeeded,
-                    jobs::State::Cancelled => WorkPhase::Cancelled,
-                    jobs::State::Failed | jobs::State::TimedOut => WorkPhase::Failed,
-                    jobs::State::Lost | jobs::State::Suspended => WorkPhase::Uncertain,
+                    jobs::State::Starting => WorkPhase::Job(AttemptPhase::Pending),
+                    jobs::State::Running | jobs::State::Paused => {
+                        WorkPhase::Job(AttemptPhase::Running)
+                    }
+                    jobs::State::Succeeded => WorkPhase::Job(AttemptPhase::Succeeded),
+                    jobs::State::Cancelled => WorkPhase::Job(AttemptPhase::Cancelled),
+                    jobs::State::Failed | jobs::State::TimedOut => {
+                        WorkPhase::Job(AttemptPhase::Failed)
+                    }
+                    jobs::State::Suspended => {
+                        WorkPhase::Job(if a.desired == Desired::Job(JobDesired::Cancelled) {
+                            AttemptPhase::Cancelled
+                        } else {
+                            AttemptPhase::Suspended
+                        })
+                    }
+                    jobs::State::Lost => WorkPhase::Job(AttemptPhase::Uncertain),
                 }
             }
             Workload::Instance { spec } => {
                 let dir = instances::directory(&home, id)?;
                 if attempted && !dir.join("desired.json").exists() {
                     return Ok(Observation {
-                        phase: WorkPhase::Uncertain,
+                        phase: WorkPhase::Instance(InstancePhase::Uncertain),
                         detail: Some(
                             "VM records missing after a creation attempt; refusing to recreate it"
                                 .into(),
                         ),
                     });
                 }
-                if a.desired == Desired::Deleted && !dir.join("desired.json").exists() {
+                if a.desired == Desired::Instance(InstanceDesired::Deleted)
+                    && !dir.join("desired.json").exists()
+                {
                     return Ok(Observation {
-                        phase: WorkPhase::Deleted,
+                        phase: WorkPhase::Instance(InstancePhase::Deleted),
                         detail: None,
                     });
                 }
@@ -757,7 +906,7 @@ impl Worker {
                 }
                 created?;
                 let info = instances::info(&home, id)?;
-                if a.desired == Desired::Running
+                if a.desired == Desired::Instance(InstanceDesired::Running)
                     && info.record.desired == instances::Desired::Stopped
                     && info.observed.state == instances::State::Creating
                 {
@@ -765,21 +914,21 @@ impl Worker {
                     // Only the authorized reconciliation loop may launch that provisioning controller.
                     instances::ensure_controller(&home, id, &self.config.supervisor)?;
                     return Ok(Observation {
-                        phase: WorkPhase::Pending,
+                        phase: WorkPhase::Instance(InstancePhase::Pending),
                         detail: None,
                     });
                 }
                 let desired = match a.desired {
-                    Desired::Running => instances::Desired::Running,
-                    Desired::Stopped => instances::Desired::Stopped,
-                    Desired::Deleted
+                    Desired::Instance(InstanceDesired::Running) => instances::Desired::Running,
+                    Desired::Instance(InstanceDesired::Stopped) => instances::Desired::Stopped,
+                    Desired::Instance(InstanceDesired::Deleted)
                         if info.record.desired == instances::Desired::Deleted
                             || info.observed.state == instances::State::Stopped =>
                     {
                         instances::Desired::Deleted
                     }
-                    Desired::Deleted => instances::Desired::Stopped,
-                    Desired::Cancelled => bail!("invalid instance intent"),
+                    Desired::Instance(InstanceDesired::Deleted) => instances::Desired::Stopped,
+                    Desired::Job(_) => bail!("invalid instance intent"),
                 };
                 if info.record.desired != desired {
                     self.agent
@@ -797,26 +946,33 @@ impl Worker {
                 }
                 let info = instances::info(&home, id)?;
                 if info.record.revision != info.observed.revision {
-                    WorkPhase::Pending
+                    WorkPhase::Instance(InstancePhase::Pending)
                 } else {
                     match info.observed.state {
-                        instances::State::Running => WorkPhase::Running,
-                        instances::State::Stopped => WorkPhase::Stopped,
-                        instances::State::Deleted => WorkPhase::Deleted,
+                        instances::State::Running => WorkPhase::Instance(InstancePhase::Running),
+                        instances::State::Stopped => WorkPhase::Instance(InstancePhase::Stopped),
+                        instances::State::Deleted => WorkPhase::Instance(InstancePhase::Deleted),
                         instances::State::Unknown | instances::State::Failed => {
                             return Ok(Observation {
-                                phase: WorkPhase::Uncertain,
+                                phase: WorkPhase::Instance(InstancePhase::Uncertain),
                                 detail: info.observed.error,
                             });
                         }
-                        _ => WorkPhase::Pending,
+                        _ => WorkPhase::Instance(InstancePhase::Pending),
                     }
                 }
             }
         };
         Ok(Observation {
             phase,
-            detail: None,
+            detail: if matches!(a.workload, Workload::Job { .. }) {
+                jobs::read_json::<String>(
+                    &home.join("jobs").join(id).join("checkpoint-error.json"),
+                )?
+                .map(|error| format!("checkpoint capture: {error}"))
+            } else {
+                None
+            },
         })
     }
 
@@ -879,7 +1035,18 @@ pub async fn fetch_outputs(
     else {
         bail!("unexpected outputs response");
     };
-    for file in &files {
+    fetch_files(store, endpoint, worker, &files, destination).await?;
+    Ok(files)
+}
+
+pub async fn fetch_files(
+    store: &iroh_blobs::api::Store,
+    endpoint: &Endpoint,
+    worker: &Peer,
+    files: &[jobs::OutputFile],
+    destination: &Path,
+) -> Result<()> {
+    for file in files {
         jobs::safe_relative(&file.path)?;
     }
     // A fresh directory prevents overwriting prior captures or following pre-existing symlinks.
@@ -891,16 +1058,17 @@ pub async fn fetch_outputs(
         &files.iter().map(|f| f.hash).collect::<Vec<_>>(),
     )
     .await?;
-    for file in &files {
+    for file in files {
         let target = destination.join(&file.path);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
         store.blobs().export(file.hash, &target).await?;
         ensure!(
-            blobs::hash_file(&target)? == file.hash,
+            blobs::hash_file(&target)? == file.hash
+                && std::fs::metadata(&target)?.len() == file.size,
             "captured file hash mismatch"
         );
     }
-    Ok(files)
+    Ok(())
 }

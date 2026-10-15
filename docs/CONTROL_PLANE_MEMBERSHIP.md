@@ -5,8 +5,8 @@ The isolated `fleet-control-lab` now supports replacing replicas, expanding one 
 and request history survive these changes. This changes controller membership only; it neither moves
 workloads nor enrolls or removes real workers. Installed Fleet services and training runs are separate.
 
-Membership originally qualified format 2. The current executable uses queue/recovery format 5; use fresh
-homes, not databases from earlier prototype formats. The administrator allowlist remains explicit and static on each replica. This milestone
+Membership originally qualified format 2. The current executable uses queue/recovery format 6; use fresh
+homes or the [explicit idle format-5 upgrade](CHECKPOINT_JOBS.md#explicit-format-5-upgrade). The administrator allowlist remains explicit and static on each replica. This milestone
 does not introduce general ACL management, rolling upgrades, or production deployment.
 
 ## Contract

@@ -2199,7 +2199,7 @@ impl Core {
 }
 
 /// The daemon's socket: `$FLEET_HOME/daemon.sock`, or, when that path is too long for a Unix socket (macOS allows
-/// 104 bytes), `/tmp/fleet-<uid>-<hash of the home>.sock`. `contrib/fleet.py` computes the same path.
+/// 104 bytes), `/tmp/fleet-<uid>-<hash of the home>.sock`.
 pub fn socket_path(home: &Path) -> PathBuf {
     let preferred = home.join("daemon.sock");
     if preferred.as_os_str().len() < 100 {

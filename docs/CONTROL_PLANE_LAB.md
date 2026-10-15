@@ -22,13 +22,12 @@ an explicit idle-worker handoff.
 - Matching request replay, conflicting-content rejection, and explicit full-response release that retains
   the request fingerprint and prevents reexecution.
 - Durable snapshot creation, integrity/cluster checks, atomic installation, log compaction, and follower catch-up.
-- A persistent simulated worker with one start per execution, revisions, cancellation tombstones, and a
-  numbered event journal. `simulate` reconciles once and submits pending journal events through the client.
+- Worker reports with durable sequence cursors, immutable attempt provenance, and lifecycle validation.
+  The simulated worker is test-only and exercises the same real job/assignment/report contract.
 
 Submission includes explicit job, execution, and worker IDs. Real assignments have enrolled-worker
 authentication and aggregate resource admission. The normal queue adds automatic placement; these
-low-level lab commands deliberately expose explicit assignments. Simulated
-observations use an administrator identity and stay separate from real assignments.
+low-level lab commands deliberately expose explicit assignments. There is no production prototype `Submit`/`Observe` domain or `simulate` command.
 
 ## Run the automated qualification
 
@@ -55,8 +54,8 @@ original bootstrap contacts. The forced process-kill test uses a single-replica 
 [Multi-machine deployment and failure qualification](CONTROL_PLANE_NETWORKING.md) extend this lab to
 explicit LAN contacts. Normal client integration is documented in [NORMAL_FLEET.md](NORMAL_FLEET.md); sustained performance qualification remains separate.
 
-The current normal queue uses protocol/storage format 5. Create fresh homes with this version; there
-is no importer for earlier lab formats or legacy SQLite state. Historical qualification records retain
+The current normal queue uses protocol/storage format 6. Fresh homes are supported, as is the explicit
+[idle format-5 upgrade](CHECKPOINT_JOBS.md#explicit-format-5-upgrade). Legacy SQLite state is not imported. Historical qualification records retain
 the version they actually tested.
 
 ## Run an interactive three replica lab
@@ -88,25 +87,23 @@ lab_pid_3=$!
 Only the first initial startup uses `--bootstrap`. Restarting a replica uses its same home/configuration
 without that flag. Bootstrap refuses already initialized state; it is not a recovery override.
 
-Submit the supplied request, reconcile the simulated worker, and inspect cluster state:
+Submit the supplied queued job request and inspect cluster state. It waits until an eligible real worker is enrolled:
 
 ```sh
 target/debug/fleet-control-lab request --key "$lab_dir/client/node.key" --config "$lab_dir/client/config.json" --request "$lab_dir/submit.json"
-target/debug/fleet-control-lab simulate --home "$lab_dir/simulation" --key "$lab_dir/client/node.key" --config "$lab_dir/client/config.json"
 target/debug/fleet-control-lab read --key "$lab_dir/client/node.key" --config "$lab_dir/client/config.json"
 ```
 
-Repeating the same request returns its original acceptance. Repeating `simulate` reports `starts: 1`.
-To cancel the example, save this as a new request file and pass it to `request`, then run `simulate` again:
+Repeating the same request returns its original acceptance. To cancel the unassigned example, save this
+as a new request file and pass it to `request`:
 
 ```json
-{"origin":"CLUSTER_ID_AT_CREATION","id":"example-cancel","mutation":{"Cancel":{"job":"example","expected_revision":1}}}
+{"origin":"CLUSTER_ID_AT_CREATION","id":"example-cancel","mutation":{"CancelQueued":{"id":"example","expected_revision":1}}}
 ```
 
-Set `origin` to the cluster ID in the client config when creating the request, and retain it on retries.
-Cancellation acceptance precedes worker observation. The simulation will record revision 2 as cancelled;
-delivering revision 1 afterward cannot start it again. A deliberately new job needs fresh job/execution
-IDs and a fresh request ID. Preserve request files after a timeout so retries use the same contents.
+Use the actual job ID from `submit.json`, and set `origin` to the cluster ID in the client config.
+Preserve request files after a timeout so retries use the same contents. Cancelling a placed job commits
+intent; the worker must confirm cleanup before Fleet releases capacity.
 
 Stop only these lab processes when finished:
 
@@ -122,11 +119,11 @@ The administrator allowlist remains static. [Real workers](CONTROL_PLANE_WORKERS
 pull quorum-confirmed assignments, reconcile native/Tart backends, account for resources, and expose
 verified input/output transfer and observations. Removed replicas have no direct worker command channel.
 
-Production metadata tables/indexes, pagination, 90-day timed receipt pruning, automatic placement,
-worker replacement/recovery tooling, artifact replication/retention, and production cutover remain ahead.
+Metadata tables/indexes, pagination, 90-day timed receipt pruning, worker replacement tooling, and
+artifact replication/retention remain ahead. Automatic placement and normal-client integration are implemented.
 Full-response release is implemented; automatic age-based pruning is not.
 
 For qualification simplicity the metadata state is one serialized redb value. Snapshot publication is
 serialized with writes, and installation replaces state plus saved snapshot in one transaction while
 preserving local votes/logs. This is not the final scalable table layout. Wire frames are limited to
-8 MiB, snapshots to 64 MiB, and simulated job payloads to 4096 bytes. These are lab limits.
+8 MiB and snapshots to 64 MiB. These remain scaling limits.
