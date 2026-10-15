@@ -43,9 +43,10 @@ an unknown outcome; create a fresh request only when you intend new work.
 Jobs support worker selection, required capability tags, priority, successful-job dependencies, CPU/RAM
 admission, native exclusive GPU reservations, VM GPU policies, logs, progress probes, and verified
 intermediate/final outputs. Native jobs are trusted host processes. Tart jobs run inside disposable
-macOS VMs; persistent VMs expose create/start/stop/delete. Tart's CPU/GPU sharing limitations and offline
+macOS VMs and can explicitly suspend at an application checkpoint and resume in a new VM under the same job ID; persistent VMs expose create/start/stop/delete. Tart's CPU/GPU sharing limitations and offline
 or public-internet-only networking policies remain unchanged.
 
+- [Checkpoint-resumable VM jobs and metadata upgrade](docs/CHECKPOINT_JOBS.md)
 - [Local failure scenarios and CI](docs/LOCAL_ROLLOUT.md)
 - [Normal client/service guide](docs/NORMAL_FLEET.md)
 - [Distributed architecture](docs/DISTRIBUTED_CONTROL_PLANE.md)

@@ -99,7 +99,7 @@ fleet --home /absolute/client-home retry experiment-1
 ```
 
 The job JSON holds `name`, `argv`, local `inputs`, `publish`, `threads`, time limits, probes and optional
-`vm`. CPU threads default to one for native jobs; a VM uses its configured vCPUs. Native memory is an
+`vm` and `checkpoint`. See [checkpoint-resumable VM jobs](CHECKPOINT_JOBS.md) for the manifest contract, attempt history, and explicit format-5 metadata upgrade. CPU threads default to one for native jobs; a VM uses its configured vCPUs. Native memory is an
 admission reservation, not a per-process limit. Native GPU use must be declared with `--gpu`; it requires
 an advertised compute GPU and reserves exclusive Fleet GPU use. All macOS VMs still have GPU access.
 VM CPU/RAM/disk reservations and exclusive/shared GPU policy use the existing backend admission rules.
@@ -171,7 +171,7 @@ Qualify fresh homes first, then stage each idle machine. Recheck immediately bef
 another client may have submitted work since the earlier audit. A replica-only deployment can proceed while
 an old worker remains busy. Reverting to the old installation also requires draining the new worker first.
 
-Checkpoint suspension/resumption, migration, preemption, direct persistent-guest commands, per-user ACLs,
+Cross-worker checkpoint migration, preemption, direct persistent-guest commands, per-user ACLs,
 background output fetching to remembered destinations, blob replication/retention, and mixed-version upgrades
 are not in this release. Receipts are retained indefinitely unless explicitly released through the low-level
 administrative contract; automatic 90-day pruning remains future work. Metadata/snapshot size limits from

@@ -91,6 +91,7 @@ async fn setup(name: &str) -> Setup {
 impl Setup {
     fn job(&self, name: &str, argv: &[&str]) -> JobFile {
         JobFile {
+            checkpoint: None,
             vm: None,
             name: name.into(),
             argv: argv.iter().map(|s| s.to_string()).collect(),

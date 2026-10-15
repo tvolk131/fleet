@@ -43,6 +43,7 @@ pub struct Inventory {
     pub registration: Registration,
     pub sequence: u64,
     pub assignments: BTreeMap<String, Assignment>,
+    pub checkpoints: BTreeMap<String, super::checkpoint::Checkpoint>,
 }
 fn digest(value: &impl Serialize) -> Result<String> {
     Ok(blake3::hash(&serde_json::to_vec(value)?)
@@ -275,10 +276,15 @@ impl State {
                 local.id == *id && local.worker == worker.id && local.revision > 0,
                 "invalid inventory identity"
             );
-            local.workload.validate(worker)?;
-            if let Some(job) = self.queue.get(id) {
+            local.validate(worker)?;
+            if let Some(job) = local
+                .attempt
+                .as_ref()
+                .and_then(|a| self.jobs.get(a.job.as_ref()))
+            {
                 ensure!(
-                    job.workload == local.workload
+                    (local.attempt.as_ref().is_some_and(|a| a.number > 1)
+                        || job.workload == local.workload)
                         && job.worker.as_ref().is_none_or(|w| w == &local.worker),
                     "logical job conflicts with worker inventory"
                 );
@@ -293,11 +299,14 @@ impl State {
                 ensure!(
                     old.worker == local.worker
                         && old.execution == local.execution
-                        && old.workload == local.workload,
+                        && old.workload == local.workload
+                        && old.attempt == local.attempt,
                     "assignment definition conflicts with recovered history"
                 );
                 ensure!(
-                    old.revision != local.revision || old.desired == local.desired,
+                    old.revision != local.revision
+                        || (old.desired == local.desired
+                            && old.suspend_checkpoint == local.suspend_checkpoint),
                     "equal revisions have conflicting intentions"
                 );
                 let mut merged = if old.revision > local.revision {
@@ -310,7 +319,7 @@ impl State {
                     merged.observed = Some((
                         merged.revision,
                         Observation {
-                            phase: WorkPhase::Uncertain,
+                            phase: merged.workload.uncertain(),
                             detail: Some(
                                 "terminal controller record conflicts with worker history".into(),
                             ),
@@ -328,29 +337,89 @@ impl State {
             if !inventory.assignments.contains_key(&a.id) {
                 held.insert(a.id.clone());
                 // Even a restored terminal claim is held until the missing local history is explained.
-                a.observed = Some((a.revision, Observation { phase: WorkPhase::Uncertain, detail: Some("restored assignment absent from worker journal; explicit cancellation/deletion required".into()) }));
+                a.observed = Some((a.revision, Observation { phase: a.workload.uncertain(), detail: Some("restored assignment absent from worker journal; explicit cancellation/deletion required".into()) }));
             }
         }
-        for a in assignments
+        let mut jobs = self.jobs.clone();
+        let mut attempts: Vec<_> = assignments
             .values()
-            .filter(|a| matches!(a.workload, Workload::Job { .. }))
-        {
-            self.queue
-                .entry(a.id.clone())
-                .or_insert_with(|| super::queue::QueuedJob {
-                    id: a.id.clone(),
+            .filter(|a| a.attempt.is_some())
+            .collect();
+        attempts.sort_by_key(|a| a.attempt.as_ref().unwrap().number);
+        for a in attempts {
+            let attempt = a.attempt.as_ref().expect("job attempt");
+            ensure!(
+                matches!(a.workload, Workload::Job { .. }) && attempt.number > 0,
+                "invalid attempt provenance"
+            );
+            let job = jobs.entry(attempt.job.to_string()).or_insert_with(|| {
+                let mut job = super::queue::Submission {
+                    id: attempt.job.to_string(),
                     workload: a.workload.clone(),
                     worker: Some(a.worker.clone()),
                     priority: 0,
                     requires: BTreeSet::new(),
                     after: BTreeSet::new(),
-                    staged: BTreeSet::new(),
-                    submitted: 0,
-                    revision: 1,
-                    cancelled: a.desired == Desired::Cancelled,
-                });
+                }
+                .job(0);
+                job.phase = super::queue::JobPhase::Active;
+                job
+            });
+            let index = (attempt.number - 1) as usize;
+            if let Some(old) = job.attempts.get(index) {
+                ensure!(
+                    old.as_ref() == a.id,
+                    "attempt ordinal conflicts with recovered history"
+                );
+            } else {
+                ensure!(job.attempts.len() == index, "attempt history has a gap");
+                job.attempts.push(a.id.clone().into());
+                job.phase = super::queue::JobPhase::Active;
+            }
+            if job.attempts.last().is_some_and(|id| id.as_ref() == a.id)
+                && a.suspend_checkpoint.is_some()
+            {
+                job.resume_from = a.suspend_checkpoint.clone();
+            }
+            if held.contains(&a.id) && job.attempts.last().is_some_and(|id| id.as_ref() == a.id) {
+                job.phase = super::queue::JobPhase::Active;
+            }
         }
+        let mut checkpoints = self.checkpoints.clone();
+        for (id, checkpoint) in &inventory.checkpoints {
+            ensure!(
+                id == &checkpoint.id && checkpoint.worker == worker.id,
+                "checkpoint inventory identity mismatch"
+            );
+            checkpoint.validate(
+                assignments
+                    .get(checkpoint.attempt.as_ref())
+                    .context("checkpoint attempt is missing")?,
+            )?;
+            if let Some(old) = checkpoints.get(id) {
+                ensure!(
+                    old == checkpoint,
+                    "checkpoint inventory conflicts with history"
+                );
+            } else {
+                checkpoints.insert(id.clone(), checkpoint.clone());
+            }
+        }
+        let mut counts = BTreeMap::<&str, usize>::new();
+        for checkpoint in checkpoints.values() {
+            let count = counts.entry(checkpoint.attempt.as_ref()).or_default();
+            *count += 1;
+            ensure!(
+                *count <= crate::checkpoint::MAX_CHECKPOINTS,
+                "checkpoint inventory exceeds per-attempt limit"
+            );
+        }
+        self.checkpoints = checkpoints;
+        self.jobs = jobs;
         self.assignments = assignments;
+        for id in inventory.assignments.keys() {
+            self.refresh_job(id);
+        }
         self.cursors.insert(worker.cursor(), inventory.sequence);
         let recovery = self.recovery.as_mut().expect("checked recovery");
         recovery.held = held;

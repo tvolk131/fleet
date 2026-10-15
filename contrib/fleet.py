@@ -57,7 +57,7 @@ class Fleet:
 
     def submit(self, name, argv, *, inputs=None, env=None, publish=(), worker=None,
                threads=1, memory_mb=1024, gpu=False, requires=(), after=(), priority=0,
-               vm=None, probes=(), max_seconds=None, settle_seconds=30,
+               vm=None, checkpoint=None, probes=(), max_seconds=None, settle_seconds=30,
                keep_awake=True, shutdown_grace_seconds=None, request_id=None, job_id=None):
         request_id = self._id(request_id)
         # Derivation makes retrying the same Python call with a caller-supplied ID
@@ -75,7 +75,7 @@ class Fleet:
                 raise FleetError(f'Input does not exist: {source}')
         job = dict(name=name, argv=[str(a) for a in argv], inputs=files,
                    env={k: str(v) for k, v in (env or {}).items()}, publish=list(publish),
-                   threads=threads, vm=vm, probes=list(probes), max_seconds=max_seconds,
+                   threads=threads, vm=vm, checkpoint=checkpoint, probes=list(probes), max_seconds=max_seconds,
                    settle_seconds=settle_seconds, keep_awake=keep_awake,
                    shutdown_grace_seconds=shutdown_grace_seconds)
         self.request('submit', request_id=request_id, id=job_id, job=job, worker=worker,
@@ -107,6 +107,28 @@ class Fleet:
         return self.request('cancel', request_id=self._id(request_id), id=job_id,
                             expected_revision=revision)
 
+    def checkpoints(self, job_id):
+        return self.request('checkpoints', id=job_id)
+
+    def fetch_checkpoint(self, checkpoint_id, destination):
+        return self.request('fetch_checkpoint', id=checkpoint_id, destination=str(Path(destination).resolve()))
+
+    def attempts(self, job_id):
+        return self.request('attempts', id=job_id)
+
+    def suspend(self, job_id, *, checkpoint='latest', request_id=None, revision=None):
+        """Stop at the selected verified checkpoint; subsequent work will be redone."""
+        if revision is None:
+            revision = self.job(job_id)['revision']
+        return self.request('suspend', request_id=self._id(request_id), id=job_id,
+                            checkpoint=checkpoint, expected_revision=revision)
+
+    def resume(self, job_id, *, request_id=None, revision=None):
+        if revision is None:
+            revision = self.job(job_id)['revision']
+        return self.request('resume', request_id=self._id(request_id), id=job_id,
+                            expected_revision=revision)
+
     def stage(self, job_id=None):
         return self.request('stage', id=job_id)
 
@@ -124,14 +146,14 @@ class Fleet:
                 raise TimeoutError(f'Waiting for {job_id} timed out; the job is not cancelled')
             time.sleep(poll)
 
-    def logs(self, job_id, *, stderr=False, offset=0, maximum=65536):
-        return self.request('logs', id=job_id, stderr=stderr, **{'from': offset, 'max': maximum})['Logs']
+    def logs(self, job_id, *, stderr=False, offset=0, maximum=65536, attempt=None):
+        return self.request('logs', id=job_id, attempt=attempt, stderr=stderr, **{'from': offset, 'max': maximum})['Logs']
 
-    def outputs(self, job_id):
-        return self.request('outputs', id=job_id)['Outputs']
+    def outputs(self, job_id, *, attempt=None):
+        return self.request('outputs', id=job_id, attempt=attempt)['Outputs']
 
-    def fetch(self, job_id, destination):
-        return self.request('fetch', id=job_id, destination=str(Path(destination).resolve()))
+    def fetch(self, job_id, destination, *, attempt=None):
+        return self.request('fetch', id=job_id, attempt=attempt, destination=str(Path(destination).resolve()))
 
     def events(self, worker, *, since=0, wait_ms=0):
         return self.request('data', worker=worker,

@@ -2,9 +2,9 @@
 
 use fleet::control::{
     Client, Command, Config, Entry, Mutation, Replica, Reply, Request, State, Store, TypeConfig,
-    model::{Job, Phase, key},
+    model::key,
     network::{ALPN, Answer, Message, Peer, exchange},
-    worker::SimulatedWorker,
+    workload::{Assignment, AttemptPhase, Desired, JobDesired, Observation, Report, WorkPhase},
 };
 use iroh::SecretKey;
 use openraft::{
@@ -18,6 +18,10 @@ use std::{
     path::PathBuf,
     time::Duration,
 };
+
+#[path = "control/simulated.rs"]
+mod simulated;
+use simulated::SimulatedWorker;
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -69,12 +73,14 @@ fn submit(id: &str, job: &str) -> Request {
     Request {
         origin: "cluster".into(),
         id: id.into(),
-        mutation: Mutation::Submit {
-            job: job.into(),
-            execution: format!("execution-{job}"),
-            worker: "worker".into(),
-            payload: "simulate training".into(),
-        },
+        mutation: Mutation::Enqueue(fleet::control::queue::Submission {
+            id: job.into(),
+            workload: real_worker::workload("echo test"),
+            worker: None,
+            priority: 0,
+            requires: BTreeSet::new(),
+            after: BTreeSet::new(),
+        }),
     }
 }
 
@@ -211,18 +217,24 @@ fn simulation_tombstones_prevent_delayed_launch_and_survive_restart() {
     let home = Home::new();
     let path = home.0.join("worker.redb");
     let worker = SimulatedWorker::open(&path, "cluster", "worker").unwrap();
-    let running = Job {
-        job: "j".into(),
+    let running = Assignment {
+        id: "j".into(),
         execution: "e".into(),
+        attempt: Some(fleet::control::queue::Attempt {
+            job: "j".into(),
+            number: 1,
+            checkpoint: None,
+        }),
         worker: "worker".into(),
-        payload: "p".into(),
+        workload: real_worker::workload("echo test"),
         revision: 1,
-        cancelled: false,
+        desired: Desired::Job(JobDesired::Running),
+        suspend_checkpoint: None,
         observed: None,
     };
-    let stopped = Job {
+    let stopped = Assignment {
         revision: 2,
-        cancelled: true,
+        desired: Desired::Job(JobDesired::Cancelled),
         ..running.clone()
     };
     assert_eq!(worker.ensure(&stopped).unwrap().starts, 0);
@@ -230,9 +242,9 @@ fn simulation_tombstones_prevent_delayed_launch_and_survive_restart() {
     let worker = SimulatedWorker::open(&path, "cluster", "worker").unwrap();
     let late = worker.ensure(&running).unwrap();
     assert_eq!(late.starts, 0);
-    assert!(late.desired.cancelled);
-    let another = Job {
-        job: "j2".into(),
+    assert_eq!(late.desired.desired, Desired::Job(JobDesired::Cancelled));
+    let another = Assignment {
+        id: "j2".into(),
         execution: "e2".into(),
         ..running
     };
@@ -251,33 +263,49 @@ fn observation_cursor_and_terminal_state_cannot_go_backwards() {
         },
         1,
     );
+    let registration = simulation_registration(SecretKey::generate().public());
+    let principal = registration.peer.identity.to_string();
+    assert_eq!(state.enroll(&registration), Reply::Recorded);
+    assert!(matches!(
+        state.place_queued("j", "worker", 1),
+        Reply::Accepted { .. }
+    ));
     let event = |id: &str, sequence, phase| Command {
-        principal: "admin".into(),
+        principal: principal.clone(),
         request: Request {
             origin: "cluster".into(),
             id: id.into(),
-            mutation: Mutation::Observe {
+            mutation: Mutation::WorkerReport(Report {
                 worker: "worker".into(),
-                incarnation: "log".into(),
+                incarnation: "simulated-journal".into(),
                 sequence,
-                execution: "execution-j".into(),
+                assignment: "j-a1".into(),
                 revision: 1,
-                phase,
-            },
+                observation: Observation {
+                    phase,
+                    detail: None,
+                },
+            }),
         },
     };
     assert!(matches!(
-        state.apply(event("gap", 2, Phase::Running), 2),
+        state.apply(event("gap", 2, WorkPhase::Job(AttemptPhase::Running)), 2),
         Reply::Rejected { .. }
     ));
     assert!(state.cursors.is_empty());
     assert_eq!(
-        state.apply(event("done", 1, Phase::Succeeded), 3),
+        state.apply(event("done", 1, WorkPhase::Job(AttemptPhase::Succeeded)), 3),
         Reply::Recorded
     );
-    state.apply(event("stale", 2, Phase::Running), 4);
-    assert_eq!(state.jobs["j"].observed, Some((1, Phase::Succeeded)));
-    assert_eq!(state.cursors[&key("worker", "log")], 2);
+    state.apply(event("stale", 2, WorkPhase::Job(AttemptPhase::Running)), 4);
+    assert_eq!(
+        state.assignments["j-a1"]
+            .observed
+            .as_ref()
+            .map(|(r, o)| (*r, o.phase)),
+        Some((1, WorkPhase::Job(AttemptPhase::Succeeded)))
+    );
+    assert_eq!(state.cursors[&key("worker", "simulated-journal")], 2);
 }
 
 struct Cluster {
@@ -536,9 +564,11 @@ async fn membership_grows_replaces_leader_and_shrinks_preserving_history() {
     }
     assert_eq!(c.client.write(submission, WAIT).await.unwrap(), accepted);
     assert_eq!(c.client.read(WAIT).await.unwrap().jobs.len(), 1);
-    // A replica role change did not move or recreate the worker assignment.
-    assert_eq!(state.jobs["training"].worker, "worker");
-    assert_eq!(state.jobs["training"].execution, "execution-training");
+    // Membership changes preserve the exact submitted job intent.
+    assert_eq!(
+        state.jobs["training"].workload,
+        real_worker::workload("echo test")
+    );
     c.close().await;
 }
 
@@ -836,20 +866,22 @@ async fn leader_failover_lost_reply_and_worker_reconciliation() {
     assert!(matches!(replay, Reply::Accepted { .. }));
     let state = c.client.read(WAIT).await.unwrap();
     assert_eq!(state.jobs.len(), 1);
+    simulation_place(&mut c.client, "j").await;
+    let state = c.client.read(WAIT).await.unwrap();
     let worker_path = c.home.0.join("simulated.redb");
     let worker = SimulatedWorker::open(&worker_path, &c.config.cluster, "worker").unwrap();
-    assert_eq!(worker.ensure(&state.jobs["j"]).unwrap().starts, 1);
+    assert_eq!(worker.ensure(&state.assignments["j-a1"]).unwrap().starts, 1);
     drop(worker);
     let worker = SimulatedWorker::open(&worker_path, &c.config.cluster, "worker").unwrap();
-    assert_eq!(worker.ensure(&state.jobs["j"]).unwrap().starts, 1);
+    assert_eq!(worker.ensure(&state.assignments["j-a1"]).unwrap().starts, 1);
     c.client
         .write(
             Request {
                 origin: "cluster".into(),
                 id: "cancel".into(),
-                mutation: Mutation::Cancel {
-                    job: "j".into(),
-                    expected_revision: 1,
+                mutation: Mutation::CancelQueued {
+                    id: "j".into(),
+                    expected_revision: 2,
                 },
             },
             WAIT,
@@ -857,7 +889,7 @@ async fn leader_failover_lost_reply_and_worker_reconciliation() {
         .await
         .unwrap();
     let cancelled = c.client.read(WAIT).await.unwrap();
-    worker.ensure(&cancelled.jobs["j"]).unwrap();
+    worker.ensure(&cancelled.assignments["j-a1"]).unwrap();
     for (i, event) in worker.events().unwrap().into_iter().enumerate() {
         let r = Request {
             origin: "cluster".into(),
@@ -871,10 +903,13 @@ async fn leader_failover_lost_reply_and_worker_reconciliation() {
         assert_eq!(c.client.write(r, WAIT).await.unwrap(), Reply::Recorded);
     }
     assert_eq!(
-        c.client.read(WAIT).await.unwrap().jobs["j"].observed,
-        Some((2, Phase::Cancelled))
+        c.client.read(WAIT).await.unwrap().assignments["j-a1"]
+            .observed
+            .as_ref()
+            .map(|(r, o)| (*r, o.phase)),
+        Some((2, WorkPhase::Job(AttemptPhase::Cancelled)))
     );
-    assert_eq!(worker.ensure(&state.jobs["j"]).unwrap().starts, 1);
+    assert_eq!(worker.ensure(&state.assignments["j-a1"]).unwrap().starts, 1);
     let restarted = Replica::start(
         &c.home.0.join(leader.to_string()),
         Config {
@@ -1084,30 +1119,34 @@ async fn committed_request_survives_sigkill_and_process_restart() {
     let _restarted = start(false);
     assert_eq!(client.write(request, WAIT).await.unwrap(), result);
     assert_eq!(client.read(WAIT).await.unwrap().jobs.len(), 1);
+    simulation_place(&mut client, "j").await;
     for _ in 0..2 {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_fleet-control-lab"))
-            .arg("simulate")
-            .arg("--home")
-            .arg(home.0.join("simulation"))
-            .arg("--key")
-            .arg(home.0.join("client/node.key"))
-            .arg("--config")
-            .arg(home.0.join("client/config.json"))
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let executions: Vec<fleet::control::worker::Execution> =
-            serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(executions.len(), 1);
-        assert_eq!(executions[0].starts, 1);
+        let worker =
+            SimulatedWorker::open(&home.0.join("simulation.redb"), &client.cluster, "worker")
+                .unwrap();
+        let state = client.read(WAIT).await.unwrap();
+        assert_eq!(worker.ensure(&state.assignments["j-a1"]).unwrap().starts, 1);
+        for (i, mutation) in worker.events().unwrap().into_iter().enumerate() {
+            let reply = client
+                .write(
+                    Request {
+                        origin: client.cluster.clone(),
+                        id: format!("sim-{i}"),
+                        mutation,
+                    },
+                    WAIT,
+                )
+                .await
+                .unwrap();
+            assert_eq!(reply, Reply::Recorded);
+        }
     }
     assert_eq!(
-        client.read(WAIT).await.unwrap().jobs["j"].observed,
-        Some((1, Phase::Running))
+        client.read(WAIT).await.unwrap().assignments["j-a1"]
+            .observed
+            .as_ref()
+            .map(|(r, o)| (*r, o.phase)),
+        Some((1, WorkPhase::Job(AttemptPhase::Running)))
     );
     client.endpoint.close().await;
 }
@@ -1438,3 +1477,54 @@ mod networking;
 
 #[path = "control/queue.rs"]
 mod queue_tests;
+
+fn simulation_registration(identity: iroh::EndpointId) -> fleet::control::workload::Registration {
+    use fleet::control::workload::*;
+    Registration {
+        id: "worker".into(),
+        peer: Peer {
+            identity,
+            address: "127.0.0.1:1".parse().unwrap(),
+        },
+        incarnation: "simulated-journal".into(),
+        budget: Budget {
+            cpu_slots: 4,
+            memory_mb: 8192,
+            disk_gb: 0,
+            vm_slots: 0,
+        },
+        images: BTreeSet::new(),
+        tags: BTreeSet::new(),
+    }
+}
+async fn simulation_place(client: &mut Client, job: &str) {
+    for (id, mutation) in [
+        (
+            "sim-enroll",
+            Mutation::Enroll {
+                worker: simulation_registration(client.endpoint.id()),
+            },
+        ),
+        (
+            "sim-place",
+            Mutation::Place {
+                id: job.into(),
+                worker: "worker".into(),
+                expected_revision: 1,
+            },
+        ),
+    ] {
+        let reply = client
+            .write(
+                Request {
+                    origin: client.cluster.clone(),
+                    id: id.into(),
+                    mutation,
+                },
+                WAIT,
+            )
+            .await
+            .unwrap();
+        assert!(!matches!(reply, Reply::Rejected { .. }), "{reply:?}");
+    }
+}

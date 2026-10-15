@@ -38,24 +38,80 @@ pub enum Workload {
     },
 }
 
+/// Intent and observations carry their domain, so job suspension cannot be mistaken for VM stop.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum Desired {
+pub enum JobDesired {
+    Running,
+    Suspended,
+    Cancelled,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum InstanceDesired {
     Running,
     Stopped,
     Deleted,
-    Cancelled,
 }
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum WorkPhase {
+pub enum Desired {
+    Job(JobDesired),
+    Instance(InstanceDesired),
+}
+impl Desired {
+    pub fn running(self) -> bool {
+        matches!(
+            self,
+            Self::Job(JobDesired::Running) | Self::Instance(InstanceDesired::Running)
+        )
+    }
+    pub fn terminating(self) -> bool {
+        matches!(
+            self,
+            Self::Job(JobDesired::Cancelled) | Self::Instance(InstanceDesired::Deleted)
+        )
+    }
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AttemptPhase {
     Pending,
     Running,
-    Stopped,
+    Suspended,
     Succeeded,
     Failed,
     Cancelled,
+    Uncertain,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum InstancePhase {
+    Pending,
+    Running,
+    Stopped,
     Deleted,
     Uncertain,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WorkPhase {
+    Job(AttemptPhase),
+    Instance(InstancePhase),
+}
+impl WorkPhase {
+    pub fn terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Job(
+                AttemptPhase::Suspended
+                    | AttemptPhase::Succeeded
+                    | AttemptPhase::Failed
+                    | AttemptPhase::Cancelled
+            ) | Self::Instance(InstancePhase::Deleted)
+        )
+    }
+    pub fn label(self) -> String {
+        match self {
+            Self::Job(p) => format!("{p:?}"),
+            Self::Instance(p) => format!("{p:?}"),
+        }
+        .to_lowercase()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,6 +124,9 @@ pub struct Observation {
 pub struct Assignment {
     pub id: String,
     pub execution: String,
+    /// Present only for a job attempt; persistent VMs have their own lifecycle.
+    pub attempt: Option<super::queue::Attempt>,
+    pub suspend_checkpoint: Option<String>,
     pub worker: String,
     pub workload: Workload,
     pub desired: Desired,
@@ -88,6 +147,7 @@ pub struct Report {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerView {
     pub starts_allowed: bool,
+    pub checkpoints: BTreeSet<String>,
     pub recovery_required: bool,
     pub held: BTreeSet<String>,
     pub registration: Registration,
@@ -119,6 +179,31 @@ impl Registration {
 }
 
 impl Workload {
+    pub fn initial_desired(&self) -> Desired {
+        match self {
+            Self::Job { .. } => Desired::Job(JobDesired::Running),
+            Self::Instance { .. } => Desired::Instance(InstanceDesired::Running),
+        }
+    }
+    pub fn pending(&self) -> WorkPhase {
+        match self {
+            Self::Job { .. } => WorkPhase::Job(AttemptPhase::Pending),
+            Self::Instance { .. } => WorkPhase::Instance(InstancePhase::Pending),
+        }
+    }
+    pub fn uncertain(&self) -> WorkPhase {
+        match self {
+            Self::Job { .. } => WorkPhase::Job(AttemptPhase::Uncertain),
+            Self::Instance { .. } => WorkPhase::Instance(InstancePhase::Uncertain),
+        }
+    }
+    pub fn accepts_phase(&self, phase: WorkPhase) -> bool {
+        matches!(
+            (self, phase),
+            (Self::Job { .. }, WorkPhase::Job(_)) | (Self::Instance { .. }, WorkPhase::Instance(_))
+        )
+    }
+
     pub fn vm(&self) -> Option<&instances::Spec> {
         match self {
             Self::Job { spec, .. } => spec.vm.as_ref(),
@@ -139,7 +224,7 @@ impl Workload {
             }
             ensure!(
                 spec.resume.is_none() && spec.preempt.is_none(),
-                "checkpoint suspension is not part of the replicated worker contract yet"
+                "legacy native resume and preemption are not supported by the replicated worker"
             );
             ensure!(
                 spec.vm.is_some() || *memory_mb > 0,
@@ -162,16 +247,52 @@ impl Workload {
 }
 
 impl Assignment {
+    pub fn validate(&self, worker: &Registration) -> Result<()> {
+        instances::valid_id(&self.id)?;
+        instances::valid_id(&self.execution)?;
+        ensure!(
+            self.worker == worker.id && self.revision > 0,
+            "invalid assignment identity"
+        );
+        self.workload.validate(worker)?;
+        match (&self.workload, self.desired, &self.attempt) {
+            (Workload::Job { spec, .. }, Desired::Job(desired), Some(attempt)) => {
+                instances::valid_id(&attempt.job)?;
+                ensure!(attempt.number > 0, "invalid attempt number");
+                ensure!(
+                    attempt.number > 1 || attempt.checkpoint.is_none(),
+                    "first attempt cannot resume a checkpoint"
+                );
+                ensure!(
+                    desired != JobDesired::Suspended
+                        || (spec.checkpoint.is_some() && self.suspend_checkpoint.is_some()),
+                    "suspension requires a selected checkpoint"
+                );
+            }
+            (Workload::Instance { .. }, Desired::Instance(_), None) => {
+                ensure!(
+                    self.suspend_checkpoint.is_none(),
+                    "persistent VM cannot have a job checkpoint"
+                );
+            }
+            _ => {
+                anyhow::bail!("assignment lifecycle or attempt provenance does not match workload")
+            }
+        }
+        if let Some((revision, observation)) = &self.observed {
+            ensure!(
+                *revision > 0
+                    && *revision <= self.revision
+                    && self.workload.accepts_phase(observation.phase),
+                "invalid assignment observation"
+            );
+        }
+        Ok(())
+    }
     pub fn terminal(&self) -> bool {
         self.observed
             .as_ref()
-            .is_some_and(|(_, o)| match self.workload {
-                Workload::Job { .. } => matches!(
-                    o.phase,
-                    WorkPhase::Succeeded | WorkPhase::Failed | WorkPhase::Cancelled
-                ),
-                Workload::Instance { .. } => o.phase == WorkPhase::Deleted,
-            })
+            .is_some_and(|(_, o)| o.phase.terminal())
     }
     fn compute_reserved(&self) -> bool {
         if self.terminal() {
@@ -180,9 +301,14 @@ impl Assignment {
         if matches!(self.workload, Workload::Job { .. }) {
             return true;
         }
-        self.desired == Desired::Running
+        self.desired.running()
             || !self.observed.as_ref().is_some_and(|(r, o)| {
-                *r == self.revision && matches!(o.phase, WorkPhase::Stopped | WorkPhase::Deleted)
+                *r == self.revision
+                    && matches!(
+                        o.phase,
+                        WorkPhase::Instance(InstancePhase::Stopped)
+                            | WorkPhase::Instance(InstancePhase::Deleted)
+                    )
             })
     }
 }
@@ -231,7 +357,7 @@ impl State {
             );
             ensure!(
                 !self.assignments.contains_key(id)
-                    && !self.queue.contains_key(id)
+                    && !self.jobs.contains_key(id)
                     && !self.assignments.values().any(|a| a.execution == execution),
                 "assignment or execution ID already exists"
             );
@@ -249,12 +375,32 @@ impl State {
             execution: execution.into(),
             worker: worker.into(),
             workload: workload.clone(),
-            desired: Desired::Running,
+            desired: workload.initial_desired(),
+            suspend_checkpoint: None,
+            attempt: matches!(workload, Workload::Job { .. }).then(|| super::queue::Attempt {
+                job: id.into(),
+                number: 1,
+                checkpoint: None,
+            }),
             revision: 1,
             observed: None,
         };
         if let Err(e) = self.admit(&candidate) {
             return Reply::rejected(&e.to_string());
+        }
+        if matches!(workload, Workload::Job { .. }) {
+            let mut job = super::queue::Submission {
+                id: id.into(),
+                workload: workload.clone(),
+                worker: Some(worker.into()),
+                priority: 0,
+                requires: BTreeSet::new(),
+                after: BTreeSet::new(),
+            }
+            .job(0);
+            job.attempts.push(id.into());
+            job.phase = super::queue::JobPhase::Active;
+            self.jobs.insert(id.into(), job);
         }
         self.assignments.insert(id.into(), candidate);
         Reply::Accepted {
@@ -270,12 +416,10 @@ impl State {
         if self.worker_recovery_required(&old.worker) {
             return Reply::rejected("worker must reconcile before changing intent");
         }
-        if desired == Desired::Running && !self.recovery_allows_work(&old.worker) {
+        if desired.running() && !self.recovery_allows_work(&old.worker) {
             return Reply::rejected("recovery is paused");
         }
-        if self.recovery.as_ref().is_some_and(|r| r.held.contains(id))
-            && !matches!(desired, Desired::Cancelled | Desired::Deleted)
-        {
+        if self.recovery.as_ref().is_some_and(|r| r.held.contains(id)) && !desired.terminating() {
             return Reply::rejected("assignment held after recovery; cancel or delete explicitly");
         }
         if old.revision != revision {
@@ -283,7 +427,7 @@ impl State {
         }
         if old.desired == desired {
             if let Some(recovery) = &mut self.recovery
-                && matches!(desired, Desired::Cancelled | Desired::Deleted)
+                && desired.terminating()
             {
                 recovery.held.remove(id);
             }
@@ -292,12 +436,12 @@ impl State {
                 revision,
             };
         }
-        if old.terminal() || old.desired == Desired::Deleted || old.desired == Desired::Cancelled {
+        if old.terminal() || old.desired.terminating() {
             return Reply::rejected("assignment is terminal or has a terminal intent");
         }
         let valid = match old.workload {
-            Workload::Job { .. } => desired == Desired::Cancelled,
-            Workload::Instance { .. } => desired != Desired::Cancelled,
+            Workload::Job { .. } => desired == Desired::Job(JobDesired::Cancelled),
+            Workload::Instance { .. } => matches!(desired, Desired::Instance(_)),
         };
         if !valid {
             return Reply::rejected("desired state is invalid for this workload");
@@ -306,7 +450,7 @@ impl State {
         candidate.desired = desired;
         candidate.revision += 1;
         // Stopping must remain possible even while stale reservations exceed capacity.
-        if desired == Desired::Running
+        if desired.running()
             && let Err(e) = self.admit(&candidate)
         {
             return Reply::rejected(&e.to_string());
@@ -407,6 +551,9 @@ impl State {
         if a.worker != report.worker || report.revision > a.revision || report.revision == 0 {
             return Reply::rejected("observation does not match assignment");
         }
+        if !a.workload.accepts_phase(report.observation.phase) {
+            return Reply::rejected("observation lifecycle does not match workload");
+        }
         if report
             .observation
             .detail
@@ -415,6 +562,22 @@ impl State {
         {
             return Reply::rejected("observation detail too large");
         }
+        // Consume superseded reports without allowing their old intent to release a current reservation.
+        if report.revision < a.revision {
+            self.cursors.insert(cursor, report.sequence);
+            return Reply::Recorded;
+        }
+        if report.observation.phase == WorkPhase::Job(AttemptPhase::Suspended)
+            && (a.desired != Desired::Job(JobDesired::Suspended)
+                || report.revision != a.revision
+                || a.suspend_checkpoint
+                    .as_ref()
+                    .is_none_or(|id| !self.checkpoints.contains_key(id)))
+        {
+            return Reply::rejected(
+                "suspension requires a verified checkpoint and matching stop revision",
+            );
+        }
         if !a.terminal()
             && a.observed
                 .as_ref()
@@ -422,6 +585,7 @@ impl State {
         {
             a.observed = Some((report.revision, report.observation.clone()));
         }
+        self.refresh_job(&report.assignment);
         self.cursors.insert(cursor, report.sequence);
         Reply::Recorded
     }

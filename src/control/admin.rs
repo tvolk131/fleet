@@ -4,7 +4,6 @@ use crate::control::{
     discovery::incarnation_cache,
     membership::{MembershipStage, MembershipView},
     network::{Peer, validate_address},
-    worker::SimulatedWorker,
 };
 use anyhow::{Result, ensure};
 use clap::Subcommand;
@@ -17,6 +16,15 @@ use std::{
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Offline format-5 upgrade: idle singleton, stopped workers, and paused client staging. Keeps backups.
+    Upgrade {
+        #[arg(long)]
+        controller_home: PathBuf,
+        #[arg(long)]
+        worker_home: Vec<PathBuf>,
+        #[arg(long)]
+        client_home: Vec<PathBuf>,
+    },
     /// Offline lost-quorum recovery. Creates a fresh single-replica home and signed manifest.
     Recover {
         #[arg(long)]
@@ -228,21 +236,20 @@ pub enum Command {
         #[arg(long)]
         replica: u64,
     },
-    /// Reconcile once using a persistent simulated worker; never executes the job payload.
-    Simulate {
-        #[arg(long)]
-        home: PathBuf,
-        #[arg(long, default_value = "worker")]
-        worker: String,
-        #[arg(long)]
-        key: PathBuf,
-        #[arg(long)]
-        config: PathBuf,
-    },
 }
 
 pub async fn run(command: Command) -> Result<()> {
     match command {
+        Command::Upgrade {
+            controller_home,
+            worker_home,
+            client_home,
+        } => {
+            tokio::task::spawn_blocking(move || {
+                super::upgrade::run(&controller_home, &worker_home, &client_home)
+            })
+            .await??;
+        }
         Command::Recover {
             source_home,
             config,
@@ -667,12 +674,20 @@ pub async fn run(command: Command) -> Result<()> {
             let request = Request {
                 origin: base.cluster.clone(),
                 id: "example-submit".into(),
-                mutation: Mutation::Submit {
-                    job: "example".into(),
-                    execution: "execution-example".into(),
-                    worker: "worker".into(),
-                    payload: "simulated training".into(),
-                },
+                mutation: Mutation::Enqueue(super::queue::Submission {
+                    id: "example".into(),
+                    workload: super::workload::Workload::Job {
+                        spec: Box::new(serde_json::from_value(
+                            serde_json::json!({"name":"example", "argv":["/bin/echo", "hello"], "keep_awake":false}),
+                        )?),
+                        gpu: false,
+                        memory_mb: 128,
+                    },
+                    worker: None,
+                    priority: 0,
+                    requires: BTreeSet::new(),
+                    after: BTreeSet::new(),
+                }),
             };
             std::fs::write(
                 home.join("submit.json"),
@@ -803,56 +818,6 @@ pub async fn run(command: Command) -> Result<()> {
             let result = client.inspect(replica, Duration::from_secs(5)).await;
             client.endpoint.close().await;
             println!("{}", serde_json::to_string_pretty(&result?)?);
-        }
-        Command::Simulate {
-            home,
-            worker,
-            key,
-            config,
-        } => {
-            let mut client = client(&key, &config).await?;
-            let cluster = client.cluster.clone();
-            let state = client.read(Duration::from_secs(10)).await?;
-            let (executions, events) = tokio::task::spawn_blocking(move || -> Result<_> {
-                let simulated =
-                    SimulatedWorker::open(&home.join("worker.redb"), &cluster, &worker)?;
-                let executions = state
-                    .jobs
-                    .values()
-                    .filter(|j| j.worker == worker)
-                    .map(|j| simulated.ensure(j))
-                    .collect::<Result<Vec<_>>>()?;
-                Ok((executions, simulated.events()?))
-            })
-            .await??;
-            for event in events {
-                let Mutation::Observe {
-                    worker,
-                    incarnation,
-                    sequence,
-                    ..
-                } = &event
-                else {
-                    unreachable!("worker journal contains observations");
-                };
-                let id = serde_json::to_string(&(worker, incarnation, sequence))?;
-                let reply = client
-                    .write(
-                        Request {
-                            origin: client.cluster.clone(),
-                            id,
-                            mutation: event,
-                        },
-                        Duration::from_secs(10),
-                    )
-                    .await?;
-                ensure!(
-                    reply == crate::control::Reply::Recorded,
-                    "observation rejected: {reply:?}"
-                );
-            }
-            client.endpoint.close().await;
-            println!("{}", serde_json::to_string_pretty(&executions)?);
         }
     }
     Ok(())

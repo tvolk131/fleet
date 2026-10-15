@@ -30,7 +30,7 @@ use super::discovery::save_cache;
 use super::membership::{MembershipView, spawn_reconciler};
 use super::{Command, FORMAT, Raft, Reply, Request, State, Store, TypeConfig, store::MAX_SNAPSHOT};
 
-pub const ALPN: &[u8] = b"fleet/control/5";
+pub const ALPN: &[u8] = b"fleet/control/6";
 const MAX_FRAME: usize = 8 << 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -412,6 +412,7 @@ impl Handler {
                 if is_admin
                     || matches!(&request.mutation,
                 super::Mutation::WorkerReport(report) if self.store.state().await.ok().and_then(|s| s.workers.get(&report.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == report.incarnation))
+                    || matches!(&request.mutation, super::Mutation::CheckpointReady(ready) if self.store.state().await.ok().and_then(|s| s.workers.get(&ready.checkpoint.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == ready.incarnation))
                     || matches!(&request.mutation, super::Mutation::RecoverWorker(inventory) if self.store.state().await.ok().and_then(|s| s.workers.get(&inventory.registration.id).cloned()).is_some_and(|w| w.peer.identity == peer && w == inventory.registration)) =>
             {
                 if request.id.is_empty() || request.id.len() > 512 {
@@ -465,6 +466,12 @@ impl Handler {
                     .insert(worker.clone(), std::time::Instant::now());
                 Answer::WorkerRead(Ok(super::workload::WorkerView {
                     starts_allowed: state.recovery.as_ref().is_none_or(|r| r.resumed),
+                    checkpoints: state
+                        .checkpoints
+                        .values()
+                        .filter(|c| c.worker == worker)
+                        .map(|c| c.id.clone())
+                        .collect(),
                     recovery_required: state.worker_recovery_required(&worker),
                     held: state
                         .recovery

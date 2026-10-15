@@ -63,10 +63,10 @@ fn queue_reserves_atomically_and_cancellation_waits_for_worker_evidence() {
                 worker: "w".into(),
                 incarnation: w.incarnation,
                 sequence: 1,
-                assignment: "a".into(),
+                assignment: "a-a1".into(),
                 revision: 2,
                 observation: Observation {
-                    phase: WorkPhase::Cancelled,
+                    phase: WorkPhase::Job(AttemptPhase::Cancelled),
                     detail: None
                 }
             }
@@ -90,7 +90,7 @@ fn queue_priority_dependencies_staging_and_drain_gate_placement() {
     b.priority = 10;
     b.after.insert("a".into());
     s.enqueue(&b, 2);
-    assert_eq!(s.scheduling_order()[0].id, "b");
+    assert_eq!(s.scheduling_order()[0].id.as_ref(), "b");
     assert!(s.placement_candidate("b", "w").is_err());
     s.cancel_queued("a", 1);
     assert!(s.placement_candidate("b", "w").is_err());
@@ -112,7 +112,7 @@ fn queue_priority_dependencies_staging_and_drain_gate_placement() {
     s.drained.clear();
     assert!(s.placement_candidate("c", "w").is_ok());
     let round: State = serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
-    assert_eq!(round.queue, s.queue);
+    assert_eq!(round.jobs, s.jobs);
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn queued_intent_and_cancel_survive_leader_replacement() {
@@ -146,7 +146,7 @@ async fn queued_intent_and_cancel_survive_leader_replacement() {
         .unwrap();
     assert_eq!(c.client.write(request, WAIT * 3).await.unwrap(), accepted);
     let s = c.client.read(WAIT).await.unwrap();
-    assert!(s.queue.contains_key("job"));
+    assert!(s.jobs.contains_key("job"));
     assert!(s.assignments.is_empty());
     c.client
         .write(
@@ -162,6 +162,9 @@ async fn queued_intent_and_cancel_survive_leader_replacement() {
         )
         .await
         .unwrap();
-    assert!(c.client.read(WAIT).await.unwrap().queue["job"].cancelled);
+    assert_eq!(
+        c.client.read(WAIT).await.unwrap().jobs["job"].phase,
+        fleet::control::queue::JobPhase::Cancelled
+    );
     c.close().await;
 }

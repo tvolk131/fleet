@@ -1,5 +1,7 @@
 # Next features: decisions to make first (draft, 2026-10-09)
 
+> Historical backend design. For the normal replicated client, see [checkpoint-resumable VM jobs](CHECKPOINT_JOBS.md) and [normal Fleet](NORMAL_FLEET.md).
+
 Order agreed with Tommy: (1) `fleet run` and sweeps, (2) CPU slots and spreading evaluations, (3) automatic recovery
 with checkpoint mirroring, (4) stall detection and notifications, (5) retention and disk guards. Item 1 needs no
 decisions. Each decision below has a recommended default; change any of them.

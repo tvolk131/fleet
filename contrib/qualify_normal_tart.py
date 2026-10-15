@@ -62,7 +62,7 @@ def main():
 
     def vm_phase(expected):
         return wait(lambda: client.instances(), lambda values: any(
-            v['id'] == 'persistent' and v['observed'] and v['observed'][0] == v['revision'] and v['observed'][1]['phase'] == expected
+            v['id'] == 'persistent' and v['observed'] and v['observed'][0] == v['revision'] and v['observed'][1]['phase']['Instance'] == expected
             for v in values))
 
     command('cluster', 'init', '--home', a.home / 'seed', '--replicas', 1)
@@ -129,7 +129,7 @@ def main():
                     client.cancel(job['id'])
                     client.wait(job['id'], timeout=160)
             for vm_record in client.instances():
-                if not vm_record['observed'] or vm_record['observed'][1]['phase'] != 'Deleted':
+                if not vm_record['observed'] or vm_record['observed'][1]['phase']['Instance'] != 'Deleted':
                     command('--home', client_home, 'instance', 'delete', vm_record['id'])
                     vm_phase('Deleted')
         finally:

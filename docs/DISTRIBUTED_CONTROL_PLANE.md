@@ -1,5 +1,7 @@
 # Fleet distributed control plane design
 
+Current implementation: [normal clients/services](NORMAL_FLEET.md) and [logical jobs, attempts, checkpoints](CHECKPOINT_JOBS.md). The target-design history below predates those milestones.
+
 Target design, updated 2026-10-13. The first isolated implementation is described in
 [CONTROL_PLANE_LAB.md](CONTROL_PLANE_LAB.md), including its qualification and remaining work.
 The isolated [membership milestone](CONTROL_PLANE_MEMBERSHIP.md) implements replica replacement and

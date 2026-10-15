@@ -1,5 +1,7 @@
 # Queued jobs in disposable macOS VMs
 
+> Historical backend design. For the normal replicated client, see [checkpoint-resumable VM jobs](CHECKPOINT_JOBS.md) and [normal Fleet](NORMAL_FLEET.md).
+
 Protocol **3.7** adds live observations and intermediate results to the opt-in Tart execution introduced in 3.6.
 A job with a `vm` specification uses the existing Fleet job queue and gets
 one private, disposable macOS VM. Fleet reserves capacity, boots the VM, waits for the guest command channel,

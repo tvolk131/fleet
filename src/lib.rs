@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod blobs;
+pub mod checkpoint;
 pub mod compose;
 #[cfg(feature = "control-plane")]
 pub mod control;

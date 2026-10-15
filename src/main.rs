@@ -86,8 +86,38 @@ enum Command {
         #[arg(long)]
         revision: Option<u64>,
     },
+    /// Stop at a verified checkpoint. Work performed after that checkpoint is redone on resume.
+    Suspend {
+        id: String,
+        #[arg(long, default_value = "latest")]
+        checkpoint: String,
+        #[arg(long)]
+        request_id: Option<String>,
+        #[arg(long)]
+        revision: Option<u64>,
+    },
+    /// Queue another attempt on the checkpoint's worker, after confirmed VM cleanup.
+    Resume {
+        id: String,
+        #[arg(long)]
+        request_id: Option<String>,
+        #[arg(long)]
+        revision: Option<u64>,
+    },
+    Checkpoints {
+        id: String,
+    },
+    FetchCheckpoint {
+        id: String,
+        destination: PathBuf,
+    },
+    Attempts {
+        id: String,
+    },
     Logs {
         id: String,
+        #[arg(long)]
+        attempt: Option<u32>,
         #[arg(long)]
         stderr: bool,
         #[arg(long, default_value_t = 0)]
@@ -97,9 +127,13 @@ enum Command {
     },
     Outputs {
         id: String,
+        #[arg(long)]
+        attempt: Option<u32>,
     },
     Fetch {
         id: String,
+        #[arg(long)]
+        attempt: Option<u32>,
         destination: PathBuf,
     },
     Stage {
@@ -431,8 +465,40 @@ async fn run(args: Args) -> Result<()> {
                 expected_revision: revision,
             }
         }
+        Command::Suspend {
+            id,
+            checkpoint,
+            request_id: rid,
+            revision,
+        } => {
+            let revision = match revision { Some(v) => v, None => client::call(&client_home, ApiRequest::Job { id: id.clone() }).await?["revision"].as_u64().context("job revision missing")? };
+            ApiRequest::Suspend {
+                request_id: request_id(rid),
+                id,
+                checkpoint,
+                expected_revision: revision,
+            }
+        }
+        Command::Resume {
+            id,
+            request_id: rid,
+            revision,
+        } => {
+            let revision = match revision { Some(v) => v, None => client::call(&client_home, ApiRequest::Job { id: id.clone() }).await?["revision"].as_u64().context("job revision missing")? };
+            ApiRequest::Resume {
+                request_id: request_id(rid),
+                id,
+                expected_revision: revision,
+            }
+        }
+        Command::Checkpoints { id } => ApiRequest::Checkpoints { id },
+        Command::FetchCheckpoint { id, destination } => {
+            ApiRequest::FetchCheckpoint { id, destination }
+        }
+        Command::Attempts { id } => ApiRequest::Attempts { id },
         Command::Logs {
             id,
+            attempt,
             stderr,
             mut from,
             follow,
@@ -441,6 +507,7 @@ async fn run(args: Args) -> Result<()> {
                 let value = client::call(
                     &client_home,
                     ApiRequest::Logs {
+                        attempt,
                         id: id.clone(),
                         stderr,
                         from,
@@ -467,8 +534,16 @@ async fn run(args: Args) -> Result<()> {
             }
             return Ok(());
         }
-        Command::Outputs { id } => ApiRequest::Outputs { id },
-        Command::Fetch { id, destination } => ApiRequest::Fetch { id, destination },
+        Command::Outputs { id, attempt } => ApiRequest::Outputs { id, attempt },
+        Command::Fetch {
+            id,
+            attempt,
+            destination,
+        } => ApiRequest::Fetch {
+            id,
+            attempt,
+            destination,
+        },
         Command::Stage { id, watch } => {
             loop {
                 match client::call(&client_home, ApiRequest::Stage { id: id.clone() }).await {
@@ -522,12 +597,16 @@ async fn run(args: Args) -> Result<()> {
                 spec: serde_json::from_slice(&std::fs::read(spec)?)?,
             },
             action => {
-                use fleet::control::workload::Desired;
+                use fleet::control::workload::InstanceDesired;
                 let (id, rid, desired) = match action {
-                    InstanceCommand::Start { id, request_id } => (id, request_id, Desired::Running),
-                    InstanceCommand::Stop { id, request_id } => (id, request_id, Desired::Stopped),
+                    InstanceCommand::Start { id, request_id } => {
+                        (id, request_id, InstanceDesired::Running)
+                    }
+                    InstanceCommand::Stop { id, request_id } => {
+                        (id, request_id, InstanceDesired::Stopped)
+                    }
                     InstanceCommand::Delete { id, request_id } => {
-                        (id, request_id, Desired::Deleted)
+                        (id, request_id, InstanceDesired::Deleted)
                     }
                     _ => unreachable!(),
                 };

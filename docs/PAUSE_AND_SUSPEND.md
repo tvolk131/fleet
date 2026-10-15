@@ -1,5 +1,7 @@
 # Pausing, suspending, moving and preempting jobs (design note)
 
+> Historical backend design. For the normal replicated client, see [checkpoint-resumable VM jobs](CHECKPOINT_JOBS.md) and [normal Fleet](NORMAL_FLEET.md).
+
 Draft of 2026-10-09, for review before the code (milestone 5). Builds on `DESIGN.md`.
 
 ## What Tommy asked for

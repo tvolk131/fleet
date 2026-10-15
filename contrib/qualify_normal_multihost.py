@@ -215,7 +215,9 @@ def main():
         return wait(lambda: normal('job', name), lambda v: v['phase'] == phase)
 
     def supervisor(h, name):
-        return h.read(f'worker/backend/jobs/exec-{name}/supervisor.json')
+        record = h.read(f'worker/backend/jobs/exec-{name}-a1/supervisor.json')
+        assert record, 'missing supervisor record for active attempt'
+        return record
 
     def fetch(name):
         normal('fetch', name, a.home / f'capture-{name}')
@@ -353,7 +355,7 @@ def main():
             h.cli('cluster', 'rebind-worker', '--home', h.root / 'worker', '--manifest', h.root / 'recovery.json')
             h.spawn('worker-service', 'service', 'run', '--config', service_configs[h.spec['name'], 'worker-service'])
         wait(state, lambda v: len(v['recovery']['inventories']) == 2)
-        assert normal('job', 'forgotten')['assignment']['execution'] == 'exec-forgotten'
+        assert normal('job', 'forgotten')['assignment']['execution'] == 'exec-forgotten-a1'
         assert supervisor(local, 'forgotten') == forgotten and supervisor(m1, 'continuity') == original
         normal('resume-recovery', '--request-id', 'resume')
         for name in ['continuity', 'forgotten']:
@@ -381,7 +383,7 @@ def main():
         errors = []
         for h, name in jobs:
             try:
-                directory = f'worker/backend/jobs/exec-{name}'
+                directory = f'worker/backend/jobs/exec-{name}-a1'
                 if h.read(f'{directory}/job.json') and not h.read(f'{directory}/exit.json'):
                     h.write(f'{directory}/cancel', b'qualification cleanup\n', raw=True)
                     wait(lambda: h.read(f'{directory}/exit.json'), bool, seconds=20)

@@ -25,6 +25,8 @@ use crate::{
 pub struct JobFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm: Option<crate::instances::Spec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<crate::checkpoint::Policy>,
     pub name: String,
     pub argv: Vec<String>,
     #[serde(default)]
@@ -192,6 +194,7 @@ impl Coordinator {
         }
         let spec = JobSpec {
             vm: job.vm.clone(),
+            checkpoint: job.checkpoint.clone(),
             name: job.name.clone(),
             argv: job.argv.clone(),
             env: job.env.clone(),

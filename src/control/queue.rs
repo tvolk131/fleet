@@ -1,5 +1,9 @@
-//! Durable jobs and deterministic admission; only the leader proposes placements.
-use super::{Command, Mutation, Raft, Reply, Request, State, Store, workload::*};
+//! Logical jobs, immutable execution attempts, and deterministic admission.
+use super::{
+    Command, Mutation, Raft, Reply, Request, State, Store,
+    ids::{AttemptId, JobId},
+    workload::*,
+};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -8,9 +12,35 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum JobPhase {
+    Queued,
+    Active,
+    Suspending,
+    Suspended,
+    Succeeded,
+    Failed,
+    Cancelling,
+    Cancelled,
+}
+impl JobPhase {
+    pub fn terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+}
+
+/// Immutable provenance of a job's worker assignment. The assignment itself is its execution attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Attempt {
+    pub job: JobId,
+    pub number: u32,
+    pub checkpoint: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct QueuedJob {
-    pub id: String,
+pub struct Job {
+    pub id: JobId,
+    /// Original submitted intent; an attempt gets its own immutable specification.
     pub workload: Workload,
     pub worker: Option<String>,
     pub priority: i32,
@@ -19,7 +49,16 @@ pub struct QueuedJob {
     pub staged: BTreeSet<String>,
     pub submitted: u64,
     pub revision: u64,
-    pub cancelled: bool,
+    pub phase: JobPhase,
+    pub attempts: Vec<AttemptId>,
+    pub resume_from: Option<String>,
+}
+impl Job {
+    pub fn current<'a>(&self, state: &'a State) -> Option<&'a Assignment> {
+        self.attempts
+            .last()
+            .and_then(|id| state.assignments.get(id.as_ref()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -34,7 +73,24 @@ pub struct Submission {
     #[serde(default)]
     pub after: BTreeSet<String>,
 }
-
+impl Submission {
+    pub(crate) fn job(&self, index: u64) -> Job {
+        Job {
+            id: self.id.clone().into(),
+            workload: self.workload.clone(),
+            worker: self.worker.clone(),
+            priority: self.priority,
+            requires: self.requires.clone(),
+            after: self.after.clone(),
+            staged: BTreeSet::new(),
+            submitted: index,
+            revision: 1,
+            phase: JobPhase::Queued,
+            attempts: vec![],
+            resume_from: None,
+        }
+    }
+}
 pub type Presence = Arc<Mutex<BTreeMap<String, Instant>>>;
 
 impl State {
@@ -43,7 +99,7 @@ impl State {
             crate::instances::valid_id(&s.id)?;
             ensure!(s.id.len() <= 48, "job ID must be at most 48 bytes");
             ensure!(
-                !self.queue.contains_key(&s.id) && !self.assignments.contains_key(&s.id),
+                !self.jobs.contains_key(&s.id) && !self.assignments.contains_key(&s.id),
                 "job ID already used"
             );
             let Workload::Job {
@@ -54,8 +110,16 @@ impl State {
             };
             spec.validate()?;
             ensure!(
+                !spec
+                    .inputs
+                    .keys()
+                    .any(|p| p == crate::checkpoint::INPUT_ROOT
+                        || p.starts_with(&format!("{}/", crate::checkpoint::INPUT_ROOT))),
+                "input path reserved for checkpoint staging"
+            );
+            ensure!(
                 spec.resume.is_none() && spec.preempt.is_none(),
-                "checkpoint continuation and preemption are not implemented"
+                "legacy checkpoint continuation and preemption are not supported"
             );
             ensure!(
                 spec.vm.is_some() || *memory_mb > 0,
@@ -65,7 +129,7 @@ impl State {
                 ensure!(self.workers.contains_key(w), "unknown target worker");
             }
             ensure!(
-                s.after.iter().all(|id| self.queue.contains_key(id)),
+                s.after.iter().all(|id| self.jobs.contains_key(id)),
                 "dependencies must refer to existing logical jobs"
             );
             Ok(())
@@ -73,36 +137,24 @@ impl State {
         if let Err(e) = check() {
             return Reply::rejected(&e.to_string());
         }
-        self.queue.insert(
-            s.id.clone(),
-            QueuedJob {
-                id: s.id.clone(),
-                workload: s.workload.clone(),
-                worker: s.worker.clone(),
-                priority: s.priority,
-                requires: s.requires.clone(),
-                after: s.after.clone(),
-                staged: BTreeSet::new(),
-                submitted: index,
-                revision: 1,
-                cancelled: false,
-            },
-        );
+        self.jobs.insert(s.id.clone(), s.job(index));
         Reply::Accepted {
             job: s.id.clone(),
             revision: 1,
         }
     }
-
+    pub fn current_attempt(&self, id: &str) -> Option<&Assignment> {
+        self.jobs.get(id)?.current(self)
+    }
     pub fn stage_job(&mut self, id: &str, worker: &str) -> Reply {
-        let Some(job) = self.queue.get_mut(id) else {
+        let Some(job) = self.jobs.get_mut(id) else {
             return Reply::rejected("unknown job");
         };
         let Some(registration) = self.workers.get(worker) else {
             return Reply::rejected("unknown worker");
         };
-        if job.cancelled || job.worker.as_ref().is_some_and(|w| w != worker) {
-            return Reply::rejected("job cancelled or wrong worker");
+        if job.phase != JobPhase::Queued || job.worker.as_ref().is_some_and(|w| w != worker) {
+            return Reply::rejected("job is not queued or wrong worker");
         }
         if let Err(e) = job.workload.validate(registration) {
             return Reply::rejected(&e.to_string());
@@ -110,44 +162,64 @@ impl State {
         job.staged.insert(worker.into());
         Reply::Recorded
     }
-
     pub fn cancel_queued(&mut self, id: &str, revision: u64) -> Reply {
-        let Some(job) = self.queue.get(id) else {
+        let Some(job) = self.jobs.get(id) else {
             return Reply::rejected("unknown job");
         };
         if job.revision != revision {
             return Reply::rejected("job revision conflict");
         }
-        if job.cancelled {
+        if matches!(job.phase, JobPhase::Cancelled | JobPhase::Cancelling) {
             return Reply::Accepted {
                 job: id.into(),
                 revision,
             };
         }
-        if let Some(a) = self.assignments.get(id) {
-            let reply = self.desire(id, a.revision, Desired::Cancelled);
+        if job.phase.terminal() {
+            return Reply::rejected("job already finished");
+        }
+        let active = job
+            .current(self)
+            .filter(|a| !a.terminal())
+            .map(|a| (a.id.clone(), a.revision));
+        if let Some((attempt, r)) = &active {
+            let reply = self.desire(attempt, *r, Desired::Job(JobDesired::Cancelled));
             if matches!(reply, Reply::Rejected { .. }) {
                 return reply;
             }
         }
-        let job = self.queue.get_mut(id).expect("job");
-        job.cancelled = true;
+        let job = self.jobs.get_mut(id).expect("job");
+        job.phase = if active.is_some() {
+            JobPhase::Cancelling
+        } else {
+            JobPhase::Cancelled
+        };
         job.revision += 1;
         Reply::Accepted {
             job: id.into(),
             revision: job.revision,
         }
     }
-
     pub fn placement_candidate(&self, id: &str, worker: &str) -> Result<Assignment> {
         let job = self
-            .queue
+            .jobs
             .get(id)
             .ok_or_else(|| anyhow::anyhow!("unknown job"))?;
-        ensure!(
-            !job.cancelled && !self.assignments.contains_key(id),
-            "job is cancelled or already assigned"
-        );
+        ensure!(job.phase == JobPhase::Queued, "job is not queued");
+        for attempt in &job.attempts {
+            let a = self
+                .assignments
+                .get(attempt.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("missing attempt history"))?;
+            ensure!(
+                a.terminal()
+                    && !self
+                        .recovery
+                        .as_ref()
+                        .is_some_and(|r| r.held.contains(&a.id)),
+                "previous attempt has not confirmed cleanup"
+            );
+        }
         ensure!(
             self.recovery_allows_work(worker),
             "recovery reconciliation required"
@@ -159,10 +231,9 @@ impl State {
         );
         for dependency in &job.after {
             ensure!(
-                self.assignments.get(dependency).is_some_and(|a| a
-                    .observed
-                    .as_ref()
-                    .is_some_and(|(_, o)| o.phase == WorkPhase::Succeeded)),
+                self.jobs
+                    .get(dependency)
+                    .is_some_and(|j| j.phase == JobPhase::Succeeded),
                 "waiting for successful dependency {dependency}"
             );
         }
@@ -174,55 +245,106 @@ impl State {
             job.requires.is_subset(&registration.tags),
             "worker does not match required tags"
         );
-        job.workload.validate(registration)?;
+        let workload = self.attempt_workload(job)?;
+        workload.validate(registration)?;
+        if let Some(checkpoint) = job.resume_from.as_ref() {
+            ensure!(
+                self.checkpoints
+                    .get(checkpoint)
+                    .is_some_and(|c| c.worker == worker),
+                "checkpoint is stored on a different worker"
+            );
+        }
         if let Workload::Job { spec, .. } = &job.workload {
             ensure!(
                 spec.inputs.is_empty() || job.staged.contains(worker),
                 "waiting for verified inputs on worker"
             );
         }
+        let number = u32::try_from(job.attempts.len() + 1)?;
+        let attempt_id = format!("{id}-a{number}");
         let a = Assignment {
-            id: id.into(),
-            execution: format!("exec-{id}"),
+            suspend_checkpoint: None,
+            id: attempt_id.clone(),
+            execution: format!("exec-{attempt_id}"),
+            attempt: Some(Attempt {
+                job: job.id.clone(),
+                number,
+                checkpoint: job.resume_from.clone(),
+            }),
             worker: worker.into(),
-            workload: job.workload.clone(),
-            desired: Desired::Running,
+            workload,
+            desired: Desired::Job(JobDesired::Running),
             revision: 1,
             observed: None,
         };
         ensure!(
-            !self
-                .assignments
-                .values()
-                .any(|old| old.execution == a.execution),
-            "execution ID already used"
+            !self.assignments.contains_key(&a.id)
+                && !self
+                    .assignments
+                    .values()
+                    .any(|old| old.execution == a.execution),
+            "attempt or backend execution ID already used"
         );
         self.admit(&a)?;
         Ok(a)
     }
-
     pub fn place_queued(&mut self, id: &str, worker: &str, revision: u64) -> Reply {
-        if self.queue.get(id).is_none_or(|j| j.revision != revision) {
+        if self.jobs.get(id).is_none_or(|j| j.revision != revision) {
             return Reply::rejected("job revision conflict");
         }
         let a = match self.placement_candidate(id, worker) {
             Ok(a) => a,
             Err(e) => return Reply::rejected(&e.to_string()),
         };
-        self.assignments.insert(id.into(), a);
-        let job = self.queue.get_mut(id).expect("job");
+        let attempt_id = a.id.clone();
+        self.assignments.insert(attempt_id.clone(), a);
+        let job = self.jobs.get_mut(id).expect("job");
+        job.attempts.push(attempt_id.into());
+        job.phase = JobPhase::Active;
         job.revision += 1;
         Reply::Accepted {
             job: id.into(),
             revision: job.revision,
         }
     }
-
-    pub fn scheduling_order(&self) -> Vec<&QueuedJob> {
+    /// Reports from historical attempts never mutate the logical job's current lifecycle.
+    pub(crate) fn refresh_job(&mut self, assignment: &str) {
+        let Some(a) = self.assignments.get(assignment) else {
+            return;
+        };
+        let Some(attempt) = &a.attempt else {
+            return;
+        };
+        let Some(job) = self.jobs.get_mut(attempt.job.as_ref()) else {
+            return;
+        };
+        if job
+            .attempts
+            .last()
+            .is_none_or(|id| id.as_ref() != assignment)
+            || job.phase.terminal()
+            || job.phase == JobPhase::Queued
+        {
+            return;
+        }
+        let phase = match a.observed.as_ref().map(|(_, o)| o.phase) {
+            Some(WorkPhase::Job(AttemptPhase::Succeeded)) => JobPhase::Succeeded,
+            Some(WorkPhase::Job(AttemptPhase::Failed)) => JobPhase::Failed,
+            Some(WorkPhase::Job(AttemptPhase::Cancelled)) => JobPhase::Cancelled,
+            Some(WorkPhase::Job(AttemptPhase::Suspended)) => JobPhase::Suspended,
+            _ => return,
+        };
+        if job.phase != phase {
+            job.phase = phase;
+            job.revision += 1;
+        }
+    }
+    pub fn scheduling_order(&self) -> Vec<&Job> {
         let mut jobs: Vec<_> = self
-            .queue
+            .jobs
             .values()
-            .filter(|j| !j.cancelled && !self.assignments.contains_key(&j.id))
+            .filter(|j| j.phase == JobPhase::Queued)
             .collect();
         jobs.sort_by_key(|j| (std::cmp::Reverse(j.priority), j.submitted, j.id.clone()));
         jobs
@@ -248,14 +370,14 @@ pub fn spawn(raft: Raft, store: Store, presence: Presence) -> tokio::task::JoinH
                         if state.placement_candidate(&job.id, worker).is_ok() {
                             // The state machine rechecks reservations and job revisions atomically.
                             // A failed proposal gets a new ID next pass, while committed placement
-                            // itself permanently excludes another execution of this logical job.
+                            // itself excludes a second concurrent attempt of this logical job.
                             raft.client_write(Command {
                                 principal: format!("scheduler:{}", raft.metrics().borrow().id),
                                 request: Request {
                                     origin: state.cluster.clone(),
                                     id: format!("place-{:032x}", rand::random::<u128>()),
                                     mutation: Mutation::Place {
-                                        id: job.id.clone(),
+                                        id: job.id.to_string(),
                                         worker: worker.clone(),
                                         expected_revision: job.revision,
                                     },

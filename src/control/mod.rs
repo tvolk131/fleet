@@ -1,8 +1,10 @@
 //! Replicated control plane and opt-in workers, with explicit isolated state homes.
 
 pub mod admin;
+pub mod checkpoint;
 pub mod client;
 pub mod discovery;
+pub mod ids;
 pub mod membership;
 pub mod model;
 pub mod network;
@@ -11,7 +13,7 @@ pub mod recovery;
 pub mod runtime;
 pub mod service;
 pub mod store;
-pub mod worker;
+pub mod upgrade;
 pub mod workload;
 
 pub use model::{Command, Mutation, Reply, Request, State};
@@ -29,4 +31,4 @@ openraft::declare_raft_types!(
 
 pub type Raft = openraft::Raft<TypeConfig>;
 pub type Entry = openraft::Entry<TypeConfig>;
-pub const FORMAT: u32 = 5;
+pub const FORMAT: u32 = 6;

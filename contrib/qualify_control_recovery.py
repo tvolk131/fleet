@@ -86,7 +86,7 @@ try:
     job = save('job.json', {'name': 'recovery canary', 'argv': ['/bin/sh', '-c', 'echo started-once; echo recovered-output > result.txt; sleep 90'], 'threads': 1, 'keep_awake': False, 'max_seconds': 100, 'shutdown_grace_seconds': 0, 'settle_seconds': 0, 'publish': ['result.txt']})
     submit = ['submit-job', *creds, '--data-home', a.home / 'client-data', '--job', job, '--worker', 'recovery-canary', '--id', 'canary', '--request-id', 'submit-canary', '--memory-mb', 128]
     assert 'Accepted' in run(*submit)
-    wait_for(lambda s: s['assignments']['canary']['observed'] and s['assignments']['canary']['observed'][1]['phase'] == 'Running')
+    wait_for(lambda s: s['assignments']['canary']['observed'] and s['assignments']['canary']['observed'][1]['phase'] == {'Job': 'Running'})
     started = json.loads((worker / 'backend/jobs/exec-canary/supervisor.json').read_text())
     stop('worker', kill=True)
     stop('node-2', kill=True)
@@ -107,9 +107,9 @@ try:
     assert json.loads((worker / 'backend/jobs/exec-canary/supervisor.json').read_text()) == started
     origin = manifest['plan']['config']['cluster']
     assert run('resume-recovery', *creds, '--origin', origin, '--request-id', 'resume') == 'Recorded'
-    cancel = save('cancel.json', {'origin': origin, 'id': 'cancel', 'mutation': {'Desire': {'id': 'canary', 'expected_revision': 1, 'desired': 'Cancelled'}}})
+    cancel = save('cancel.json', {'origin': origin, 'id': 'cancel', 'mutation': {'Desire': {'id': 'canary', 'expected_revision': 1, 'desired': {'Job': 'Cancelled'}}}})
     assert 'Accepted' in run('request', *creds, '--request', cancel)
-    wait_for(lambda s: s['assignments']['canary']['observed'][1]['phase'] == 'Cancelled')
+    wait_for(lambda s: s['assignments']['canary']['observed'][1]['phase'] == {'Job': 'Cancelled'})
     assert (worker / 'backend/jobs/exec-canary/stdout.log').read_text() == 'started-once\n'
     run('fetch', *creds, '--data-home', a.home / 'capture-data', '--assignment', 'canary', '--destination', a.home / 'outputs')
     assert (a.home / 'outputs/result.txt').read_text() == 'recovered-output\n'

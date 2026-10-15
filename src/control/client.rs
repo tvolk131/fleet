@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -51,6 +51,27 @@ pub enum ApiRequest {
         id: String,
         expected_revision: u64,
     },
+    Suspend {
+        request_id: String,
+        id: String,
+        expected_revision: u64,
+        checkpoint: String,
+    },
+    Resume {
+        request_id: String,
+        id: String,
+        expected_revision: u64,
+    },
+    Checkpoints {
+        id: String,
+    },
+    Attempts {
+        id: String,
+    },
+    FetchCheckpoint {
+        id: String,
+        destination: PathBuf,
+    },
     InstanceCreate {
         request_id: String,
         id: String,
@@ -61,7 +82,7 @@ pub enum ApiRequest {
         request_id: String,
         id: String,
         expected_revision: u64,
-        desired: Desired,
+        desired: InstanceDesired,
     },
     Enroll {
         request_id: String,
@@ -92,6 +113,8 @@ pub enum ApiRequest {
     Logs {
         id: String,
         #[serde(default)]
+        attempt: Option<u32>,
+        #[serde(default)]
         stderr: bool,
         #[serde(default)]
         from: u64,
@@ -100,9 +123,13 @@ pub enum ApiRequest {
     },
     Outputs {
         id: String,
+        #[serde(default)]
+        attempt: Option<u32>,
     },
     Fetch {
         id: String,
+        #[serde(default)]
+        attempt: Option<u32>,
         destination: PathBuf,
     },
     Data {
@@ -118,6 +145,8 @@ impl ApiRequest {
         match self {
             Self::Submit { request_id, .. }
             | Self::Cancel { request_id, .. }
+            | Self::Suspend { request_id, .. }
+            | Self::Resume { request_id, .. }
             | Self::InstanceCreate { request_id, .. }
             | Self::InstanceSet { request_id, .. }
             | Self::Enroll { request_id, .. }
@@ -261,6 +290,35 @@ impl AppClient {
                 id: id.clone(),
                 expected_revision: *expected_revision,
             },
+            ApiRequest::Suspend {
+                id,
+                expected_revision,
+                checkpoint,
+                ..
+            } => {
+                let checkpoint = if checkpoint == "latest" {
+                    let state = self.read().await?;
+                    latest_checkpoint(&state, id)
+                        .context("no verified checkpoint for the current attempt")?
+                        .id
+                        .clone()
+                } else {
+                    checkpoint.clone()
+                };
+                Mutation::SuspendJob {
+                    id: id.clone(),
+                    expected_revision: *expected_revision,
+                    checkpoint,
+                }
+            }
+            ApiRequest::Resume {
+                id,
+                expected_revision,
+                ..
+            } => Mutation::ResumeJob {
+                id: id.clone(),
+                expected_revision: *expected_revision,
+            },
             ApiRequest::InstanceCreate {
                 id, worker, spec, ..
             } => Mutation::Assign {
@@ -277,7 +335,7 @@ impl AppClient {
             } => Mutation::Desire {
                 id: id.clone(),
                 expected_revision: *expected_revision,
-                desired: *desired,
+                desired: Desired::Instance(*desired),
             },
             ApiRequest::Enroll { registration, .. } => Mutation::Enroll {
                 worker: registration.clone(),
@@ -324,7 +382,7 @@ impl AppClient {
             for job in state
                 .scheduling_order()
                 .into_iter()
-                .filter(|j| id.is_none_or(|id| j.id == id))
+                .filter(|j| id.is_none_or(|id| j.id.as_ref() == id))
             {
                 let Workload::Job { spec, .. } = &job.workload else {
                     continue;
@@ -359,7 +417,7 @@ impl AppClient {
                                 origin: state.cluster.clone(),
                                 id: format!("stage-{}-{}", job.id, worker.incarnation),
                                 mutation: Mutation::Stage {
-                                    id: job.id.clone(),
+                                    id: job.id.to_string(),
                                     worker: worker.id.clone(),
                                 },
                             };
@@ -395,6 +453,8 @@ impl AppClient {
                 Ok(answer)
             }
             ApiRequest::Cancel { .. }
+            | ApiRequest::Suspend { .. }
+            | ApiRequest::Resume { .. }
             | ApiRequest::InstanceCreate { .. }
             | ApiRequest::InstanceSet { .. }
             | ApiRequest::Enroll { .. }
@@ -465,6 +525,65 @@ impl AppClient {
                 }
                 Ok(json!(values))
             }
+            ApiRequest::Checkpoints { id } => {
+                let state = self.read().await?;
+                ensure!(state.jobs.contains_key(id), "unknown job");
+                Ok(json!(
+                    state
+                        .checkpoints
+                        .values()
+                        .filter(|c| c.job.as_ref() == id)
+                        .collect::<Vec<_>>()
+                ))
+            }
+            ApiRequest::FetchCheckpoint { id, destination } => {
+                let state = self.read().await?;
+                let checkpoint = state.checkpoints.get(id).context("unknown checkpoint")?;
+                let worker = state
+                    .workers
+                    .get(&checkpoint.worker)
+                    .context("unknown checkpoint worker")?;
+                std::fs::create_dir(destination)
+                    .context("checkpoint destination must be a new directory")?;
+                let cache = self
+                    .home
+                    .join("downloads")
+                    .join(format!("{:032x}", rand::random::<u128>()));
+                let store = crate::blobs::open(&cache).await?;
+                let result = async {
+                    let files = destination.join("files");
+                    runtime::fetch_files(
+                        &store,
+                        &self.transport.endpoint,
+                        &worker.peer,
+                        &checkpoint.content.files,
+                        &files,
+                    )
+                    .await?;
+                    for file in &checkpoint.content.files {
+                        checkpoint.content.verify_file(&files, file)?;
+                    }
+                    instances::write(&destination.join("checkpoint.json"), checkpoint)?;
+                    Ok::<_, anyhow::Error>(json!({"checkpoint":id,"destination":destination}))
+                }
+                .await;
+                let closed = store.shutdown().await;
+                let cleaned = std::fs::remove_dir_all(&cache);
+                let result = result?;
+                closed?;
+                cleaned?;
+                Ok(result)
+            }
+            ApiRequest::Attempts { id } => {
+                let state = self.read().await?;
+                let job = state.jobs.get(id).context("unknown job")?;
+                Ok(json!(
+                    job.attempts
+                        .iter()
+                        .filter_map(|a| state.assignments.get(a.as_ref()))
+                        .collect::<Vec<_>>()
+                ))
+            }
             ApiRequest::Operation { id } => Ok(json!(
                 self.read()
                     .await?
@@ -493,14 +612,20 @@ impl AppClient {
                     .await?
                 ))
             }
-            ApiRequest::Logs { id, .. }
-            | ApiRequest::Outputs { id }
-            | ApiRequest::Fetch { id, .. } => {
+            ApiRequest::Logs { id, attempt, .. }
+            | ApiRequest::Outputs { id, attempt }
+            | ApiRequest::Fetch { id, attempt, .. } => {
                 let state = self.read().await?;
-                let a = state
-                    .assignments
-                    .get(id)
-                    .context("job has no execution yet")?;
+                let job = state.jobs.get(id).context("unknown job")?;
+                let a = if let Some(number) = attempt {
+                    ensure!(*number > 0, "attempt numbers begin at 1");
+                    job.attempts
+                        .get((*number - 1) as usize)
+                        .and_then(|a| state.assignments.get(a.as_ref()))
+                } else {
+                    job.current(&state)
+                }
+                .context("job has no such attempt")?;
                 let w = &state.workers[&a.worker];
                 let request = match api {
                     ApiRequest::Logs {
@@ -552,15 +677,15 @@ impl AppClient {
     }
 }
 pub fn job_views(state: &State) -> Vec<Value> {
-    let mut jobs: Vec<_> = state.queue.values().collect();
+    use super::queue::JobPhase;
+    let mut jobs: Vec<_> = state.jobs.values().collect();
     jobs.sort_by_key(|j| j.submitted);
     jobs.into_iter().map(|j| {
-        let a=state.assignments.get(&j.id);
-        let phase=if let Some(a)=a {
-            a.observed.as_ref().map(|(_,o)|format!("{:?}",o.phase).to_lowercase()).unwrap_or_else(||"pending".into())
-        } else if j.cancelled {"cancelled".into()} else {"queued".into()};
-        let reasons=if a.is_none() && !j.cancelled {state.workers.keys().map(|w|(w.clone(),state.placement_candidate(&j.id,w).err().map(|e|e.to_string()).unwrap_or_else(||"waiting for worker poll and scheduler".into()))).collect::<std::collections::BTreeMap<_,_>>()} else {Default::default()};
-        json!({"id":j.id,"revision":j.revision,"phase":phase,"cancel_requested":j.cancelled,"priority":j.priority,"after":j.after,"workload":j.workload,"assignment":a,"waiting":reasons})
+        let a = j.current(state);
+        let phase = if j.phase == JobPhase::Active { a.and_then(|a|a.observed.as_ref()).map(|(_,o)|o.phase.label()).unwrap_or_else(|| "pending".into()) } else { format!("{:?}",j.phase).to_lowercase() };
+        let reasons = if j.phase == JobPhase::Queued { state.workers.keys().map(|w|(w.clone(),state.placement_candidate(&j.id,w).err().map(|e|e.to_string()).unwrap_or_else(||"waiting for worker poll and scheduler".into()))).collect::<BTreeMap<_,_>>() } else { BTreeMap::new() };
+        let attempts: Vec<_> = j.attempts.iter().filter_map(|id| state.assignments.get(id.as_ref())).collect();
+        json!({"id":j.id,"revision":j.revision,"phase":phase,"cancel_requested":matches!(j.phase,JobPhase::Cancelling|JobPhase::Cancelled),"priority":j.priority,"after":j.after,"workload":j.workload,"assignment":a,"attempts":attempts,"latest_checkpoint":latest_checkpoint(state,&j.id),"resume_from":j.resume_from,"waiting":reasons})
     }).collect()
 }
 
@@ -569,4 +694,23 @@ pub async fn call(home: &Path, request: ApiRequest) -> Result<Value> {
     let result = c.execute(request).await;
     c.close().await;
     result
+}
+
+pub fn latest_checkpoint<'a>(
+    state: &'a State,
+    job: &str,
+) -> Option<&'a super::checkpoint::Checkpoint> {
+    let a = state.current_attempt(job)?;
+    state
+        .checkpoints
+        .values()
+        .filter(|c| c.attempt.as_ref() == a.id)
+        .max_by_key(|c| {
+            (
+                c.content.captured_at,
+                c.content.manifest.position,
+                c.content.source.clone(),
+                c.id.clone(),
+            )
+        })
 }
