@@ -45,7 +45,7 @@ jobs:
         run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
       - name: Formatting
         run: cargo fmt --all --check
-      - name: Build normal and historical regression clients
+      - name: Build Fleet and control-plane qualification tools
         run: cargo build --all-features --bins --locked
       - name: Checkpoint backup and restore JSON CLI lifecycle with isolated Tart backend
         run: |

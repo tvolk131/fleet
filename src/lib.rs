@@ -1,21 +1,15 @@
-//! fleet: a small job runner for experiment machines over iroh. See `DESIGN.md`.
-//!
-//! Milestone 1: keys and allowlists; the agent with `Hello`, `Status` and jobs (submit, list, logs, cancel, outputs);
-//! the detached supervisor; content-addressed inputs and outputs over `iroh-blobs`; path reports.
+//! Fleet: replicated workload intent, independently reconciled workers and storage,
+//! and authenticated clients over iroh. See `docs/DISTRIBUTED_CONTROL_PLANE.md`.
 
 pub mod agent;
 pub mod blobs;
 pub mod checkpoint;
-pub mod compose;
 #[cfg(feature = "control-plane")]
 pub mod control;
 pub mod coordinator;
-pub mod daemon;
 pub mod events;
 #[cfg(feature = "gui")]
 pub mod gui;
-#[cfg(all(feature = "gui", feature = "legacy"))]
-pub mod gui_legacy;
 pub mod instances;
 pub mod jobs;
 pub mod keys;

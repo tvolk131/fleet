@@ -1,4 +1,4 @@
-//! Opt-in replicated Fleet daemon and explicit-home qualification CLI.
+//! Replicated Fleet administration and explicit-home qualification commands.
 use crate::control::{
     Client, Config, Mutation, Replica, Reply, Request,
     discovery::incarnation_cache,

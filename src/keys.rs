@@ -98,9 +98,9 @@ pub fn allow(path: &Path, id: EndpointId, note: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// The coordinator's key in use: an exclusive lock on `$FLEET_HOME/coordinator.lock`, held by the daemon for its whole
-/// life and by a CLI command that works in-process. Two processes with one key confuse the network, so only one may
-/// hold it. The lock is released when the holder exits, even after a crash.
+/// Exclusive use of a client identity while a CLI/GUI request or staging task is connected.
+/// The existing `coordinator.lock` filename is retained for installed client homes.
+/// A crash releases the OS lock; a client never takes over controller duties.
 #[derive(Debug)]
 pub struct KeyLock(#[allow(dead_code)] fs::File);
 
@@ -132,9 +132,7 @@ pub fn lock_coordinator(home: &Path, patience: std::time::Duration) -> Result<Ke
             return Ok(lock);
         }
         if start.elapsed() >= patience {
-            bail!(
-                "the coordinator's key is in use by another fleet process (a daemon, or a command still running)"
-            );
+            bail!("the client identity is in use by another Fleet request or staging task");
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }

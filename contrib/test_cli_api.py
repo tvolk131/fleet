@@ -98,6 +98,46 @@ class ReplicatedFleet(unittest.TestCase):
         self.assertEqual((destination / 'result.txt').read_text(), 'original input\n')
         self.assertEqual(len([j for j in self.request(op='queue') if j['id'] == job]), 1)
         self.assertTrue(any(r['id'] == 'file-request' for r in self.request(op='requests')))
+        (destination / 'result.txt').write_text('user edited this export\n')
+        answer = api(BIN, self.home, dict(op='fetch', id=job, destination=str(destination)))
+        self.assertFalse(answer['ok'], answer)
+        self.assertEqual((destination / 'result.txt').read_text(), 'user edited this export\n')
+        conflict = api(BIN, self.home, dict(op='submit', id=job, request_id='file-request', memory_mb=128,
+                                           job={'name': 'different payload', 'argv': ['false']}))
+        self.assertFalse(conflict['ok'], conflict)
+        self.assertEqual(len(self.request(op='attempts', id=job)), 1)
+
+    def test_executable_inputs_and_log_cursor_survive_service_restarts(self):
+        script = self.root / 'canary.sh'
+        gate = self.root / 'release-canary'
+        script.write_text('#!/bin/sh\necho before-restart\nwhile [ ! -f "$1" ]; do sleep .1; done\necho after-restart\n')
+        script.chmod(0o700)
+        job = 'restart-logs'
+        self.request(op='submit', id=job, request_id='restart-logs-submit', memory_mb=128,
+                     job={'name': 'executable log canary', 'argv': ['./bin/canary', str(gate)],
+                          'inputs': {'bin/canary': str(script)}, 'keep_awake': False, 'max_seconds': 60})
+        try:
+            wait_for(lambda: self.request(op='job', id=job), lambda j: j['phase'] == 'running')
+            first = wait_for(lambda: self.request(op='logs', id=job)['Logs'],
+                             lambda log: log['data'] == 'before-restart\n')
+            self.stop('controller')
+            self.stop('worker')
+            self.start('controller')
+            self.start('worker')
+            # Every read still goes through the logical control plane; no direct scheduler fallback.
+            wait_for(lambda: self.request(op='job', id=job), lambda j: j['phase'] == 'running')
+            gate.write_text('go\n')
+            wait_for(lambda: self.request(op='job', id=job), lambda j: j['phase'] == 'succeeded')
+            tail = self.request(op='logs', id=job, **{'from': first['next']})['Logs']
+            self.assertEqual(tail['data'], 'after-restart\n')
+            self.assertTrue(tail['done'])
+            self.assertEqual(self.request(op='logs', id=job)['Logs']['data'], 'before-restart\nafter-restart\n')
+            self.assertEqual(len(self.request(op='attempts', id=job)), 1)
+        finally:
+            gate.write_text('go\n')
+            for role in ('controller', 'worker'):
+                if role not in self.processes:
+                    self.start(role)
 
     def test_dependency_and_cancel_before_placement(self):
         self.request(op='submit', id='first', request_id='first-submit', memory_mb=128,
