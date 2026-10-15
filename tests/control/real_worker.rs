@@ -145,11 +145,18 @@ async fn wait(c: &mut Cluster, w: &mut Worker, id: &str, wanted: WorkPhase) -> A
     loop {
         w.tick().await.unwrap();
         let state = c.client.read(WAIT).await.unwrap();
-        let a = state
+        let Some(a) = state
             .current_attempt(id)
             .or_else(|| state.assignments.get(id))
-            .unwrap()
-            .clone();
+            .cloned()
+        else {
+            assert!(
+                tokio::time::Instant::now() < end,
+                "waiting for placement: {state:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
         if a.observed
             .as_ref()
             .is_some_and(|(r, o)| *r == a.revision && o.phase == wanted)
@@ -1009,3 +1016,6 @@ mod checkpoints;
 
 #[path = "upgrade.rs"]
 mod upgrade;
+
+#[path = "storage.rs"]
+mod storage;

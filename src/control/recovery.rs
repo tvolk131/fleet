@@ -414,7 +414,21 @@ impl State {
                 "checkpoint inventory exceeds per-attempt limit"
             );
         }
+        let artifacts = checkpoints
+            .values()
+            .map(|cp| {
+                super::artifact::Manifest::new(
+                    cp.worker.clone(),
+                    cp.attempt.to_string(),
+                    super::artifact::Kind::Checkpoint(cp.id.clone()),
+                    cp.content.files.clone(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
         self.checkpoints = checkpoints;
+        for manifest in artifacts {
+            self.register_artifact(manifest);
+        }
         self.jobs = jobs;
         self.assignments = assignments;
         for id in inventory.assignments.keys() {

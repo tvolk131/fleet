@@ -629,6 +629,10 @@ impl Agent {
                 .export(input.hash, &target)
                 .await
                 .with_context(|| format!("placing input {path}"))?;
+            anyhow::ensure!(
+                crate::blobs::hash_file(&target)? == input.hash,
+                "staged input hash mismatch: {path}"
+            );
             if input.executable {
                 supervise::make_executable(&target)?;
             }
@@ -675,7 +679,13 @@ impl Agent {
             let hash = match cached {
                 Some(hash) => hash,
                 None => {
-                    let tag = self.config.store.blobs().add_path(&abs).await?;
+                    let tag = self
+                        .config
+                        .store
+                        .blobs()
+                        .add_path(&abs)
+                        .with_named_tag(format!("output/{job}/{path}"))
+                        .await?;
                     self.hashed
                         .lock()
                         .expect("hash cache")

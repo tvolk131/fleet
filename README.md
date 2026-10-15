@@ -23,7 +23,7 @@ fleet --home /absolute/client-home gui
 ```
 
 The default client home is `~/.fleet-client`; `FLEET_HOME` or `--home` overrides it. Controller, worker,
-and optional client-staging roles use explicit persistent homes and can share one service process.
+storage, and optional client-staging roles use explicit persistent homes and can share one service process.
 No role is started implicitly by a client command.
 
 Automation can send a JSON request from any language, without a language-specific SDK:
@@ -54,6 +54,7 @@ intermediate/final outputs. Native jobs are trusted host processes. Tart jobs ru
 macOS VMs and can explicitly suspend at an application checkpoint and resume in a new VM under the same job ID; persistent VMs expose create/start/stop/delete. Tart's CPU/GPU sharing limitations and offline
 or public-internet-only networking policies remain unchanged.
 
+- [Artifact backups, restore, retention, and storage roles](docs/ARTIFACT_STORAGE.md)
 - [Checkpoint-resumable VM jobs and metadata upgrade](docs/CHECKPOINT_JOBS.md)
 - [Local failure scenarios and CI](docs/LOCAL_ROLLOUT.md)
 - [Normal client/service guide](docs/NORMAL_FLEET.md)

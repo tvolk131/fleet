@@ -3,7 +3,7 @@ use super::{Reply, State, network::Peer};
 use crate::{instances, jobs};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Budget {
@@ -146,6 +146,9 @@ pub struct Report {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerView {
+    pub artifacts: Vec<super::artifact::Artifact>,
+    pub stores: BTreeMap<String, super::artifact::Registration>,
+    pub cleanup_allowed: bool,
     pub starts_allowed: bool,
     pub checkpoints: BTreeSet<String>,
     pub recovery_required: bool,
@@ -333,6 +336,14 @@ impl State {
             .any(|w| w.peer.identity == worker.peer.identity)
         {
             return Reply::rejected("worker key is already enrolled");
+        }
+        if self
+            .storage
+            .stores
+            .values()
+            .any(|s| s.peer.identity == worker.peer.identity)
+        {
+            return Reply::rejected("worker needs a separate identity from storage");
         }
         self.workers.insert(worker.id.clone(), worker.clone());
         Reply::Recorded

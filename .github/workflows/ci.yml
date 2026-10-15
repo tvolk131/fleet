@@ -47,9 +47,9 @@ jobs:
         run: cargo fmt --all --check
       - name: Build normal and historical regression clients
         run: cargo build --all-features --bins --locked
-      - name: Checkpoint JSON CLI lifecycle with isolated Tart test backend
+      - name: Checkpoint backup and restore JSON CLI lifecycle with isolated Tart backend
         run: |
-          python3 contrib/qualify_checkpoint_tart.py --fake --binary "$PWD/target/debug/fleet" \
+          python3 contrib/qualify_checkpoint_tart.py --fake --backup-restore --binary "$PWD/target/debug/fleet" \
             --home /tmp/fleet-control-checkpoint-ci 2>&1 | tee checkpoint-client.log
       - name: Rust tests (including Raft, redb, workers, and headless M3 GUI)
         run: cargo test --all-features --locked --no-fail-fast -- --test-threads=2 2>&1 | tee rust-tests.log

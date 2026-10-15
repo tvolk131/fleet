@@ -30,7 +30,7 @@ use super::discovery::save_cache;
 use super::membership::{MembershipView, spawn_reconciler};
 use super::{Command, FORMAT, Raft, Reply, Request, State, Store, TypeConfig, store::MAX_SNAPSHOT};
 
-pub const ALPN: &[u8] = b"fleet/control/6";
+pub const ALPN: &[u8] = b"fleet/control/7";
 const MAX_FRAME: usize = 8 << 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -84,6 +84,10 @@ pub enum Message {
     Read,
     /// Local diagnostics can be stale and never authorize worker action or a membership change.
     Inspect,
+    StorageRead {
+        storage: String,
+        incarnation: String,
+    },
     WorkerRead {
         worker: String,
         incarnation: String,
@@ -113,9 +117,10 @@ pub enum Answer {
     Vote(Result<VoteResponse<u64>, RaftError<u64>>),
     Snapshot(Result<InstallSnapshotResponse<u64>, RaftError<u64, InstallSnapshotError>>),
     Write(Result<Reply, ApiError>),
-    Read(Result<State, ApiError>),
+    Read(Result<Box<State>, ApiError>),
     Inspect(ReplicaStatus),
     WorkerRead(Result<super::workload::WorkerView, ApiError>),
+    StorageRead(Result<super::artifact::View, ApiError>),
     Refused(String),
 }
 
@@ -412,6 +417,8 @@ impl Handler {
                 if is_admin
                     || matches!(&request.mutation,
                 super::Mutation::WorkerReport(report) if self.store.state().await.ok().and_then(|s| s.workers.get(&report.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == report.incarnation))
+                    || matches!(&request.mutation, super::Mutation::ArtifactReady(ready) if self.store.state().await.ok().and_then(|s| s.workers.get(&ready.manifest.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == ready.incarnation))
+                    || matches!(&request.mutation, super::Mutation::ArtifactReport(report) if self.store.state().await.ok().is_some_and(|s| s.artifact_reporter(&peer.to_string(), &report.location, &report.incarnation)))
                     || matches!(&request.mutation, super::Mutation::CheckpointReady(ready) if self.store.state().await.ok().and_then(|s| s.workers.get(&ready.checkpoint.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == ready.incarnation))
                     || matches!(&request.mutation, super::Mutation::RecoverWorker(inventory) if self.store.state().await.ok().and_then(|s| s.workers.get(&inventory.registration.id).cloned()).is_some_and(|w| w.peer.identity == peer && w == inventory.registration)) =>
             {
@@ -465,6 +472,16 @@ impl Handler {
                     .expect("presence")
                     .insert(worker.clone(), std::time::Instant::now());
                 Answer::WorkerRead(Ok(super::workload::WorkerView {
+                    artifacts: state
+                        .storage
+                        .artifacts
+                        .values()
+                        .filter(|a| a.manifest.worker == worker)
+                        .cloned()
+                        .collect(),
+                    stores: state.storage.stores.clone(),
+                    cleanup_allowed: state
+                        .artifact_cleanup_allowed(Some(&format!("worker/{worker}"))),
                     starts_allowed: state.recovery.as_ref().is_none_or(|r| r.resumed),
                     checkpoints: state
                         .checkpoints
@@ -492,6 +509,47 @@ impl Handler {
                         .collect(),
                 }))
             }
+            Message::StorageRead {
+                storage,
+                incarnation,
+            } => {
+                if let Err(e) = self.raft.ensure_linearizable().await {
+                    return Answer::StorageRead(Err(ApiError {
+                        message: e.to_string(),
+                        leader: e.forward_to_leader().and_then(|f| f.leader_id),
+                    }));
+                }
+                let state = match self.store.state().await {
+                    Ok(s) => s,
+                    Err(e) => return Answer::Refused(e.to_string()),
+                };
+                let Some(registration) = state
+                    .storage
+                    .stores
+                    .get(&storage)
+                    .filter(|r| r.peer.identity == peer && r.incarnation == incarnation)
+                else {
+                    return Answer::Refused(
+                        "storage identity or incarnation is not enrolled".into(),
+                    );
+                };
+                let cleanup_allowed =
+                    state.artifact_cleanup_allowed(Some(&format!("storage/{storage}")));
+                Answer::StorageRead(Ok(super::artifact::View {
+                    registration: registration.clone(),
+                    artifacts: state
+                        .storage
+                        .artifacts
+                        .values()
+                        .filter(|a| a.targets.contains(&storage))
+                        .cloned()
+                        .collect(),
+                    workers: state.workers,
+                    stores: state.storage.stores,
+                    checkpoints: state.checkpoints,
+                    cleanup_allowed,
+                }))
+            }
             Message::Read if is_admin => {
                 if let Err(e) = self.raft.ensure_linearizable().await {
                     return Answer::Read(Err(ApiError {
@@ -499,10 +557,16 @@ impl Handler {
                         leader: e.forward_to_leader().and_then(|f| f.leader_id),
                     }));
                 }
-                Answer::Read(self.store.state().await.map_err(|e| ApiError {
-                    message: e.to_string(),
-                    leader: None,
-                }))
+                Answer::Read(
+                    self.store
+                        .state()
+                        .await
+                        .map(Box::new)
+                        .map_err(|e| ApiError {
+                            message: e.to_string(),
+                            leader: None,
+                        }),
+                )
             }
             Message::Inspect if is_admin => {
                 let metrics = self.raft.metrics().borrow().clone();
@@ -538,7 +602,10 @@ impl ProtocolHandler for Handler {
                 .store
                 .state()
                 .await
-                .map(|s| s.workers.values().any(|w| w.peer.identity == peer))
+                .map(|s| {
+                    s.workers.values().any(|w| w.peer.identity == peer)
+                        || s.storage.stores.values().any(|w| w.peer.identity == peer)
+                })
                 .unwrap_or(false)
         {
             connection.close(403u32.into(), b"not authorized");
@@ -860,7 +927,10 @@ impl Client {
                 };
                 match result {
                     Ok(Ok(
-                        Answer::Write(Err(e)) | Answer::Read(Err(e)) | Answer::WorkerRead(Err(e)),
+                        Answer::Write(Err(e))
+                        | Answer::Read(Err(e))
+                        | Answer::WorkerRead(Err(e))
+                        | Answer::StorageRead(Err(e)),
                     )) => {
                         self.preferred = e.leader.filter(|id| self.peers.contains_key(id));
                         last_error = e.message;
@@ -893,7 +963,7 @@ impl Client {
     }
     pub async fn read(&mut self, deadline: Duration) -> Result<State> {
         match self.call(Message::Read, deadline).await? {
-            Answer::Read(Ok(state)) => Ok(state),
+            Answer::Read(Ok(state)) => Ok(*state),
             other => bail!("unexpected reply: {other:?}"),
         }
     }

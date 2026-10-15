@@ -71,7 +71,7 @@ impl Store {
         if identity.0 == FORMAT {
             return read(&table, "state")?.context("missing state");
         }
-        ensure!(identity.0 == 5, "unsupported source format");
+        ensure!(matches!(identity.0, 5 | 6), "unsupported source format");
         let state = super::upgrade::state(read(&table, "state")?.context("missing state")?)?;
         let applied = state
             .last_applied
@@ -104,7 +104,7 @@ impl Store {
         drop(logs);
         drop(table);
         drop(tx);
-        super::upgrade::backup(path)?;
+        super::upgrade::backup_version(path, identity.0)?;
         let hash = snapshot_id(&data);
         let mut tx = db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;

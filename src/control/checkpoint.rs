@@ -74,6 +74,7 @@ impl State {
     pub(crate) fn attempt_workload(&self, job: &super::queue::Job) -> Result<Workload> {
         let mut workload = job.workload.clone();
         if let Some(id) = &job.resume_from {
+            ensure!(!self.checkpoint_deleted(id), "checkpoint was deleted");
             let c = self.checkpoints.get(id).context("checkpoint is missing")?;
             ensure!(c.job == job.id, "checkpoint belongs to another job");
             let Workload::Job { spec, .. } = &mut workload else {
@@ -135,12 +136,26 @@ impl State {
         if let Err(e) = check() {
             return Reply::rejected(&e.to_string());
         }
+        let manifest = match super::artifact::Manifest::new(
+            c.worker.clone(),
+            c.attempt.to_string(),
+            super::artifact::Kind::Checkpoint(c.id.clone()),
+            c.content.files.clone(),
+        ) {
+            Ok(m) => m,
+            Err(e) => return Reply::rejected(&e.to_string()),
+        };
         self.checkpoints.insert(c.id.clone(), c.clone());
+        self.register_artifact(manifest);
         Reply::Recorded
     }
 
     pub fn suspend_job(&mut self, id: &str, revision: u64, checkpoint: &str) -> Reply {
         let check = || -> Result<(String, String)> {
+            ensure!(
+                !self.checkpoint_deleted(checkpoint),
+                "checkpoint was deleted"
+            );
             let job = self.jobs.get(id).context("unknown job")?;
             ensure!(job.revision == revision, "job revision conflict");
             ensure!(
