@@ -14,7 +14,7 @@ import subprocess
 import time
 
 from control_host_fixture import preservation
-from fleet import Fleet
+from fleet import Fleet, FleetError
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -50,7 +50,7 @@ def main():
     if not a.fake:
         for p in (Path.home() / '.fleet/jobs').glob('*/job.json'):
             assert (p.parent / 'exit.json').exists(), 'legacy job active'
-    result = {'real_tart': not a.fake, 'binary_sha256': hashlib.sha256(a.binary.read_bytes()).hexdigest()}
+    result = {'real_tart': not a.fake, 'binary_sha256': hashlib.sha256(a.binary.read_bytes()).hexdigest(), 'read_retries': 0}
     worker, client_home = a.home / 'worker', a.home / 'client'
     child, logs, cache = None, [], None
 
@@ -74,9 +74,19 @@ def main():
         end = time.monotonic() + seconds
         last = None
         while time.monotonic() < end:
-            last = call()
-            if predicate(last):
-                return last
+            try:
+                last = call()
+                if predicate(last):
+                    return last
+            except FleetError as error:
+                # These call sites only poll reads. Retry transport deadlines within the overall
+                # bound, and retain the count as qualification evidence. Semantic errors still fail.
+                if 'control-plane request deadline exceeded' not in str(error):
+                    raise
+                last = str(error)
+                result['read_retries'] += 1
+                if child is not None and child.poll() is not None:
+                    raise RuntimeError('fixture service exited during read polling') from error
             time.sleep(.5)
         raise RuntimeError(f'timed out: {last}')
 
@@ -133,7 +143,7 @@ def main():
         wait(lambda: client.job('resumable'), lambda j: j['phase'] == 'suspended')
         command('--home', client_home, 'resume', 'resumable', '--request-id', 'resume')
         client.retry('resume')
-        final = client.wait('resumable', timeout=300)
+        final = wait(lambda: client.job('resumable'), lambda j: j['phase'] in ('succeeded', 'failed', 'cancelled'), seconds=300)
         assert final['phase'] == 'succeeded', final
         attempts = client.attempts('resumable')
         assert len(attempts) == 2 and attempts[0]['execution'] != attempts[1]['execution']
@@ -152,7 +162,8 @@ def main():
         result.update(success=False, error=str(error))
         service_log = a.home / 'service.log'
         if service_log.exists():
-            print('Fixture service diagnostics:\n' + service_log.read_text()[-4000:], flush=True)
+            diagnostics = service_log.read_text()
+            print('Fixture service diagnostics:\n' + diagnostics[:2000] + '\n...\n' + diagnostics[-2000:], flush=True)
         raise
     finally:
         if child is not None:

@@ -47,6 +47,10 @@ jobs:
         run: cargo fmt --all --check
       - name: Build normal and historical regression clients
         run: cargo build --all-features --bins --locked
+      - name: Checkpoint CLI/Python lifecycle with isolated Tart test backend
+        run: |
+          python3 contrib/qualify_checkpoint_tart.py --fake --binary "$PWD/target/debug/fleet" \
+            --home /tmp/fleet-control-checkpoint-ci 2>&1 | tee checkpoint-client.log
       - name: Rust tests (including Raft, redb, workers, and headless M3 GUI)
         run: cargo test --all-features --locked --no-fail-fast -- --test-threads=2 2>&1 | tee rust-tests.log
       - name: Clippy
@@ -57,10 +61,6 @@ jobs:
         run: |
           python3 contrib/qualify_normal_multihost.py --local --binary "$PWD/target/debug/fleet" \
             --home /tmp/fleet-control-ci --port 29300 2>&1 | tee local-three.log
-      - name: Checkpoint CLI/Python lifecycle with isolated Tart test backend
-        run: |
-          python3 contrib/qualify_checkpoint_tart.py --fake --binary "$PWD/target/debug/fleet" \
-            --home /tmp/fleet-control-checkpoint-ci 2>&1 | tee checkpoint-client.log
       - name: Collect safe evidence
         if: always()
         run: |
