@@ -6,7 +6,7 @@ membership changes. It creates a new controller identity and wire incarnation, p
 logical Fleet identity in a signed recovery record, and requires explicit client and worker rebinding.
 Installed Fleet services and training records remain outside this workflow.
 
-The normal queue and recovery use protocol and storage format 6. See the [checkpoint/upgrade guide](CHECKPOINT_JOBS.md) for the current model. Recovery-bound format-5 state is deliberately refused by that upgrade; earlier lab formats and the SQLite coordinator are not imported. The recovery command
+The normal queue and recovery use protocol and storage format 7. See the [checkpoint/upgrade guide](CHECKPOINT_JOBS.md) for the current model. Recovery-bound format-5/6 state is deliberately refused by that upgrade; earlier lab formats and the SQLite coordinator are not imported. The recovery command
 accepts a concrete loopback or LAN address. See [multi-machine deployment](CONTROL_PLANE_NETWORKING.md)
 for the network configuration and physical-host qualification.
 
@@ -198,3 +198,6 @@ The qualification record (local hardware qualification record; excluded from the
 its boundaries. The subsequent [multi-host qualification](CONTROL_PLANE_NETWORKING.md) exercises this
 workflow across physical machines. Physical power loss, disk corruption and total loss of every usable
 controller database remain outside this milestone.
+
+Artifact storage roles also require explicit signed rebinding. Emergency recovery holds payload cleanup
+until the recovered catalog is reviewed; see [storage recovery safeguards](ARTIFACT_STORAGE.md#emergency-control-plane-recovery).

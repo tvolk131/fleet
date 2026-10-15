@@ -106,7 +106,7 @@ The selected checkpoint remains explicit even if another point is captured durin
 
 `logs`, `outputs`, and `fetch` default to the current/latest attempt. The export command verifies all bytes
 and writes `files/` plus `checkpoint.json` only after verification. It requires a fresh destination.
-A failed export can leave a partial directory, without a completed `checkpoint.json` descriptor.
+Failed exports remove their partial destination. Configured backups allow export with the worker offline.
 
 The [JSON CLI interface](NORMAL_FLEET.md#json-automation-interface) exposes `checkpoints`, `suspend`,
 `resume`, `attempts`, and `fetch_checkpoint`, plus `attempt` on `logs`, `outputs`, and `fetch`. Submit
@@ -121,24 +121,26 @@ and checkpoint export are available through the CLI/JSON interface.
 
 ## Durability and scope
 
-Checkpoints survive VM deletion and worker process restart, but their bytes remain on the original
-worker. Resume is restricted to that worker. A replicated control-plane catalog is not a checkpoint
-backup: disk loss can lose both sealed files and blobs. Export points you need to keep off-machine.
+Checkpoints survive VM deletion and worker process restart. Configured [storage agents](ARTIFACT_STORAGE.md)
+retain off-worker copies and can restore missing checkpoint inputs before resume on the original worker.
+A replicated control-plane catalog alone is not a checkpoint backup. Physical host-loss protection
+requires a copy on another machine; original input dependencies and worker identity/history are separate.
 The control plane need not be always online for capture, but quorum is required to publish metadata,
 accept suspend/resume, and resolve normal client reads.
 
-There is no automatic retry, cross-worker migration, checkpoint garbage collection, user-defined
+There is no automatic retry, cross-worker migration, user-defined
 checkpoint hook, exactly-once external side-effect guarantee, or automatic resume after failure in this
 milestone. Cancellation is terminal. Explicit suspension frees VM compute and disk reservations only
 after confirmed deletion; host checkpoint storage is retained separately and is bounded per attempt,
-not by a cluster-wide retention policy. Tart networking and VM isolation are unchanged.
+with explicit artifact retention/pinning and safe cleanup available through the storage catalog.
+Tart networking and VM isolation are unchanged.
 
-## Explicit format-5 upgrade
+## Explicit format-5/6 upgrade
 
-The model uses control-plane/worker format 6. Mixed-version operation is rejected. Fresh homes need no
-migration. For an existing format-5 installation:
+The model uses control-plane/worker format 7. Mixed-version operation is rejected. Fresh homes need no
+migration. For an existing format-5 or format-6 installation:
 
-1. Finish or cancel queued/active jobs and stop or delete persistent VMs. Do not upgrade under training.
+1. Finish or cancel queued/active jobs and stop or delete persistent VMs. Format 6 can also retain suspended jobs. Do not upgrade under training.
 2. If needed, cooperatively shrink to a single voter using the old binary and let it settle.
 3. Stop controller, worker, and client-staging services. Preserve old binaries and service definitions.
 4. Run the new binary offline, listing all applicable worker and client homes:
@@ -152,14 +154,14 @@ migration. For an existing format-5 installation:
    replicas to grow back to three. Never start an old replica against the upgraded cluster.
 
 The command locks and validates every selected database before writing, backs up each changed file with
-`.v5-backup` (a unique suffix prevents overwriting an earlier backup), and converts it transactionally.
+`.v5-backup` or `.v6-backup` (a unique suffix prevents overwriting an earlier backup), and converts it transactionally.
 It preserves cluster identity, applied log boundary, votes/membership, receipts, backend execution IDs,
-and completed job history. Each old job's existing assignment becomes its first attempt. A v6 snapshot
+and completed job history. Each old job's existing assignment becomes its first attempt. A current-format snapshot
 replaces the compacted historical log; original raw log bytes remain in the backup. Repeating the command
 skips already-converted databases, allowing recovery from interruption between database commits.
 
 It refuses active/uncertain work, unapplied log suffixes, mixed cluster identities, nonempty prototype
-job databases, pending membership operations, and format-5 installations bound to emergency recovery
+job databases, pending membership operations, and format-5/6 installations bound to emergency recovery
 history. Those need a separately reviewed migration, not an override. Historical released receipt
 tombstones remain non-executable; a transformed old request may report a fingerprint conflict rather
 than an expired receipt. Full retained receipts and saved requests are rehashed for the typed commands.
@@ -175,7 +177,7 @@ worker restart, leader loss, immutable attempts, resource-release ordering, and 
 and preservation. CI also runs:
 
 ```sh
-python3 contrib/qualify_checkpoint_tart.py --fake --binary "$PWD/target/debug/fleet" \
+python3 contrib/qualify_checkpoint_tart.py --fake --backup-restore --binary "$PWD/target/debug/fleet" \
   --home /tmp/fleet-control-checkpoint-ci
 ```
 

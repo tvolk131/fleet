@@ -21,6 +21,46 @@ const WAIT: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ApiRequest {
+    Storage,
+    ReviewStorageRecovery {
+        request_id: String,
+        expected_catalog: String,
+        #[serde(default)]
+        unavailable_locations: BTreeSet<String>,
+    },
+    Artifacts {
+        #[serde(default)]
+        attempt: Option<String>,
+    },
+    EnrollStorage {
+        request_id: String,
+        registration: super::artifact::Registration,
+    },
+    StoragePolicy {
+        request_id: String,
+        expected_revision: u64,
+        policy: super::artifact::Policy,
+    },
+    ArtifactRetention {
+        request_id: String,
+        id: String,
+        expected_revision: u64,
+        pinned: bool,
+        expires_at: Option<u64>,
+    },
+    DeleteArtifact {
+        request_id: String,
+        id: String,
+        expected_revision: u64,
+    },
+    ExpireArtifacts {
+        request_id: String,
+        as_of: u64,
+    },
+    FetchArtifact {
+        id: String,
+        destination: PathBuf,
+    },
     Status,
     Queue,
     Job {
@@ -143,7 +183,13 @@ fn log_size() -> u32 {
 impl ApiRequest {
     pub fn request_id(&self) -> Option<&str> {
         match self {
-            Self::Submit { request_id, .. }
+            Self::ReviewStorageRecovery { request_id, .. }
+            | Self::EnrollStorage { request_id, .. }
+            | Self::StoragePolicy { request_id, .. }
+            | Self::ArtifactRetention { request_id, .. }
+            | Self::DeleteArtifact { request_id, .. }
+            | Self::ExpireArtifacts { request_id, .. }
+            | Self::Submit { request_id, .. }
             | Self::Cancel { request_id, .. }
             | Self::Suspend { request_id, .. }
             | Self::Resume { request_id, .. }
@@ -245,6 +291,48 @@ impl AppClient {
             return self.send(prepared).await;
         }
         let mutation = match api {
+            ApiRequest::ReviewStorageRecovery {
+                expected_catalog,
+                unavailable_locations,
+                ..
+            } => Mutation::ReviewStorageRecovery {
+                expected_catalog: expected_catalog.clone(),
+                unavailable_locations: unavailable_locations.clone(),
+            },
+            ApiRequest::EnrollStorage { registration, .. } => {
+                Mutation::EnrollStorage(registration.clone())
+            }
+            ApiRequest::StoragePolicy {
+                expected_revision,
+                policy,
+                ..
+            } => Mutation::StoragePolicy {
+                expected_revision: *expected_revision,
+                policy: policy.clone(),
+            },
+            ApiRequest::ArtifactRetention {
+                id,
+                expected_revision,
+                pinned,
+                expires_at,
+                ..
+            } => Mutation::ArtifactRetention {
+                id: id.clone(),
+                expected_revision: *expected_revision,
+                pinned: *pinned,
+                expires_at: *expires_at,
+            },
+            ApiRequest::DeleteArtifact {
+                id,
+                expected_revision,
+                ..
+            } => Mutation::DeleteArtifact {
+                id: id.clone(),
+                expected_revision: *expected_revision,
+            },
+            ApiRequest::ExpireArtifacts { as_of, .. } => {
+                Mutation::ExpireArtifacts { as_of: *as_of }
+            }
             ApiRequest::Submit {
                 id,
                 job,
@@ -442,6 +530,32 @@ impl AppClient {
     }
     pub async fn execute(&mut self, api: ApiRequest) -> Result<Value> {
         match &api {
+            ApiRequest::Storage => {
+                let state = self.read().await?;
+                Ok(
+                    json!({"stores":state.storage.stores,"policy":state.storage.policy,"revision":state.storage.policy_revision,"catalog_fingerprint":state.artifact_catalog_fingerprint(),"cleanup_allowed":state.artifact_cleanup_allowed(None),"quarantined_locations":state.storage.quarantined_locations}),
+                )
+            }
+            ApiRequest::Artifacts { attempt } => {
+                let state = self.read().await?;
+                Ok(json!(state.storage.artifacts.values().filter(|a| attempt.as_ref().is_none_or(|id| a.manifest.attempt == *id)).map(|a| json!({"artifact":a,"protected":state.artifact_protected(&a.manifest.id)})).collect::<Vec<_>>()))
+            }
+            ApiRequest::FetchArtifact { id, destination } => {
+                let state = self.read().await?;
+                let artifact = state
+                    .storage
+                    .artifacts
+                    .get(id)
+                    .context("unknown artifact")?;
+                super::artifact_io::fetch_available(
+                    &self.transport.endpoint,
+                    &state,
+                    artifact,
+                    destination,
+                )
+                .await?;
+                Ok(json!({"artifact":id,"destination":destination,"files":artifact.manifest.files}))
+            }
             ApiRequest::Submit { id, .. } => {
                 let mut answer = self.prepare_mutation(&api).await?;
                 if answer["reply"].get("Accepted").is_some() {
@@ -452,7 +566,13 @@ impl AppClient {
                 }
                 Ok(answer)
             }
-            ApiRequest::Cancel { .. }
+            ApiRequest::ReviewStorageRecovery { .. }
+            | ApiRequest::EnrollStorage { .. }
+            | ApiRequest::StoragePolicy { .. }
+            | ApiRequest::ArtifactRetention { .. }
+            | ApiRequest::DeleteArtifact { .. }
+            | ApiRequest::ExpireArtifacts { .. }
+            | ApiRequest::Cancel { .. }
             | ApiRequest::Suspend { .. }
             | ApiRequest::Resume { .. }
             | ApiRequest::InstanceCreate { .. }
@@ -499,7 +619,7 @@ impl AppClient {
                     );
                 }
                 Ok(
-                    json!({"cluster":state.cluster,"quorum":true,"membership":state.membership_view(),"replicas":replicas,"recovery":state.recovery,"pending":state.scheduling_order().len()}),
+                    json!({"format":state.format,"cluster":state.cluster,"quorum":true,"membership":state.membership_view(),"replicas":replicas,"recovery":state.recovery,"pending":state.scheduling_order().len()}),
                 )
             }
             ApiRequest::Queue => Ok(json!(job_views(&self.read().await?))),
@@ -539,24 +659,20 @@ impl AppClient {
             ApiRequest::FetchCheckpoint { id, destination } => {
                 let state = self.read().await?;
                 let checkpoint = state.checkpoints.get(id).context("unknown checkpoint")?;
-                let worker = state
-                    .workers
-                    .get(&checkpoint.worker)
-                    .context("unknown checkpoint worker")?;
-                std::fs::create_dir(destination)
-                    .context("checkpoint destination must be a new directory")?;
-                let cache = self
-                    .home
-                    .join("downloads")
-                    .join(format!("{:032x}", rand::random::<u128>()));
-                let store = crate::blobs::open(&cache).await?;
+                ensure!(!state.checkpoint_deleted(id), "checkpoint was deleted");
+                let artifact = state
+                    .storage
+                    .artifacts
+                    .values()
+                    .find(|a| a.manifest.kind == super::artifact::Kind::Checkpoint(id.clone()))
+                    .context("checkpoint artifact unavailable")?;
+                std::fs::create_dir(destination).context("checkpoint destination must be new")?;
                 let result = async {
                     let files = destination.join("files");
-                    runtime::fetch_files(
-                        &store,
+                    super::artifact_io::fetch_available(
                         &self.transport.endpoint,
-                        &worker.peer,
-                        &checkpoint.content.files,
+                        &state,
+                        artifact,
                         &files,
                     )
                     .await?;
@@ -567,12 +683,10 @@ impl AppClient {
                     Ok::<_, anyhow::Error>(json!({"checkpoint":id,"destination":destination}))
                 }
                 .await;
-                let closed = store.shutdown().await;
-                let cleaned = std::fs::remove_dir_all(&cache);
-                let result = result?;
-                closed?;
-                cleaned?;
-                Ok(result)
+                if result.is_err() {
+                    let _ = std::fs::remove_dir_all(destination);
+                }
+                result
             }
             ApiRequest::Attempts { id } => {
                 let state = self.read().await?;
@@ -636,10 +750,32 @@ impl AppClient {
                         from,
                         max,
                     },
-                    ApiRequest::Outputs { .. } => DataRequest::Outputs {
-                        execution: a.execution.clone(),
-                    },
+                    ApiRequest::Outputs { .. } => {
+                        if let Some(artifact) = state.storage.artifacts.values().find(|m| {
+                            m.manifest.attempt == a.id
+                                && m.manifest.kind == super::artifact::Kind::FinalOutputs
+                        }) {
+                            ensure!(!artifact.deleted, "final outputs were deleted");
+                            return Ok(json!({"Outputs":artifact.manifest.files}));
+                        }
+                        DataRequest::Outputs {
+                            execution: a.execution.clone(),
+                        }
+                    }
                     ApiRequest::Fetch { destination, .. } => {
+                        if let Some(artifact) = state.storage.artifacts.values().find(|m| {
+                            m.manifest.attempt == a.id
+                                && m.manifest.kind == super::artifact::Kind::FinalOutputs
+                        }) {
+                            super::artifact_io::fetch_available(
+                                &self.transport.endpoint,
+                                &state,
+                                artifact,
+                                &destination,
+                            )
+                            .await?;
+                            return Ok(json!(artifact.manifest.files));
+                        }
                         // Each fetch has a separate transient client cache; parallel downloads do not lock the input spool.
                         let cache = self
                             .home
@@ -685,7 +821,8 @@ pub fn job_views(state: &State) -> Vec<Value> {
         let phase = if j.phase == JobPhase::Active { a.and_then(|a|a.observed.as_ref()).map(|(_,o)|o.phase.label()).unwrap_or_else(|| "pending".into()) } else { format!("{:?}",j.phase).to_lowercase() };
         let reasons = if j.phase == JobPhase::Queued { state.workers.keys().map(|w|(w.clone(),state.placement_candidate(&j.id,w).err().map(|e|e.to_string()).unwrap_or_else(||"waiting for worker poll and scheduler".into()))).collect::<BTreeMap<_,_>>() } else { BTreeMap::new() };
         let attempts: Vec<_> = j.attempts.iter().filter_map(|id| state.assignments.get(id.as_ref())).collect();
-        json!({"id":j.id,"revision":j.revision,"phase":phase,"cancel_requested":matches!(j.phase,JobPhase::Cancelling|JobPhase::Cancelled),"priority":j.priority,"after":j.after,"workload":j.workload,"assignment":a,"attempts":attempts,"latest_checkpoint":latest_checkpoint(state,&j.id),"resume_from":j.resume_from,"waiting":reasons})
+        let artifacts: Vec<_> = state.storage.artifacts.values().filter(|a| j.attempts.iter().any(|id| id.as_ref() == a.manifest.attempt)).collect();
+        json!({"artifacts":artifacts,"id":j.id,"revision":j.revision,"phase":phase,"cancel_requested":matches!(j.phase,JobPhase::Cancelling|JobPhase::Cancelled),"priority":j.priority,"after":j.after,"workload":j.workload,"assignment":a,"attempts":attempts,"latest_checkpoint":latest_checkpoint(state,&j.id),"resume_from":j.resume_from,"waiting":reasons})
     }).collect()
 }
 
@@ -704,7 +841,7 @@ pub fn latest_checkpoint<'a>(
     state
         .checkpoints
         .values()
-        .filter(|c| c.attempt.as_ref() == a.id)
+        .filter(|c| c.attempt.as_ref() == a.id && !state.checkpoint_deleted(&c.id))
         .max_by_key(|c| {
             (
                 c.content.captured_at,

@@ -23,6 +23,8 @@ use std::{
     time::Duration,
 };
 
+mod artifacts;
+
 pub const DATA_ALPN: &[u8] = b"fleet/worker-data/1";
 const JOURNAL: TableDefinition<&str, &[u8]> = TableDefinition::new("worker_journal");
 const MAX_FRAME: usize = 8 << 20;
@@ -38,6 +40,10 @@ pub struct WorkerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JournalState {
+    #[serde(default)]
+    artifacts: BTreeMap<String, super::artifact::Manifest>,
+    #[serde(default)]
+    deleted_artifacts: BTreeSet<String>,
     starts_allowed: bool,
     checkpoints: BTreeMap<String, super::checkpoint::Checkpoint>,
     known_checkpoints: BTreeSet<String>,
@@ -90,6 +96,8 @@ impl Journal {
                     "worker journal has no durable identity; explicit recovery required"
                 );
                 let state = JournalState {
+                    artifacts: BTreeMap::new(),
+                    deleted_artifacts: BTreeSet::new(),
                     starts_allowed: true,
                     checkpoints: BTreeMap::new(),
                     known_checkpoints: BTreeSet::new(),
@@ -336,6 +344,8 @@ pub struct Worker {
     pub store: iroh_blobs::api::Store,
     journal: Journal,
     agent: Agent,
+    artifact_access: Arc<std::sync::RwLock<super::artifact_io::Access>>,
+    storage_view: Option<WorkerView>,
 }
 
 impl Worker {
@@ -349,6 +359,7 @@ impl Worker {
         let table = tx.open_table(JOURNAL)?;
         let raw: serde_json::Value =
             serde_json::from_slice(table.get("state")?.context("missing worker state")?.value())?;
+        let source_format = raw["format"].as_u64().context("worker format missing")? as u32;
         let already = raw["format"] == super::FORMAT;
         let converted = super::upgrade::journal(raw)?;
         let state: JournalState = serde_json::from_value(converted)?;
@@ -365,7 +376,7 @@ impl Worker {
         }
         drop(table);
         drop(tx);
-        super::upgrade::backup(&home.join("worker.redb"))?;
+        super::upgrade::backup_version(&home.join("worker.redb"), source_format)?;
         let mut tx = db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         tx.open_table(JOURNAL)?
@@ -514,7 +525,17 @@ impl Worker {
                 store: store.clone(),
             },
         )?;
+        let artifact_access =
+            Arc::new(std::sync::RwLock::new(super::artifact_io::Access::default()));
         let router = Router::builder(endpoint.clone())
+            .accept(
+                super::artifact_io::ALPN,
+                super::artifact_io::Handler {
+                    cluster: config.cluster.clone(),
+                    access: artifact_access.clone(),
+                    slots: Arc::new(tokio::sync::Semaphore::new(4)),
+                },
+            )
             .accept(
                 DATA_ALPN,
                 DataHandler {
@@ -540,12 +561,14 @@ impl Worker {
             store,
             journal,
             agent,
+            artifact_access,
+            storage_view: None,
         })
     }
 
     /// Network failure does not prevent local supervision. Accepted intents remain authoritative.
     pub async fn tick(&mut self) -> Result<()> {
-        let r = &self.config.registration;
+        let r = self.config.registration.clone();
         let poll = self
             .client
             .call(
@@ -604,7 +627,8 @@ impl Worker {
                         return Ok(());
                     }
                 }
-                self.journal.accept(view)?;
+                self.journal.accept(view.clone())?;
+                self.storage_view = Some(view);
                 true
             }
             Ok(other) => bail!("unexpected worker poll: {other:?}"),
@@ -637,6 +661,9 @@ impl Worker {
             self.journal.observe(a, observation)?;
         }
         if online {
+            if let Err(e) = self.reconcile_artifacts().await {
+                tracing::warn!(error=%e, "artifact lifecycle will retry");
+            }
             let saved = self.journal.read()?;
             for checkpoint in saved
                 .checkpoints
@@ -802,6 +829,7 @@ impl Worker {
                     }
                 } else {
                     if !attempted {
+                        self.restore_checkpoint(a).await?;
                         let hashes = spec.inputs.values().map(|i| i.hash).collect();
                         if let proto::Response::Missing(missing) = self
                             .agent

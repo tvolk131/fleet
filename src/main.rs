@@ -32,6 +32,42 @@ enum Command {
         #[command(subcommand)]
         action: ServiceCommand,
     },
+    Storage {
+        #[command(subcommand)]
+        action: StorageCommand,
+    },
+    Artifacts {
+        #[arg(long)]
+        attempt: Option<String>,
+    },
+    FetchArtifact {
+        id: String,
+        destination: PathBuf,
+    },
+    ArtifactRetention {
+        id: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        pinned: bool,
+        #[arg(long)]
+        expires_at: Option<u64>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    DeleteArtifact {
+        id: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    ExpireArtifacts {
+        #[arg(long)]
+        as_of: u64,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
     Status,
     /// Change membership using prepared public peer descriptors; requires current quorum.
     Replicas {
@@ -191,6 +227,34 @@ enum ClientCommand {
     },
 }
 #[derive(Subcommand)]
+enum StorageCommand {
+    /// After inspecting recovered retention/copy inventory, authorize cleanup; named unavailable locations remain quarantined.
+    ReviewRecovery {
+        #[arg(long)]
+        catalog_fingerprint: String,
+        #[arg(long)]
+        unavailable_location: Vec<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    Status,
+    Enroll {
+        registration: PathBuf,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    Policy {
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        checkpoint: Vec<String>,
+        #[arg(long)]
+        output: Vec<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+}
+#[derive(Subcommand)]
 enum ServiceCommand {
     Configure {
         #[arg(long)]
@@ -199,6 +263,8 @@ enum ServiceCommand {
         controller_home: Option<PathBuf>,
         #[arg(long)]
         worker_home: Option<PathBuf>,
+        #[arg(long)]
+        storage_home: Option<PathBuf>,
         #[arg(long)]
         client_home: Option<PathBuf>,
         #[arg(long)]
@@ -317,6 +383,7 @@ async fn run(args: Args) -> Result<()> {
                     config,
                     controller_home,
                     worker_home,
+                    storage_home,
                     client_home,
                     bootstrap,
                 } => {
@@ -324,6 +391,7 @@ async fn run(args: Args) -> Result<()> {
                     let settings = ServiceConfig {
                         controller_home,
                         worker_home,
+                        storage_home,
                         client_home,
                         bootstrap,
                     };
@@ -369,6 +437,69 @@ async fn run(args: Args) -> Result<()> {
             id,
             operation,
         } => return fleet::instances::guest::supervise(&instance_home, &id, &operation),
+        Command::Storage { action } => match action {
+            StorageCommand::Status => ApiRequest::Storage,
+            StorageCommand::ReviewRecovery {
+                catalog_fingerprint,
+                unavailable_location,
+                request_id: rid,
+            } => ApiRequest::ReviewStorageRecovery {
+                request_id: request_id(rid),
+                expected_catalog: catalog_fingerprint,
+                unavailable_locations: unavailable_location.into_iter().collect(),
+            },
+            StorageCommand::Enroll {
+                registration,
+                request_id: rid,
+            } => ApiRequest::EnrollStorage {
+                request_id: request_id(rid),
+                registration: serde_json::from_slice(&std::fs::read(registration)?)?,
+            },
+            StorageCommand::Policy {
+                revision,
+                checkpoint,
+                output,
+                request_id: rid,
+            } => ApiRequest::StoragePolicy {
+                request_id: request_id(rid),
+                expected_revision: revision,
+                policy: fleet::control::artifact::Policy {
+                    checkpoints: checkpoint.into_iter().collect(),
+                    outputs: output.into_iter().collect(),
+                },
+            },
+        },
+        Command::Artifacts { attempt } => ApiRequest::Artifacts { attempt },
+        Command::FetchArtifact { id, destination } => ApiRequest::FetchArtifact { id, destination },
+        Command::ArtifactRetention {
+            id,
+            revision,
+            pinned,
+            expires_at,
+            request_id: rid,
+        } => ApiRequest::ArtifactRetention {
+            request_id: request_id(rid),
+            id,
+            expected_revision: revision,
+            pinned,
+            expires_at,
+        },
+        Command::DeleteArtifact {
+            id,
+            revision,
+            request_id: rid,
+        } => ApiRequest::DeleteArtifact {
+            request_id: request_id(rid),
+            id,
+            expected_revision: revision,
+        },
+        Command::ExpireArtifacts {
+            as_of,
+            request_id: rid,
+        } => ApiRequest::ExpireArtifacts {
+            request_id: request_id(rid),
+            as_of,
+        },
         Command::Status => ApiRequest::Status,
         Command::Replicas {
             add,

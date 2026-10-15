@@ -1,4 +1,4 @@
-//! Explicit offline conversion of idle format-5 metadata. No rolling mixed-version protocol.
+//! Explicit offline conversion of idle format-5/6 metadata. No rolling mixed-version protocol.
 use super::{Mutation, State};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -65,6 +65,53 @@ pub(crate) fn mutation(value: &mut Value, assignments: &Value) -> Result<()> {
 }
 
 pub(crate) fn state(mut value: Value) -> Result<State> {
+    if value["format"] == 6 {
+        let mut state: State = serde_json::from_value(value)?;
+        ensure!(
+            state.recovery.is_none(),
+            "format-6 recovery-bound state requires a separate migration"
+        );
+        ensure!(
+            state.membership.voter_ids().count() == 1
+                && state
+                    .membership_operations
+                    .values()
+                    .all(|op| op.stage == super::membership::MembershipStage::Complete),
+            "upgrade requires settled singleton membership"
+        );
+        ensure!(
+            state.assignments.values().all(|a| a.terminal()
+                || a.observed
+                    .as_ref()
+                    .is_some_and(|(revision, o)| *revision == a.revision
+                        && a.desired
+                            == super::workload::Desired::Instance(
+                                super::workload::InstanceDesired::Stopped
+                            )
+                        && o.phase
+                            == super::workload::WorkPhase::Instance(
+                                super::workload::InstancePhase::Stopped
+                            ))),
+            "finish or suspend jobs and stop VMs before upgrade"
+        );
+        ensure!(
+            state
+                .jobs
+                .values()
+                .all(|j| j.phase.terminal() || j.phase == super::queue::JobPhase::Suspended),
+            "finish or suspend all logical jobs before upgrade"
+        );
+        state.format = super::FORMAT;
+        for cp in state.checkpoints.clone().into_values() {
+            state.register_artifact(super::artifact::Manifest::new(
+                cp.worker.clone(),
+                cp.attempt.to_string(),
+                super::artifact::Kind::Checkpoint(cp.id.clone()),
+                cp.content.files.clone(),
+            )?);
+        }
+        return Ok(state);
+    }
     ensure!(value["format"] == 5, "upgrade requires format 5");
     ensure!(
         value["recovery"].is_null(),
@@ -152,6 +199,28 @@ pub(crate) fn journal(mut value: Value) -> Result<Value> {
     if value["format"] == super::FORMAT {
         return Ok(value);
     }
+    if value["format"] == 6 {
+        ensure!(
+            value["recovery_inventory"].is_null() && value["recovery_binding"].is_null(),
+            "format-6 recovery-bound worker requires a separate migration"
+        );
+        for (_, item) in value["observations"]
+            .as_object()
+            .context("missing worker observations")?
+        {
+            let o: super::workload::Observation = serde_json::from_value(item[1].clone())?;
+            ensure!(
+                o.phase.terminal()
+                    || o.phase
+                        == super::workload::WorkPhase::Instance(
+                            super::workload::InstancePhase::Stopped
+                        ),
+                "worker has unfinished accepted work"
+            );
+        }
+        value["format"] = json!(super::FORMAT);
+        return Ok(value);
+    }
     ensure!(
         value["format"] == 5
             && value["recovery_inventory"].is_null()
@@ -197,12 +266,15 @@ pub(crate) fn journal(mut value: Value) -> Result<Value> {
 }
 
 pub(crate) fn backup(path: &Path) -> Result<()> {
+    backup_version(path, 5)
+}
+pub(crate) fn backup_version(path: &Path, version: u32) -> Result<()> {
     let mut backup = path.with_extension(format!(
-        "{}.v5-backup",
+        "{}.v{version}-backup",
         path.extension().and_then(|s| s.to_str()).unwrap_or("file")
     ));
     if backup.exists() {
-        backup = backup.with_extension(format!("v5-backup-{:016x}", rand::random::<u64>()));
+        backup = backup.with_extension(format!("v{version}-backup-{:016x}", rand::random::<u64>()));
     }
     let mut target = std::fs::OpenOptions::new()
         .write(true)

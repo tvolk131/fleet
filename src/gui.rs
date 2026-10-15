@@ -601,7 +601,29 @@ impl App {
                     .and_then(Value::as_u64)
                     .map(|p| format!(" at position {p}"))
                     .unwrap_or_default();
-                card = card.push(typography(format!("Verified checkpoint{position}, stored on this worker. Suspending discards work after it."), TypeScale::BodySmall).style(muted));
+                let backups = j["artifacts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|a| a.pointer("/manifest/kind/Checkpoint") == cp.get("id"))
+                    .and_then(|a| a["copies"].as_object())
+                    .map(|copies| {
+                        copies
+                            .iter()
+                            .filter(|(location, _)| location.starts_with("storage/"))
+                            .map(|(location, copy)| {
+                                format!(
+                                    "{}: {}",
+                                    location.trim_start_matches("storage/"),
+                                    copy["phase"].as_str().unwrap_or("Unknown")
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "no backup target configured".into());
+                card = card.push(typography(format!("Verified checkpoint{position}. Backups — {backups}. Suspending discards work after it."), TypeScale::BodySmall).style(muted));
             }
             if let Some(worker) = j.pointer("/assignment/worker").and_then(Value::as_str) {
                 card = card.push(
@@ -913,6 +935,7 @@ mod tests {
         let mut app = sample();
         app.jobs[0]["latest_checkpoint"] =
             json!({"id":"saved-point","content":{"manifest":{"position":48}}});
+        app.jobs[0]["artifacts"] = json!([{"manifest":{"kind":{"Checkpoint":"saved-point"}},"copies":{"storage/backup-1":{"phase":"Ready"},"storage/backup-2":{"phase":"Pending"}}}]);
         app.jobs[0]["assignment"]["attempt"] = json!({"number":1});
         app.selected = Some("training".into());
         let mut ui = simulator(&app);

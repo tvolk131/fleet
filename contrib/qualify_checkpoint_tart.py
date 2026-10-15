@@ -28,10 +28,12 @@ def main():
     parser.add_argument('--instances', type=Path)
     parser.add_argument('--image-cache', type=Path)
     parser.add_argument('--job', type=Path)
+    parser.add_argument('--backup-restore', action='store_true', help='qualify a separate storage home with source checkpoint/cache removed')
     a = parser.parse_args()
     assert a.home.is_absolute() and a.home.resolve().is_relative_to(Path('/tmp').resolve())
     assert a.home.name.startswith('fleet-control-'), 'isolated fixture prefix required'
     assert a.fake or (a.instances and a.image_cache)
+    assert not (a.backup_restore and a.job), 'backup fixture uses the built-in job without original input dependencies'
     a.home.mkdir(mode=0o700, parents=True, exist_ok=False)
     # Supervisors and restarted services must use one immutable candidate, even while a developer rebuilds.
     shutil.copy2(a.binary.resolve(), a.home / 'fleet')
@@ -53,6 +55,7 @@ def main():
             assert (p.parent / 'exit.json').exists(), 'legacy job active'
     result = {'real_tart': not a.fake, 'binary_sha256': hashlib.sha256(a.binary.read_bytes()).hexdigest(), 'read_retries': 0}
     worker, client_home = a.home / 'worker', a.home / 'client'
+    storage_home = a.home / 'storage'
     child, logs, cache = None, [], None
 
     def save(name, value):
@@ -114,7 +117,13 @@ def main():
         cache = worker / 'backend/instance-tart/cache'
         cache.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(['/bin/cp', '-cR', str(a.image_cache), str(cache)], check=True)
-    command('service', 'configure', '--config', a.home / 'service.json', '--controller-home', a.home / 'seed/node-1', '--worker-home', worker, '--bootstrap')
+    storage_args = []
+    if a.backup_restore:
+        command('cluster', 'prepare-storage', '--home', storage_home, '--config', client_home / 'config.json',
+                '--id', 'checkpoint-backup', '--failure-domain', 'same-qualification-machine', '--capacity-bytes', 16 << 20)
+        storage_args = ['--storage-home', storage_home]
+    command('service', 'configure', '--config', a.home / 'service.json', '--controller-home', a.home / 'seed/node-1',
+            '--worker-home', worker, '--bootstrap', *storage_args)
     request = partial(api_result, a.binary, client_home)
     first = "import hashlib,json,pathlib,time; p=pathlib.Path('checkpoints/one'); p.mkdir(parents=True); (p/'state').write_text('7'); m={'version':1,'position':7,'files':{'state':{'size':1,'sha256':hashlib.sha256(b'7').hexdigest()}}}; (p/'ready.tmp').write_text(json.dumps(m)); (p/'ready.tmp').rename(p/'fleet.json'); print('initial-once',flush=True); time.sleep(180)"
     resume = "import pathlib,sys; n=int(pathlib.Path(sys.argv[1]).read_text()); pathlib.Path('result.txt').write_text(str(n+1)); print('resumed-once',flush=True)"
@@ -126,9 +135,20 @@ def main():
     try:
         child = start()
         command('--home', client_home, 'enroll', worker / 'enroll.json', '--request-id', 'enroll')
+        if a.backup_restore:
+            command('--home', client_home, 'storage', 'enroll', storage_home / 'registration.json', '--request-id', 'storage-enroll')
+            command('--home', client_home, 'storage', 'policy', '--revision', 0, '--checkpoint', 'checkpoint-backup', '--output', 'checkpoint-backup', '--request-id', 'storage-policy')
         request(op='submit', id='resumable', request_id='submit', worker='checkpoint-worker', memory_mb=vm_memory, job=job)
         cp = wait(lambda: request(op='checkpoints', id='resumable'), bool)[0]
         print('Verified checkpoint published', flush=True)
+        backup_artifact = None
+        if a.backup_restore:
+            backups = wait(lambda: request(op='artifacts'), lambda rows: any(
+                r['artifact']['manifest']['kind'] == {'Checkpoint': cp['id']}
+                and r['artifact']['copies']['storage/checkpoint-backup']['phase'] == 'Ready' for r in rows))
+            backup_artifact = next(r['artifact'] for r in backups if r['artifact']['manifest']['kind'] == {'Checkpoint': cp['id']})
+            result['checkpoint_backup_ready'] = True
+            result['physical_failure_domain'] = 'same-machine; does not qualify physical host loss'
         request(op='fetch_checkpoint', id=cp['id'], destination=str(a.home / 'checkpoint-download'))
         assert (a.home / 'checkpoint-download/checkpoint.json').is_file()
         request(op='suspend', id='resumable', checkpoint=cp['id'], request_id='suspend',
@@ -140,8 +160,17 @@ def main():
         assert all(json.loads(p.read_text())['state'] == 'deleted' for p in (worker / 'backend/instances').glob('*/observed.json'))
         child.kill()
         child.wait(timeout=10)
+        if a.backup_restore:
+            (worker / 'blobs').rename(a.home / 'unavailable-worker-blobs')
+            source = worker / 'backend/jobs' / attempts[0]['execution'] / 'checkpoints' / cp['content']['id'] / 'files'
+            source.rename(a.home / 'unavailable-checkpoint-files')
+            result['source_checkpoint_and_blob_cache_unavailable'] = True
         child = start()
         suspended = wait(lambda: request(op='job', id='resumable'), lambda j: j['phase'] == 'suspended')
+        if a.backup_restore:
+            request(op='fetch_checkpoint', id=cp['id'], destination=str(a.home / 'backup-only-export'))
+            assert (a.home / 'backup-only-export/files/state').read_text() == '7'
+            result['backup_only_export_verified'] = True
         request(op='resume', id='resumable', request_id='resume', expected_revision=suspended['revision'])
         request(op='retry', request_id='resume')
         final = wait(lambda: request(op='job', id='resumable'), lambda j: j['phase'] in ('succeeded', 'failed', 'cancelled'), seconds=300)
@@ -156,6 +185,20 @@ def main():
             assert (a.home / 'outputs/result.txt').read_text() == '8'
             assert request(op='logs', id='resumable', attempt=1)['Logs']['data'].count('initial-once') == 1
             assert request(op='logs', id='resumable', attempt=2)['Logs']['data'].count('resumed-once') == 1
+        if a.backup_restore:
+            assert (worker / 'restored' / backup_artifact['manifest']['id'] / 'state').read_text() == '7'
+            outputs = wait(lambda: request(op='artifacts'), lambda rows: any(
+                r['artifact']['manifest']['kind'] == 'FinalOutputs' and r['artifact']['copies']['storage/checkpoint-backup']['phase'] == 'Ready' for r in rows))
+            save('artifacts-before-cleanup.json', outputs)
+            for row in outputs:
+                artifact = row['artifact']
+                command('--home', client_home, 'delete-artifact', artifact['manifest']['id'], '--revision', artifact['revision'], '--request-id', 'delete-' + artifact['manifest']['id'])
+            wait(lambda: request(op='artifacts'), lambda rows: all(r['artifact']['deleted'] and all(
+                copy['phase'] == 'Deleted' for copy in r['artifact']['copies'].values()) for r in rows))
+            result['retained_payloads_deleted'] = True
+            result['off_worker_restore_verified'] = True
+            result['storage_accounting'] = command('cluster', 'storage-usage', '--home', storage_home)
+            assert len(request(op='attempts', id='resumable')) == 2
         result.update(success=True, checkpoint_export_verified=True, vm_deleted_before_resume=True,
                       combined_service_restart=True, unique_attempts=2, stable_job_identity=True)
         print('Suspension, restart, fresh-VM resume, and historical logs passed', flush=True)

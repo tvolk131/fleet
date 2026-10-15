@@ -360,3 +360,454 @@ time.sleep(150)
     w.shutdown().await.unwrap();
     c.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checkpoint_backup_restores_without_worker_payloads_and_retention_preserves_history() {
+    use fleet::control::{
+        artifact::{self, CopyPhase, Kind},
+        artifact_io, storage,
+    };
+    let mut c = Cluster::new(3).await;
+    let (home, config) = prepare(&mut c, true).await;
+    let storage_home = c.home.0.join("storage");
+    let key = fleet::keys::load_or_create(&storage_home.join("node.key")).unwrap();
+    let socket = reserve_socket();
+    let registration = artifact::Registration {
+        id: "backup".into(),
+        peer: Peer {
+            identity: key.public(),
+            address: socket.local_addr().unwrap(),
+        },
+        incarnation: "storage-1".into(),
+        failure_domain: "same-test-machine".into(),
+        capacity_bytes: 16 << 20,
+    };
+    let storage_config = storage::Config {
+        cluster: c.config.cluster.clone(),
+        registration: registration.clone(),
+        controllers: c.config.peers.clone(),
+        administrators: c.config.administrators.clone(),
+    };
+    storage::Agent::initialize(&storage_home, &storage_config).unwrap();
+    drop(socket);
+    for (id, mutation) in [
+        ("storage-enroll", Mutation::EnrollStorage(registration)),
+        (
+            "storage-policy",
+            Mutation::StoragePolicy {
+                expected_revision: 0,
+                policy: artifact::Policy {
+                    checkpoints: BTreeSet::from(["backup".into()]),
+                    outputs: BTreeSet::from(["backup".into()]),
+                },
+            },
+        ),
+    ] {
+        assert_eq!(
+            c.client
+                .write(
+                    Request {
+                        origin: c.config.cluster.clone(),
+                        id: id.into(),
+                        mutation
+                    },
+                    WAIT
+                )
+                .await
+                .unwrap(),
+            Reply::Recorded
+        );
+    }
+    let mut storage = storage::Agent::start(&storage_home, storage_config.clone())
+        .await
+        .unwrap();
+    let mut w = Worker::start(&home, config.clone(), hello()).await.unwrap();
+    queued(&mut c, resumable()).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let checkpoint = loop {
+        if let Err(error) = w.tick().await {
+            eprintln!("worker will retry: {error:#}");
+        }
+        if let Err(error) = storage.tick().await {
+            eprintln!("storage will retry: {error:#}");
+        }
+        let state = c.client.read(WAIT).await.unwrap();
+        if let Some(a) = state.storage.artifacts.values().find(|a| {
+            matches!(a.manifest.kind, Kind::Checkpoint(_))
+                && a.copies["storage/backup"].phase == CopyPhase::Ready
+        }) {
+            let Kind::Checkpoint(id) = &a.manifest.kind else {
+                unreachable!()
+            };
+            break state.checkpoints[id].clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "checkpoint backup not ready: {state:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let mut state = c.client.read(WAIT).await.unwrap();
+    let artifact_id = state
+        .storage
+        .artifacts
+        .values()
+        .find(|a| a.manifest.kind == Kind::Checkpoint(checkpoint.id.clone()))
+        .unwrap()
+        .manifest
+        .id
+        .clone();
+    // The latest resumable checkpoint cannot be removed, even without an explicit pin.
+    let revision = state.storage.artifacts[&artifact_id].revision;
+    assert!(matches!(
+        state.delete_artifact(&artifact_id, revision),
+        Reply::Rejected { .. }
+    ));
+    let reply = c
+        .client
+        .write(
+            Request {
+                origin: c.config.cluster.clone(),
+                id: "backup-suspend".into(),
+                mutation: Mutation::SuspendJob {
+                    id: "logical".into(),
+                    expected_revision: state.jobs["logical"].revision,
+                    checkpoint: checkpoint.id.clone(),
+                },
+            },
+            WAIT,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(reply, Reply::Accepted { .. }));
+    wait(
+        &mut c,
+        &mut w,
+        "logical",
+        WorkPhase::Job(AttemptPhase::Suspended),
+    )
+    .await;
+    w.store.shutdown().await.unwrap();
+    w.shutdown().await.unwrap();
+    // Make every source payload and source blob unavailable. Keep execution identity/history intact.
+    std::fs::rename(
+        home.join("blobs"),
+        c.home.0.join("unavailable-worker-blobs"),
+    )
+    .unwrap();
+    let state = c.client.read(WAIT).await.unwrap();
+    let original = state.current_attempt("logical").unwrap();
+    let checkpoint_root = fleet::vm_job::checkpoint_files_dir(
+        &home.join("backend/jobs").join(&original.execution),
+        &checkpoint.content.id,
+    )
+    .unwrap();
+    std::fs::rename(
+        &checkpoint_root,
+        c.home.0.join("unavailable-checkpoint-files"),
+    )
+    .unwrap();
+    let before_history = state.assignments[&original.id].clone();
+    // A fresh storage process verifies its retained copy; exporting works with the worker offline.
+    storage.shutdown().await.unwrap();
+    let mut storage = storage::Agent::start(&storage_home, storage_config)
+        .await
+        .unwrap();
+    storage.tick().await.unwrap();
+    let export = c.home.0.join("backup-export");
+    artifact_io::fetch_available(
+        &c.client.endpoint,
+        &state,
+        &state.storage.artifacts[&artifact_id],
+        &export,
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(export.join("state")).unwrap(), b"7");
+    // Retained artifacts and requests survive a change of Raft leader.
+    let leader = c.leader().await;
+    c.replicas
+        .remove(&leader)
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    let state = c.client.read(WAIT).await.unwrap();
+    let reply = c
+        .client
+        .write(
+            Request {
+                origin: c.config.cluster.clone(),
+                id: "backup-resume".into(),
+                mutation: Mutation::ResumeJob {
+                    id: "logical".into(),
+                    expected_revision: state.jobs["logical"].revision,
+                },
+            },
+            WAIT,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(reply, Reply::Accepted { .. }));
+    let mut w = Worker::start(&home, config, hello()).await.unwrap();
+    wait(
+        &mut c,
+        &mut w,
+        "logical",
+        WorkPhase::Job(AttemptPhase::Succeeded),
+    )
+    .await;
+    let state = c.client.read(WAIT).await.unwrap();
+    assert_eq!(state.jobs["logical"].attempts.len(), 2);
+    assert_eq!(state.assignments[&before_history.id], before_history);
+    assert_eq!(
+        std::fs::read(home.join("restored").join(&artifact_id).join("state")).unwrap(),
+        b"7"
+    );
+    w.tick().await.unwrap();
+    storage.tick().await.unwrap();
+    let state = c.client.read(WAIT).await.unwrap();
+    let outputs = state
+        .storage
+        .artifacts
+        .values()
+        .find(|a| a.manifest.kind == Kind::FinalOutputs)
+        .unwrap();
+    assert_eq!(outputs.copies["storage/backup"].phase, CopyPhase::Ready);
+    let captured = c.home.0.join("final-output-export");
+    artifact_io::fetch_available(&c.client.endpoint, &state, outputs, &captured)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(captured.join("result.txt")).unwrap(), b"8");
+    // Pins and expiry are independent. Expiry is deterministic and never bypasses a pin.
+    let rev = state.storage.artifacts[&artifact_id].revision;
+    let request = |id: &str, mutation| Request {
+        origin: "cluster".into(),
+        id: id.into(),
+        mutation,
+    };
+    assert_eq!(
+        c.client
+            .write(
+                request(
+                    "pin",
+                    Mutation::ArtifactRetention {
+                        id: artifact_id.clone(),
+                        expected_revision: rev,
+                        pinned: true,
+                        expires_at: Some(1)
+                    }
+                ),
+                WAIT
+            )
+            .await
+            .unwrap(),
+        Reply::Recorded
+    );
+    c.client
+        .write(
+            request("expire-pinned", Mutation::ExpireArtifacts { as_of: 2 }),
+            WAIT,
+        )
+        .await
+        .unwrap();
+    let state = c.client.read(WAIT).await.unwrap();
+    assert!(!state.storage.artifacts[&artifact_id].deleted);
+    let rev = state.storage.artifacts[&artifact_id].revision;
+    c.client
+        .write(
+            request(
+                "unpin",
+                Mutation::ArtifactRetention {
+                    id: artifact_id.clone(),
+                    expected_revision: rev,
+                    pinned: false,
+                    expires_at: Some(1),
+                },
+            ),
+            WAIT,
+        )
+        .await
+        .unwrap();
+    c.client
+        .write(
+            request("expire", Mutation::ExpireArtifacts { as_of: 2 }),
+            WAIT,
+        )
+        .await
+        .unwrap();
+    w.tick().await.unwrap();
+    storage.tick().await.unwrap();
+    let state = c.client.read(WAIT).await.unwrap();
+    assert!(state.storage.artifacts[&artifact_id].deleted);
+    assert_eq!(
+        state.storage.artifacts[&artifact_id].copies["storage/backup"].phase,
+        CopyPhase::Deleted
+    );
+    assert_eq!(
+        state.storage.artifacts[&artifact_id].copies["worker/worker-real"].phase,
+        CopyPhase::Deleted
+    );
+    assert!(!storage_home.join("objects").join(&artifact_id).exists());
+    assert!(
+        !home
+            .join("restored")
+            .join(&artifact_id)
+            .join("state")
+            .exists()
+    );
+    assert_eq!(state.jobs["logical"].attempts.len(), 2);
+    assert!(
+        state.checkpoints.contains_key(&checkpoint.id),
+        "history must survive payload deletion"
+    );
+    assert!(
+        artifact_io::fetch_available(
+            &c.client.endpoint,
+            &state,
+            &state.storage.artifacts[&artifact_id],
+            &c.home.0.join("deleted-export")
+        )
+        .await
+        .is_err()
+    );
+    storage.shutdown().await.unwrap();
+    w.shutdown().await.unwrap();
+    c.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn format_six_upgrade_preserves_suspended_checkpoint_and_request_receipts() {
+    use redb::{Database, ReadableTable, TableDefinition};
+    let mut c = Cluster::new(1).await;
+    let (home, config) = prepare(&mut c, true).await;
+    let mut w = Worker::start(&home, config.clone(), hello()).await.unwrap();
+    queued(&mut c, resumable()).await;
+    let end = tokio::time::Instant::now() + Duration::from_secs(90);
+    let cp = loop {
+        w.tick().await.unwrap();
+        let state = c.client.read(WAIT).await.unwrap();
+        if let Some(cp) = state.checkpoints.values().next() {
+            break cp.clone();
+        }
+        assert!(tokio::time::Instant::now() < end);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let state = c.client.read(WAIT).await.unwrap();
+    let request = Request {
+        origin: "cluster".into(),
+        id: "upgrade-suspend".into(),
+        mutation: Mutation::SuspendJob {
+            id: "logical".into(),
+            expected_revision: state.jobs["logical"].revision,
+            checkpoint: cp.id.clone(),
+        },
+    };
+    let reply = c.client.write(request.clone(), WAIT).await.unwrap();
+    wait(
+        &mut c,
+        &mut w,
+        "logical",
+        WorkPhase::Job(AttemptPhase::Suspended),
+    )
+    .await;
+    let before = c.client.read(WAIT).await.unwrap();
+    w.shutdown().await.unwrap();
+    c.replicas.remove(&1).unwrap().shutdown().await.unwrap();
+    let controller = c.home.0.join("1");
+    for (path, table_name) in [
+        (controller.join("control.redb"), "meta"),
+        (home.join("worker.redb"), "worker_journal"),
+    ] {
+        let db = Database::open(path).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(TableDefinition::<&str, &[u8]>::new(table_name))
+                .unwrap();
+            let mut value: serde_json::Value =
+                serde_json::from_slice(table.get("state").unwrap().unwrap().value()).unwrap();
+            value["format"] = serde_json::json!(6);
+            for field in ["storage", "artifacts", "deleted_artifacts"] {
+                value.as_object_mut().unwrap().remove(field);
+            }
+            table
+                .insert("state", serde_json::to_vec(&value).unwrap().as_slice())
+                .unwrap();
+            if table_name == "meta" {
+                let mut identity: serde_json::Value =
+                    serde_json::from_slice(table.get("identity").unwrap().unwrap().value())
+                        .unwrap();
+                identity[0] = serde_json::json!(6);
+                table
+                    .insert(
+                        "identity",
+                        serde_json::to_vec(&identity).unwrap().as_slice(),
+                    )
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+    fleet::control::upgrade::run(&controller, std::slice::from_ref(&home), &[]).unwrap();
+    assert!(controller.join("control.redb.v6-backup").exists());
+    assert!(home.join("worker.redb.v6-backup").exists());
+    let mut cfg = c.config.clone();
+    cfg.id = 1;
+    c.replicas
+        .insert(1, Replica::start(&controller, cfg).await.unwrap());
+    let after = c.client.read(WAIT).await.unwrap();
+    assert_eq!(after.jobs, before.jobs);
+    assert_eq!(after.checkpoints, before.checkpoints);
+    assert_eq!(after.receipts, before.receipts);
+    assert_eq!(after.assignments, before.assignments);
+    assert_eq!(after.storage.artifacts.len(), 1);
+    assert_eq!(c.client.write(request, WAIT).await.unwrap(), reply);
+    let mut w = Worker::start(&home, config.clone(), hello()).await.unwrap();
+    w.tick().await.unwrap();
+    let artifact = after.storage.artifacts.values().next().unwrap();
+    let destination = c.home.0.join("upgraded-export");
+    fleet::control::artifact_io::fetch_available(
+        &c.client.endpoint,
+        &after,
+        artifact,
+        &destination,
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(destination.join("state")).unwrap(), b"7");
+    // Without a backup target, intact sealed checkpoint files can rebuild a lost blob cache.
+    w.store.shutdown().await.unwrap();
+    w.shutdown().await.unwrap();
+    std::fs::rename(
+        home.join("blobs"),
+        c.home.0.join("unavailable-upgraded-cache"),
+    )
+    .unwrap();
+    let reply = c
+        .client
+        .write(
+            Request {
+                origin: "cluster".into(),
+                id: "resume-with-local-sealed-copy".into(),
+                mutation: Mutation::ResumeJob {
+                    id: "logical".into(),
+                    expected_revision: after.jobs["logical"].revision,
+                },
+            },
+            WAIT,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(reply, Reply::Accepted { .. }));
+    let mut w = Worker::start(&home, config, hello()).await.unwrap();
+    wait(
+        &mut c,
+        &mut w,
+        "logical",
+        WorkPhase::Job(AttemptPhase::Succeeded),
+    )
+    .await;
+    w.shutdown().await.unwrap();
+    c.close().await;
+}

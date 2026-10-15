@@ -24,6 +24,30 @@ pub struct Command {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Mutation {
     Enqueue(super::queue::Submission),
+    EnrollStorage(super::artifact::Registration),
+    ReviewStorageRecovery {
+        expected_catalog: String,
+        unavailable_locations: std::collections::BTreeSet<String>,
+    },
+    StoragePolicy {
+        expected_revision: u64,
+        policy: super::artifact::Policy,
+    },
+    ArtifactReady(super::artifact::Ready),
+    ArtifactReport(super::artifact::Report),
+    ArtifactRetention {
+        id: String,
+        expected_revision: u64,
+        pinned: bool,
+        expires_at: Option<u64>,
+    },
+    DeleteArtifact {
+        id: String,
+        expected_revision: u64,
+    },
+    ExpireArtifacts {
+        as_of: u64,
+    },
     Stage {
         id: String,
         worker: String,
@@ -111,6 +135,8 @@ pub struct Receipt {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct State {
+    #[serde(default)]
+    pub storage: super::artifact::Catalog,
     pub jobs: BTreeMap<String, super::queue::Job>,
     pub checkpoints: BTreeMap<String, super::checkpoint::Checkpoint>,
     pub drained: std::collections::BTreeSet<String>,
@@ -135,6 +161,7 @@ pub fn key(principal: &str, id: &str) -> String {
 impl State {
     pub fn new(cluster: String) -> Self {
         Self {
+            storage: Default::default(),
             jobs: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
             drained: Default::default(),
@@ -203,6 +230,28 @@ impl State {
     ) -> Reply {
         match mutation {
             Mutation::Enqueue(s) => self.enqueue(s, index),
+            Mutation::EnrollStorage(r) => self.enroll_storage(r),
+            Mutation::ReviewStorageRecovery {
+                expected_catalog,
+                unavailable_locations,
+            } => self.review_storage_recovery(expected_catalog, unavailable_locations),
+            Mutation::StoragePolicy {
+                expected_revision,
+                policy,
+            } => self.storage_policy(*expected_revision, policy),
+            Mutation::ArtifactReady(r) => self.artifact_ready(principal, r),
+            Mutation::ArtifactReport(r) => self.artifact_report(principal, r),
+            Mutation::ArtifactRetention {
+                id,
+                expected_revision,
+                pinned,
+                expires_at,
+            } => self.artifact_retention(id, *expected_revision, *pinned, *expires_at),
+            Mutation::DeleteArtifact {
+                id,
+                expected_revision,
+            } => self.delete_artifact(id, *expected_revision),
+            Mutation::ExpireArtifacts { as_of } => self.expire_artifacts(*as_of),
             Mutation::Stage { id, worker } => self.stage_job(id, worker),
             Mutation::CancelQueued {
                 id,

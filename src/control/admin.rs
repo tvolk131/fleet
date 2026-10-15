@@ -16,7 +16,44 @@ use std::{
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Offline format-5 upgrade: idle singleton, stopped workers, and paused client staging. Keeps backups.
+    /// Prepare a separate storage identity/home; enroll its public registration before running it.
+    PrepareStorage {
+        #[arg(long)]
+        home: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        failure_domain: String,
+        #[arg(long)]
+        capacity_bytes: u64,
+        #[arg(long, default_value = "127.0.0.1:0")]
+        bind: std::net::SocketAddr,
+    },
+    /// Run the independent artifact storage role.
+    Storage {
+        #[arg(long)]
+        home: PathBuf,
+    },
+    /// Read storage filesystem accounting, including staging and orphaned payloads.
+    StorageUsage {
+        #[arg(long)]
+        home: PathBuf,
+    },
+    /// Read separate worker cache, restored payload, job-home and VM-image accounting; never deletes files.
+    WorkerStorageUsage {
+        #[arg(long)]
+        home: PathBuf,
+    },
+    /// Explicitly accept signed recovery while retaining objects and deletion tombstones.
+    RebindStorage {
+        #[arg(long)]
+        home: PathBuf,
+        #[arg(long)]
+        manifest: PathBuf,
+    },
+    /// Offline format-5/6 upgrade: idle singleton, stopped workers, and paused client staging. Keeps backups.
     Upgrade {
         #[arg(long)]
         controller_home: PathBuf,
@@ -296,6 +333,87 @@ pub async fn run(command: Command) -> Result<()> {
             let reply = client.write(request, Duration::from_secs(10)).await?;
             println!("{}", serde_json::to_string_pretty(&reply)?);
             client.endpoint.close().await;
+        }
+        Command::PrepareStorage {
+            home,
+            config,
+            id,
+            failure_domain,
+            capacity_bytes,
+            bind,
+        } => {
+            let base: Config = serde_json::from_slice(&std::fs::read(config)?)?;
+            std::fs::create_dir_all(&home)?;
+            ensure!(
+                std::fs::read_dir(&home)?.next().is_none(),
+                "prepare requires an empty storage home"
+            );
+            let identity = crate::keys::load_or_create(&home.join("node.key"))?.public();
+            let socket = UdpSocket::bind(bind)?;
+            let registration = super::artifact::Registration {
+                id,
+                peer: Peer {
+                    identity,
+                    address: socket.local_addr()?,
+                },
+                incarnation: format!("{:032x}", rand::random::<u128>()),
+                failure_domain,
+                capacity_bytes,
+            };
+            registration.validate()?;
+            let config = super::storage::Config {
+                cluster: base.cluster,
+                registration: registration.clone(),
+                controllers: base.peers,
+                administrators: base.administrators,
+            };
+            super::storage::Agent::initialize(&home, &config)?;
+            crate::instances::write(&home.join("registration.json"), &registration)?;
+            println!("{}", serde_json::to_string_pretty(&registration)?);
+        }
+        Command::Storage { home } => {
+            let mut agent = super::storage::Agent::start(
+                &home,
+                serde_json::from_slice(&std::fs::read(home.join("storage.json"))?)?,
+            )
+            .await?;
+            let signal = crate::shutdown_signal();
+            tokio::pin!(signal);
+            loop {
+                if let Err(error) = agent.tick().await {
+                    tracing::warn!(%error, "storage reconciliation will retry");
+                }
+                tokio::select! { _ = &mut signal => break, _ = tokio::time::sleep(Duration::from_secs(2)) => {} }
+            }
+            agent.shutdown().await?;
+        }
+        Command::WorkerStorageUsage { home } => {
+            let _config: super::runtime::WorkerConfig =
+                serde_json::from_slice(&std::fs::read(home.join("worker.json"))?)?;
+            let mut categories = std::collections::BTreeMap::new();
+            for (label, path) in [
+                ("shared_blob_cache", "blobs"),
+                ("restored_checkpoints", "restored"),
+                ("job_homes_including_logs_and_captures", "backend/jobs"),
+                ("vm_images_and_disks", "backend/instance-tart"),
+            ] {
+                categories.insert(label, super::storage::usage(&home.join(path))?);
+            }
+            println!("{}", serde_json::to_string_pretty(&categories)?);
+        }
+        Command::StorageUsage { home } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"objects":super::storage::usage(&home.join("objects"))?,"staging":super::storage::usage(&home.join("staging"))?,"metadata":super::storage::usage(&home.join("deleted"))?})
+                )?
+            );
+        }
+        Command::RebindStorage { home, manifest } => {
+            super::storage::accept_recovery(
+                &home,
+                &serde_json::from_slice(&std::fs::read(manifest)?)?,
+            )?;
         }
         Command::Supervise { dir } => crate::supervise::run(&dir)?,
         Command::InstanceController { home, id } => crate::instances::run_controller(&home, &id)?,
@@ -793,7 +911,7 @@ pub async fn run(command: Command) -> Result<()> {
                     )
                     .await?
                 {
-                    crate::control::network::Answer::Read(Ok(state)) => Ok(state),
+                    crate::control::network::Answer::Read(Ok(state)) => Ok(*state),
                     other => Err(anyhow::anyhow!("strong read unavailable: {other:?}")),
                 }
             } else {

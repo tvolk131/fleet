@@ -9,6 +9,8 @@ pub struct ServiceConfig {
     pub controller_home: Option<PathBuf>,
     pub worker_home: Option<PathBuf>,
     #[serde(default)]
+    pub storage_home: Option<PathBuf>,
+    #[serde(default)]
     pub client_home: Option<PathBuf>,
     #[serde(default)]
     pub bootstrap: bool,
@@ -18,13 +20,19 @@ impl ServiceConfig {
         ensure!(
             self.controller_home.is_some()
                 || self.worker_home.is_some()
-                || self.client_home.is_some(),
-            "choose controller, worker or client-staging roles"
+                || self.client_home.is_some()
+                || self.storage_home.is_some(),
+            "choose controller, worker, storage or client-staging roles"
         );
         let mut homes = Vec::new();
-        for home in [&self.controller_home, &self.worker_home, &self.client_home]
-            .into_iter()
-            .flatten()
+        for home in [
+            &self.controller_home,
+            &self.worker_home,
+            &self.client_home,
+            &self.storage_home,
+        ]
+        .into_iter()
+        .flatten()
         {
             ensure!(home.is_absolute(), "service homes must be absolute");
             ensure!(
@@ -63,6 +71,22 @@ pub async fn run(path: &Path) -> Result<()> {
     } else {
         None
     };
+    let (storage_stop, mut storage_signal) = tokio::sync::watch::channel(false);
+    let storage = if let Some(home) = &config.storage_home {
+        let cfg = serde_json::from_slice(&std::fs::read(home.join("storage.json"))?)?;
+        let mut agent = super::storage::Agent::start(home, cfg).await?;
+        Some(tokio::spawn(async move {
+            loop {
+                if let Err(error) = agent.tick().await {
+                    tracing::warn!(%error, "storage reconciliation will retry");
+                }
+                tokio::select! { _ = storage_signal.changed() => break, _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {} }
+            }
+            agent.shutdown().await
+        }))
+    } else {
+        None
+    };
     let staging = config.client_home.map(|home| {
         tokio::spawn(async move {
             loop {
@@ -87,6 +111,10 @@ pub async fn run(path: &Path) -> Result<()> {
         crate::shutdown_signal().await;
         Ok(())
     };
+    let _ = storage_stop.send(true);
+    if let Some(task) = storage {
+        task.await??;
+    }
     if let Some(task) = staging {
         task.abort();
         let _ = task.await;
