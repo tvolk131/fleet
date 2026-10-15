@@ -99,7 +99,7 @@ fleet --home /absolute/client-home retry experiment-1
 ```
 
 The job JSON holds `name`, `argv`, local `inputs`, `publish`, `threads`, time limits, probes and optional
-`vm` and `checkpoint`. See [checkpoint-resumable VM jobs](CHECKPOINT_JOBS.md) for the manifest contract, attempt history, and explicit format-5 metadata upgrade. CPU threads default to one for native jobs; a VM uses its configured vCPUs. Native memory is an
+`vm` and `checkpoint`. See [checkpoint-resumable VM jobs](CHECKPOINT_JOBS.md) for the manifest contract, attempt history, and explicit format-5/6 metadata upgrade. CPU threads default to one for native jobs; a VM uses its configured vCPUs. Native memory is an
 admission reservation, not a per-process limit. Native GPU use must be declared with `--gpu`; it requires
 an advertised compute GPU and reserves exclusive Fleet GPU use. All macOS VMs still have GPU access.
 VM CPU/RAM/disk reservations and exclusive/shared GPU policy use the existing backend admission rules.
@@ -120,8 +120,9 @@ completed cleanup before its capacity becomes available again.
 Metadata can be accepted while inputs await delivery. Submission attempts staging immediately;
 `fleet stage [JOB]` retries it and `fleet stage --watch` keeps retrying. A configured client-staging service
 provides the same behavior after the submitting CLI exits. If that source machine is offline before any
-eligible worker has the bytes, the job waits. This release does not replicate input/output bytes among
-controllers or promise off-host blob durability. Retain the client spool until staging is complete.
+eligible worker has the bytes, the job waits. Controllers do not replicate file bytes. Configure separate [storage agents](ARTIFACT_STORAGE.md)
+for verified checkpoint/final-output backups; original input spools are still client-owned. Retain the
+client spool until staging is complete.
 
 `fleet logs JOB --follow`, `fleet outputs JOB`, and `fleet fetch JOB /absolute/new-directory` read directly
 from the assigned worker after resolving it through the cluster. Fetch verifies hashes and requires a
@@ -219,7 +220,7 @@ another client may have submitted work since the earlier audit. A replica-only d
 an old worker remains busy. Reverting to the old installation also requires draining the new worker first.
 
 Cross-worker checkpoint migration, preemption, direct persistent-guest commands, per-user ACLs,
-background output fetching to remembered destinations, blob replication/retention, and mixed-version upgrades
+background output fetching to remembered destinations, shared blob-cache vacuum, and mixed-version upgrades
 are not in this release. Receipts are retained indefinitely unless explicitly released through the low-level
 administrative contract; automatic 90-day pruning remains future work. Metadata/snapshot size limits from
 the qualification remain applicable. Existing backend guarantees do not make CPU/GPU scheduling exclusive

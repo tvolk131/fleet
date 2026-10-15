@@ -538,7 +538,39 @@ async fn tart_job_and_persistent_instances_use_replicated_intent_and_shared_budg
         .await;
     }
     w.shutdown().await.unwrap();
+    let state = c.client.read(WAIT).await.unwrap();
+    for id in ["one", "two"] {
+        assert_eq!(
+            state.assignments[id].observed.as_ref().unwrap().1.phase,
+            WorkPhase::Instance(InstancePhase::Running)
+        );
+    }
     let mut w = Worker::start(&home, config.clone(), hello()).await.unwrap();
+    let proto::Response::Instances(inventory) = data_call(
+        &c.client.endpoint,
+        &c.config.cluster,
+        &config.registration.peer,
+        DataRequest::Instances,
+    )
+    .await
+    .unwrap() else {
+        panic!("instance inventory")
+    };
+    assert_eq!(inventory.len(), 2);
+    assert!(
+        inventory
+            .iter()
+            .all(|i| i.observed.state == instances::State::Running)
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("backend/instance-tart/history"))
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("run "))
+            .count(),
+        2,
+        "worker restart must reuse both existing VMs"
+    );
     for id in ["one", "two"] {
         desire(&mut c, id, 1, Desired::Instance(InstanceDesired::Deleted)).await;
         wait(
@@ -1019,3 +1051,6 @@ mod upgrade;
 
 #[path = "storage.rs"]
 mod storage;
+
+#[path = "vm_lifecycle.rs"]
+mod vm_lifecycle;

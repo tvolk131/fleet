@@ -43,7 +43,7 @@ production cutover. Existing training runs and their services remain outside tha
   Separating logical jobs from executions does not add VM checkpoint resume.
 - An unreachable worker keeps its assignments and reservations until reconciled. Automatic execution
   elsewhere requires a later design for confirmed termination or enforceable execution authority.
-  The timeout-based recovery proposal in [NEXT_FEATURES.md](NEXT_FEATURES.md) does not govern this work.
+  Recovery requires explicit fencing and authority rebinding; elapsed time is not takeover authority.
 
 ## Roles and data flow
 
@@ -268,12 +268,10 @@ failure qualification and boundaries. The legacy `FLEET_NETWORK` setting does no
 
 ## Integration and initial cutover
 
-The historical coordinator state lives in SQLite in `src/daemon.rs`; its worker interface is in
-`src/proto.rs`. That command surface is retained only in the optional `fleet-legacy` binary for
-backend regression tests. The normal `fleet` binary always uses an explicitly running replicated
-control plane, including for a single replica.
-A local daemon may act as a client helper, never as an independent metadata authority when the
-configured cluster is unreachable. The old in-process fallback is removed from the new client path.
+The normal `fleet` binary always uses an explicitly running replicated control plane, including for
+one replica. The retired CLI, GUI, standalone SQLite scheduler, and its installers are removed.
+A client-staging helper can deliver saved inputs but cannot schedule work or replace an unavailable
+control plane. Native/Tart supervisors, verified transfers, and their backend tests remain shared.
 
 There is no SQLite importer, legacy protocol adapter, or live workload adoption in this milestone.
 The new client, control plane, and worker interfaces are versioned independently from the legacy
@@ -298,7 +296,7 @@ Reuse the current Tart adapter, guest supervision, native supervision, and verif
 where appropriate behind the new interfaces. Reusing code does not require accepting old wire messages
 or durable records. Tests are updated around the new contract while preserving backend safety checks.
 
-Blob replication and checkpoint completeness remain separate work. Metadata records verified locations
+[Artifact storage](ARTIFACT_STORAGE.md) now manages checkpoint/final-output backups outside Raft. Metadata records verified locations
 and distinguishes unavailable bytes from missing resource history. Existing trusted native execution,
 Tart isolation, networking policy, and resource admission behavior continue through their current backends.
 

@@ -1,9 +1,9 @@
 # Replicated control plane: real workers
 
 The replicated worker backend runs native jobs, disposable Tart VM jobs, and persistent
-Tart instances under the replicated control plane. It requires fresh, explicit homes and enrollment.
-Existing installed Fleet services and their training history remain separate. This is not a production
-cutover or an adapter for the old coordinator protocol.
+Tart instances under the replicated control plane. This is the normal Fleet worker architecture;
+[the service guide](NORMAL_FLEET.md) covers installation. The explicit-home examples below are for
+isolated qualification and do not adopt archived coordinator workloads.
 
 For permanent controller quorum loss, use [lost-quorum recovery](CONTROL_PLANE_RECOVERY.md). It preserves
 worker execution history and requires explicit authority rebinding and inventory reconciliation.
@@ -14,10 +14,12 @@ An administrator enrolls a worker's public key, stable worker ID, journal incarn
 and image aliases. Enrollment is immutable in this milestone. Losing/replacing the worker's journal
 requires explicit recovery; it is not equivalent to restarting the worker process.
 
-Placement is explicit. `Assign` commits an immutable workload and fixed execution/worker identity,
-including its resource reservation. `Desire` changes lifecycle intent with an expected revision.
-Acceptance means the intent is durable, not that the process or VM is already running. Jobs currently
-have one execution; checkpoint continuation, automatic placement, queues, and migration are later work.
+The normal client enqueues a stable logical job. The controller commits placement and a separate
+execution attempt when an eligible worker has capacity. `Assign` also supports explicit placement,
+including persistent instances. `Desire` changes lifecycle intent with an expected revision.
+Acceptance means the intent is durable, not that the process or VM is already running.
+[Checkpoint continuation](CHECKPOINT_JOBS.md) creates a new attempt on the original worker; it does
+not move a live process or VM between hosts.
 
 The worker initiates an authenticated `WorkerRead`. A replica must establish a linearizable read before
 returning that worker's assignments. Workers follow the same authenticated membership discovery as
@@ -69,7 +71,8 @@ collisions, not physical resource contention.
 
 Images remain pinned in the worker's trusted `backend/instances.json`. Inputs are content-addressed and
 verified before use. Virtual disk accounting is not a physical-storage quota for image caches, job outputs,
-or blob stores. General storage retention, replication, and quotas are separate milestones.
+or blob stores. [Artifact storage](ARTIFACT_STORAGE.md) supplies explicit retention, backup targets,
+and storage-agent quotas for checkpoints and final outputs; it does not impose a host filesystem quota.
 
 ## Data plane
 
@@ -82,12 +85,13 @@ Existing backend observations supply stdout/stderr by byte offset, progress prob
 and settled intermediate/final output manifests. Inputs and outputs transfer over authenticated iroh-blobs;
 fetch verifies content hashes and writes into a fresh destination directory. Intermediate captures remain
 available after job cancellation and disposable-VM deletion. Files are independently captured, not an atomic
-checkpoint transaction. A worker/disk loss can still lose bytes even when metadata survives on the replicas.
+checkpoint transaction. Registered application checkpoints and final outputs can have independently
+verified backup copies. Unbacked bytes, logs, and metrics can still be lost with a worker disk.
 
 The library can query a known worker directly during a controller outage. The current `data`/`fetch` CLI
 first resolves the worker from a strong control-plane read, so those convenience commands require quorum.
 The normal CLI, Material 3 GUI and JSON interface expose the replicated queue through [NORMAL_FLEET.md](NORMAL_FLEET.md).
-The legacy clients remain separate. All configured administrators can read worker
+The obsolete public clients and standalone scheduler have been removed. All configured administrators can read worker
 outputs; per-user ACLs and reader-key rotation are not implemented.
 
 ## Start an isolated worker
@@ -136,8 +140,9 @@ backend-managed disposable VMs.
 
 For a disposable VM job, add `"vm":{"image":"macos","cpus":2,"memory_mb":4096,"disk_gb":50,
 "network":"offline","gpu":"exclusive"}` to the job file and use a suitably enrolled Tart worker.
-The VM's declared RAM supersedes the native `--memory-mb` reservation. Jobs cannot request checkpoint
-suspension/preemption through this new contract yet.
+The VM's declared RAM supersedes the native `--memory-mb` reservation. Use the normal queue and
+[checkpoint contract](CHECKPOINT_JOBS.md) for checkpoint suspension and explicit resume; there is no
+automatic preemption or live VM migration.
 
 Pass these JSON files to `request` for lifecycle mutations:
 
@@ -177,6 +182,7 @@ VM jobs, captures live metrics/files, kills a replica leader and worker, cancels
 deletes a persistent instance. It cleans up only its own resources. It does not reserve capacity through a
 second coordinator; run it only with the physical machine idle and no legacy queue waiting to start.
 
-The normal queue uses storage/protocol format **6** (`fleet/control/6`); the read-only data ALPN is `fleet/worker-data/1`.
-Use fresh homes or the [explicit idle format-5 upgrade](CHECKPOINT_JOBS.md#explicit-format-5-upgrade). No format-1/2/3 importer, worker adoption, mixed-release rollout, power-failure
-qualification, or production service cutover is included.
+The normal queue uses storage/protocol format **7** (`fleet/control/7`); the read-only data ALPN is
+`fleet/worker-data/1`. Use fresh homes or the [explicit idle format-5/6 upgrade](CHECKPOINT_JOBS.md#explicit-format-56-upgrade).
+There is no format-1/2/3 importer, automatic worker adoption, or mixed-release rollout. Physical
+power-failure qualification remains separate from the process-failure tests.

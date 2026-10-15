@@ -63,9 +63,9 @@ or public-internet-only networking policies remain unchanged.
 - [Emergency recovery and authority transitions](docs/CONTROL_PLANE_RECOVERY.md)
 - [Direct LAN deployment qualification](docs/CONTROL_PLANE_NETWORKING.md)
 - [Worker execution and Tart guarantees](docs/CONTROL_PLANE_WORKERS.md)
-- [Historical CLI reference](docs/LEGACY_FLEET.md)
+- [Current regression coverage](docs/TEST_COVERAGE.md)
 
 Testing: `cargo test --all-features --locked`; `cargo clippy --all-features --all-targets --locked -- -D warnings`;
 `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s contrib -p 'test_*.py'` after building all feature binaries.
-`fleet-control-lab` is retained for fault qualification. `fleet-legacy` is built only with `--features legacy`
-to exercise historical backend tests; it is not the normal client or a protocol bridge.
+`fleet-control-lab` is retained for fault qualification. The retired CLI, GUI, standalone daemon,
+and their installers are removed. Normal clients always use the replicated control plane.

@@ -1,6 +1,7 @@
 //! Suspending a job at a checkpoint and continuing it later: the job's `resume` declaration, finding its latest settled
 //! checkpoint, and the plan that states what suspending now would lose and when the next checkpoint is due. See
-//! `docs/PAUSE_AND_SUSPEND.md`.
+//! the retained native backend records. Current public suspension uses the explicit VM checkpoint
+//! contract in `docs/CHECKPOINT_JOBS.md`.
 
 use std::{
     fs,
