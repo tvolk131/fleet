@@ -367,6 +367,10 @@ fn real_processes_run_a_job_and_survive_an_agent_restart() {
         "42\n"
     );
     assert_eq!(h.fleet(&["logs", &id]), "done\n");
+    // Completion/fetch and the periodic progress scan are separate event streams.
+    h.wait("the final progress reading", || {
+        h.queued(&id)["progress"][0]["reading"]["number"]["value"] == 3.0
+    });
     let progress = &h.queued(&id)["progress"][0]["reading"]["number"];
     assert_eq!(progress["value"], 3.0, "{progress}");
 
@@ -381,10 +385,10 @@ fn real_processes_run_a_job_and_survive_an_agent_restart() {
         .as_str()
         .unwrap()
         .to_string();
-    let agent_pid = running.0[0].id().to_string();
+    #[cfg(target_os = "macos")]
     h.wait("the agent to hold a keep-awake assertion", || {
         Command::new("pgrep")
-            .args(["-P", &agent_pid, "caffeinate"])
+            .args(["-P", &running.0[0].id().to_string(), "caffeinate"])
             .output()
             .is_ok_and(|o| o.status.success())
     });

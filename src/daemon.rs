@@ -2011,9 +2011,15 @@ impl Core {
                 self.wake.notify_one();
             }
             if last_awake.elapsed() >= Duration::from_secs(60) && self.work_waits_for(name)? {
-                self.coordinator
+                // Sleep prevention is best effort: an unavailable platform helper must not
+                // prevent replaying job events (which also releases queued resource claims).
+                if let Err(e) = self
+                    .coordinator
                     .ask(&connection, &Request::KeepAwake { seconds: 180 })
-                    .await?;
+                    .await
+                {
+                    tracing::warn!(machine = %name, "keeping the worker awake failed: {e:#}");
+                }
                 last_awake = tokio::time::Instant::now();
             }
             let since = self.cursor(name);
