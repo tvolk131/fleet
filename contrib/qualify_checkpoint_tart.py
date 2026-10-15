@@ -2,10 +2,11 @@
 """Checkpoint lifecycle through the normal client, with fake or real offline Tart.
 
 Always uses fresh homes under /tmp. Real mode requires --instances and --image-cache.
-Optional --job supplies application-specific Fleet.submit keyword arguments; its
+Optional --job supplies an ordinary Fleet job JSON file (input paths must be absolute); its
 first attempt must publish a checkpoint and remain running until suspension.
 """
 import argparse
+from functools import partial
 import hashlib
 import json
 from pathlib import Path
@@ -14,7 +15,7 @@ import subprocess
 import time
 
 from control_host_fixture import preservation
-from fleet import Fleet, FleetError
+from cli_fixture import api_result
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -41,8 +42,8 @@ def main():
     if not a.fake and installed.exists():
         # Read through the installed version; never open its databases with the fixture binary.
         config = json.loads(installed.read_text())
-        normal = Fleet(config['client_home'], Path.home() / 'fleet/bin/fleet')
-        normal_before = {'jobs': normal.queue(), 'instances': normal.instances()}
+        normal = partial(api_result, Path.home() / 'fleet/bin/fleet', config['client_home'])
+        normal_before = {'jobs': normal(op='queue'), 'instances': normal(op='instances')}
         assert all(j['phase'] in ('succeeded', 'failed', 'cancelled', 'suspended')
                    for j in normal_before['jobs']), 'installed Fleet has active jobs'
         assert all(i['observed'] and i['observed'][1]['phase'] in ('Stopped', 'Deleted', {'Instance': 'Stopped'}, {'Instance': 'Deleted'})
@@ -78,7 +79,7 @@ def main():
                 last = call()
                 if predicate(last):
                     return last
-            except FleetError as error:
+            except AssertionError as error:
                 # These call sites only poll reads. Retry transport deadlines within the overall
                 # bound, and retain the count as qualification evidence. Semantic errors still fail.
                 if 'control-plane request deadline exceeded' not in str(error):
@@ -114,47 +115,47 @@ def main():
         cache.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(['/bin/cp', '-cR', str(a.image_cache), str(cache)], check=True)
     command('service', 'configure', '--config', a.home / 'service.json', '--controller-home', a.home / 'seed/node-1', '--worker-home', worker, '--bootstrap')
-    client = Fleet(client_home, a.binary)
+    request = partial(api_result, a.binary, client_home)
     first = "import hashlib,json,pathlib,time; p=pathlib.Path('checkpoints/one'); p.mkdir(parents=True); (p/'state').write_text('7'); m={'version':1,'position':7,'files':{'state':{'size':1,'sha256':hashlib.sha256(b'7').hexdigest()}}}; (p/'ready.tmp').write_text(json.dumps(m)); (p/'ready.tmp').rename(p/'fleet.json'); print('initial-once',flush=True); time.sleep(180)"
     resume = "import pathlib,sys; n=int(pathlib.Path(sys.argv[1]).read_text()); pathlib.Path('result.txt').write_text(str(n+1)); print('resumed-once',flush=True)"
     job = json.loads(a.job.read_text()) if a.job else dict(
         name='Checkpoint qualification', argv=['/usr/bin/python3', '-c', first], publish=['result.txt'],
         checkpoint={'manifests': 'checkpoints/*/fleet.json', 'resume_argv': ['/usr/bin/python3', '-c', resume, '{checkpoint}/state']})
-    job.update(worker='checkpoint-worker', keep_awake=False, settle_seconds=0, max_seconds=600,
-               job_id='resumable', request_id='submit', threads=vm_cpus,
+    job.update(keep_awake=False, settle_seconds=0, max_seconds=600, threads=vm_cpus,
                vm=dict(image='macos', cpus=vm_cpus, memory_mb=vm_memory, disk_gb=50, network='offline', gpu='exclusive'))
     try:
         child = start()
         command('--home', client_home, 'enroll', worker / 'enroll.json', '--request-id', 'enroll')
-        client.submit(**job)
-        cp = wait(lambda: client.checkpoints('resumable'), bool)[0]
+        request(op='submit', id='resumable', request_id='submit', worker='checkpoint-worker', memory_mb=vm_memory, job=job)
+        cp = wait(lambda: request(op='checkpoints', id='resumable'), bool)[0]
         print('Verified checkpoint published', flush=True)
-        client.fetch_checkpoint(cp['id'], a.home / 'checkpoint-download')
+        request(op='fetch_checkpoint', id=cp['id'], destination=str(a.home / 'checkpoint-download'))
         assert (a.home / 'checkpoint-download/checkpoint.json').is_file()
-        client.suspend('resumable', checkpoint=cp['id'], request_id='suspend')
-        assert client.retry('suspend')['reply']['Accepted']['job'] == 'resumable'
-        wait(lambda: client.job('resumable'), lambda j: j['phase'] == 'suspended')
-        attempts = client.attempts('resumable')
+        request(op='suspend', id='resumable', checkpoint=cp['id'], request_id='suspend',
+                expected_revision=request(op='job', id='resumable')['revision'])
+        assert request(op='retry', request_id='suspend')['reply']['Accepted']['job'] == 'resumable'
+        wait(lambda: request(op='job', id='resumable'), lambda j: j['phase'] == 'suspended')
+        attempts = request(op='attempts', id='resumable')
         assert len(attempts) == 1
         assert all(json.loads(p.read_text())['state'] == 'deleted' for p in (worker / 'backend/instances').glob('*/observed.json'))
         child.kill()
         child.wait(timeout=10)
         child = start()
-        wait(lambda: client.job('resumable'), lambda j: j['phase'] == 'suspended')
-        command('--home', client_home, 'resume', 'resumable', '--request-id', 'resume')
-        client.retry('resume')
-        final = wait(lambda: client.job('resumable'), lambda j: j['phase'] in ('succeeded', 'failed', 'cancelled'), seconds=300)
+        suspended = wait(lambda: request(op='job', id='resumable'), lambda j: j['phase'] == 'suspended')
+        request(op='resume', id='resumable', request_id='resume', expected_revision=suspended['revision'])
+        request(op='retry', request_id='resume')
+        final = wait(lambda: request(op='job', id='resumable'), lambda j: j['phase'] in ('succeeded', 'failed', 'cancelled'), seconds=300)
         assert final['phase'] == 'succeeded', final
-        attempts = client.attempts('resumable')
+        attempts = request(op='attempts', id='resumable')
         assert len(attempts) == 2 and attempts[0]['execution'] != attempts[1]['execution']
         for n in (1, 2):
             command('--home', client_home, 'logs', 'resumable', '--attempt', n)
-            save(f'attempt-{n}-logs.json', client.logs('resumable', attempt=n))
-        client.fetch('resumable', a.home / 'outputs', attempt=2)
+            save(f'attempt-{n}-logs.json', request(op='logs', id='resumable', attempt=n)['Logs'])
+        request(op='fetch', id='resumable', destination=str(a.home / 'outputs'), attempt=2)
         if not a.job:
             assert (a.home / 'outputs/result.txt').read_text() == '8'
-            assert client.logs('resumable', attempt=1)['data'].count('initial-once') == 1
-            assert client.logs('resumable', attempt=2)['data'].count('resumed-once') == 1
+            assert request(op='logs', id='resumable', attempt=1)['Logs']['data'].count('initial-once') == 1
+            assert request(op='logs', id='resumable', attempt=2)['Logs']['data'].count('resumed-once') == 1
         result.update(success=True, checkpoint_export_verified=True, vm_deleted_before_resume=True,
                       combined_service_restart=True, unique_attempts=2, stable_job_identity=True)
         print('Suspension, restart, fresh-VM resume, and historical logs passed', flush=True)
@@ -170,10 +171,11 @@ def main():
             if child.poll() is not None:
                 child = start()
             try:
-                for j in client.queue():
+                for j in request(op='queue'):
                     if j['phase'] not in ('succeeded', 'failed', 'cancelled'):
-                        client.cancel(j['id'])
-                        client.wait(j['id'], timeout=180)
+                        request(op='cancel', id=j['id'], request_id=f"cleanup-{j['id']}", expected_revision=j['revision'])
+                        wait(lambda: request(op='job', id=j['id']),
+                             lambda state: state['phase'] in ('succeeded', 'failed', 'cancelled'), seconds=180)
             except Exception as cleanup_error:
                 result['cleanup_client_error'] = str(cleanup_error)
                 # A broken client must not leave this fixture's detached jobs running. Never touch
@@ -197,7 +199,7 @@ def main():
         result['all_fixture_vms_deleted'] = all(s == 'deleted' for s in states)
         result['legacy_records_unchanged'] = preservation() == before
         if normal_before is not None:
-            result['normal_records_unchanged'] = normal_before == {'jobs': normal.queue(), 'instances': normal.instances()}
+            result['normal_records_unchanged'] = normal_before == {'jobs': normal(op='queue'), 'instances': normal(op='instances')}
         save('qualification.json', result)
         assert result['all_fixture_vms_deleted'] and result['legacy_records_unchanged'] and result.get('normal_records_unchanged', True)
         if cache:

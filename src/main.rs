@@ -161,7 +161,7 @@ enum Command {
         #[command(subcommand)]
         action: InstanceCommand,
     },
-    /// A single JSON request on stdin and a JSON result on stdout; used by the Python client.
+    /// A single JSON request on stdin and a JSON response envelope on stdout for automation.
     Api,
     #[cfg(feature = "gui")]
     Gui,

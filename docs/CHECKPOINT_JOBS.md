@@ -108,14 +108,16 @@ The selected checkpoint remains explicit even if another point is captured durin
 and writes `files/` plus `checkpoint.json` only after verification. It requires a fresh destination.
 A failed export can leave a partial directory, without a completed `checkpoint.json` descriptor.
 
-Python exposes `submit(checkpoint=...)`, `checkpoints(job)`, `suspend(job, checkpoint='latest')`,
-`resume(job)`, `attempts(job)`, `fetch_checkpoint(id, destination)`, and `attempt=N` on logs/outputs/fetch.
-`wait()` waits for success, failure, or cancellation; suspension is intentionally nonterminal at the
-logical-job level. Poll `job()['phase']` when waiting specifically for suspension.
+The [JSON CLI interface](NORMAL_FLEET.md#json-automation-interface) exposes `checkpoints`, `suspend`,
+`resume`, `attempts`, and `fetch_checkpoint`, plus `attempt` on `logs`, `outputs`, and `fetch`. Submit
+checkpoint policy inside the request’s `job` object. Suspend/resume require explicit request IDs and
+expected job revisions. Poll `job` for `succeeded`, `failed`, or `cancelled` when waiting for completion;
+suspension is intentionally nonterminal at the logical-job level. Poll specifically for `suspended`
+when waiting for suspension.
 
 The iced-m3 GUI shows the current attempt, verified checkpoint position/location, and explicit suspend
 and resume actions. It resets the log view when the execution changes. Historical attempt inspection
-and checkpoint export are available through CLI/Python.
+and checkpoint export are available through the CLI/JSON interface.
 
 ## Durability and scope
 
@@ -181,4 +183,4 @@ Omit `--fake` and provide `--instances /absolute/instances.json --image-cache /a
 a real offline macOS VM qualification. Use a fresh `/tmp/fleet-control-*` home. Real mode checks that
 installed work is idle and verifies its records remain unchanged. The script tests export, suspension,
 VM deletion, combined-service restart, fresh-VM resume, request retries, and both attempts' logs.
-An optional `--job /absolute/qualification-job.json` supplies application-specific submit arguments.
+An optional `--job /absolute/qualification-job.json` supplies an ordinary job JSON file with absolute, individual input file paths.

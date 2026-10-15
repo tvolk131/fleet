@@ -25,7 +25,7 @@ Jobs without a `resume` declaration can be paused or cancelled, not suspended.
 
 ## Pause
 
-**Built (2026-10-09).** `fleet pause`/`fleet continue`, GUI buttons, `Fleet.pause`/`Fleet.continue_` in Python; tested
+**Built (2026-10-09).** `fleet pause`/`fleet continue`, GUI buttons; tested
 (a frozen job's time limit waits, its GPU is freed, and it can still be cancelled).
 
 - `fleet pause <job>` and `fleet continue <job>`; GUI buttons; `paused` becomes a job state.
@@ -108,8 +108,8 @@ never used. (Our trainer also writes resume points to a staging folder and renam
 
 - **Built:** the `resume` and `preempt` declarations; `fleet suspend` (when safe, `--within-minutes`; `--now` with
   the loss stated and a confirmation; `--plan`), `fleet resume [--on]`, `fleet move --to [--now]`; preemption in the
-  scheduler; GUI buttons (Suspend… with both options and their costs, Resume); `Fleet.plan/suspend/resume/move` in
-  Python. Tested end to end: suspend now and resume from the checkpoint; suspend when safe; a move to another machine
+  scheduler; GUI buttons (Suspend… with both options and their costs, Resume); historical daemon protocol operations.
+  Tested end to end: suspend now and resume from the checkpoint; suspend when safe; a move to another machine
   (the checkpoint relayed through the laptop); a higher-priority GPU job preempting a lower one, which then resumes
   by itself.
 - **"When safe" loses at most the detection delay:** the agent checks for a settled checkpoint every second, so the

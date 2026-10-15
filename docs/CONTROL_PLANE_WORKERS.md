@@ -86,7 +86,7 @@ checkpoint transaction. A worker/disk loss can still lose bytes even when metada
 
 The library can query a known worker directly during a controller outage. The current `data`/`fetch` CLI
 first resolves the worker from a strong control-plane read, so those convenience commands require quorum.
-The normal CLI, Material 3 GUI and Python client expose the replicated queue through [NORMAL_FLEET.md](NORMAL_FLEET.md).
+The normal CLI, Material 3 GUI and JSON interface expose the replicated queue through [NORMAL_FLEET.md](NORMAL_FLEET.md).
 The legacy clients remain separate. All configured administrators can read worker
 outputs; per-user ACLs and reader-key rotation are not implemented.
 

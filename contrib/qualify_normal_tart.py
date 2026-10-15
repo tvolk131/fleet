@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Normal queue/service API with real offline Tart jobs, in a fresh isolated home."""
 import argparse
+from functools import partial
 import hashlib
 import json
 from pathlib import Path
@@ -9,7 +10,7 @@ import subprocess
 import time
 
 from control_host_fixture import preservation
-from fleet import Fleet
+from cli_fixture import api_result
 
 
 def main():
@@ -61,7 +62,7 @@ def main():
         raise RuntimeError(f'timed out: {last}')
 
     def vm_phase(expected):
-        return wait(lambda: client.instances(), lambda values: any(
+        return wait(lambda: request(op='instances'), lambda values: any(
             v['id'] == 'persistent' and v['observed'] and v['observed'][0] == v['revision'] and v['observed'][1]['phase']['Instance'] == expected
             for v in values))
 
@@ -76,7 +77,7 @@ def main():
     subprocess.run(['/bin/cp', '-cR', str(a.image_cache), str(cache)], check=True)
     command('service', 'configure', '--config', a.home / 'service.json', '--controller-home', a.home / 'seed/node-1',
             '--worker-home', worker, '--bootstrap')
-    client = Fleet(client_home, a.binary)
+    request = partial(api_result, a.binary, client_home)
     vm = dict(image='macos', cpus=2, memory_mb=4096, disk_gb=50, network='offline', gpu='exclusive')
     try:
         child = start()
@@ -84,29 +85,35 @@ def main():
         source = a.home / 'input.txt'
         source.write_text('normal queue verified input\n')
         program = "import json,time,pathlib; p=pathlib.Path('.'); print('guest-started-once',flush=True); (p/'result.txt').write_bytes((p/'input.txt').read_bytes());\nfor n in range(180):\n (p/'metrics.jsonl').open('a').write(json.dumps({'step':n})+'\\n'); time.sleep(1)"
-        client.submit('Normal VM canary', ['/usr/bin/python3', '-c', program], worker='tart-canary',
-                      inputs={'input.txt': source}, publish=['result.txt', 'metrics.jsonl'], memory_mb=4096,
-                      keep_awake=False, settle_seconds=0, max_seconds=240, vm=vm, job_id='vm-canary', request_id='vm-submit',
-                      probes=[{'jsonl_field': {'name': 'step', 'file': 'metrics.jsonl', 'field': 'step', 'total': 180}}])
-        wait(lambda: client.job('vm-canary'), lambda v: v['phase'] == 'running')
+        request(op='submit', id='vm-canary', request_id='vm-submit', worker='tart-canary', memory_mb=4096,
+                job={'name': 'Normal VM canary', 'argv': ['/usr/bin/python3', '-c', program],
+                     'inputs': {'input.txt': str(source)}, 'publish': ['result.txt', 'metrics.jsonl'],
+                     'keep_awake': False, 'settle_seconds': 0, 'max_seconds': 240, 'vm': vm,
+                     'probes': [{'jsonl_field': {'name': 'step', 'file': 'metrics.jsonl', 'field': 'step', 'total': 180}}]})
+        wait(lambda: request(op='job', id='vm-canary'), lambda v: v['phase'] == 'running')
         print('VM job running through normal queue', flush=True)
-        native = client.submit('Alongside VM', ['/bin/sh', '-c', 'echo native-once'], worker='tart-canary', memory_mb=128,
-                               keep_awake=False, settle_seconds=0, max_seconds=20, job_id='native-canary', request_id='native-submit')
-        assert client.wait(native, timeout=60)['phase'] == 'succeeded'
-        wait(lambda: client.outputs('vm-canary'), lambda files: any(v['path'] == 'result.txt' for v in files))
-        client.fetch('vm-canary', a.home / 'live-output')
+        request(op='submit', id='native-canary', request_id='native-submit', worker='tart-canary', memory_mb=128,
+                job={'name': 'Alongside VM', 'argv': ['/bin/sh', '-c', 'echo native-once'],
+                     'keep_awake': False, 'settle_seconds': 0, 'max_seconds': 20})
+        wait(lambda: request(op='job', id='native-canary'), lambda j: j['phase'] == 'succeeded', seconds=60)
+        wait(lambda: request(op='outputs', id='vm-canary')['Outputs'], lambda files: any(v['path'] == 'result.txt' for v in files))
+        request(op='fetch', id='vm-canary', destination=str(a.home / 'live-output'))
         assert (a.home / 'live-output/result.txt').read_bytes() == source.read_bytes()
-        events = client.events('tart-canary')
-        assert 'Progress' in json.dumps(events)
+        # Outputs and progress probes are captured independently; wait for this job's metric.
+        execution = request(op='job', id='vm-canary')['assignment']['execution']
+        events = wait(lambda: request(op='data', worker='tart-canary',
+                                      request={'Events': {'since': 0, 'wait_ms': 0}})['Events'],
+                      lambda value: any(event['kind'].get('Progress', {}).get('job') == execution
+                                        for event in value['events']))
         save('live-events.json', events)
         result['live_verified_output_and_metrics'] = result['native_coexistence'] = True
         child.kill()
         child.wait(timeout=10)
         child = start()
-        wait(lambda: client.job('vm-canary'), lambda v: v['phase'] == 'running')
-        client.cancel('vm-canary', request_id='vm-cancel')
-        assert client.wait('vm-canary', timeout=160)['phase'] == 'cancelled'
-        assert client.logs('vm-canary')['data'].count('guest-started-once') == 1
+        active = wait(lambda: request(op='job', id='vm-canary'), lambda v: v['phase'] == 'running')
+        request(op='cancel', id='vm-canary', request_id='vm-cancel', expected_revision=active['revision'])
+        wait(lambda: request(op='job', id='vm-canary'), lambda j: j['phase'] == 'cancelled')
+        assert request(op='logs', id='vm-canary')['Logs']['data'].count('guest-started-once') == 1
         result['combined_service_restart_no_duplicate_guest_job'] = True
         print('VM job cancellation and combined-service restart passed', flush=True)
         spec = save('vm-spec.json', vm)
@@ -124,11 +131,11 @@ def main():
         if child is not None and child.poll() is not None:
             child = start()
         try:
-            for job in client.queue():
+            for job in request(op='queue'):
                 if job['phase'] not in ('succeeded', 'failed', 'cancelled'):
-                    client.cancel(job['id'])
-                    client.wait(job['id'], timeout=160)
-            for vm_record in client.instances():
+                    request(op='cancel', id=job['id'], request_id=f"cleanup-{job['id']}", expected_revision=job['revision'])
+                    wait(lambda: request(op='job', id=job['id']), lambda j: j['phase'] in ('succeeded', 'failed', 'cancelled'))
+            for vm_record in request(op='instances'):
                 if not vm_record['observed'] or vm_record['observed'][1]['phase']['Instance'] != 'Deleted':
                     command('--home', client_home, 'instance', 'delete', vm_record['id'])
                     vm_phase('Deleted')

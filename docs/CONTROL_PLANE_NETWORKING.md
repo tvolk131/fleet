@@ -2,7 +2,8 @@
 
 `fleet-control-lab` can run replicas and workers on separate machines using authenticated iroh QUIC
 over explicit IP addresses. The M4 Pro and M1 Pro use the macOS ARM binary; the Pi uses a separately
-built Linux ARM binary from the same source and lockfile. The normal CLI/GUI/Python clients and persistent service roles now use this transport; see
+built Linux ARM binary from the same source and lockfile. The CLI, GUI, JSON automation, and persistent
+service roles use this transport; see
 [NORMAL_FLEET.md](NORMAL_FLEET.md). The historical qualification below used separate lab homes
 and did not change installed legacy services.
 

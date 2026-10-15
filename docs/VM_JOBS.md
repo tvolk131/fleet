@@ -9,7 +9,7 @@ stages verified inputs, executes the command, captures declared outputs during e
 The ordinary queue, logs, outputs, fetch, cancellation, dependencies and submission keys continue to work.
 Without `vm`, a job still uses the existing trusted native process backend.
 
-Upgrade the coordinator, submitting client and selected worker. The CLI/Python client uses a new `submit_vm_observed`
+Upgrade the coordinator, submitting client and selected worker. The CLI uses a new `submit_vm_observed`
 request so an older local daemon cannot silently use its older execution/output behavior. Remote submission is gated on protocol
 3.7. An older worker remains usable for native jobs and is skipped for VM jobs with an upgrade explanation.
 
@@ -56,25 +56,9 @@ paths such as `bin/train` refer to staged files there; absolute paths refer to t
 argv and environment as data without an implicit shell. Use `/bin/sh -c` explicitly when needed. Thread
 environment defaults mirror native jobs; the reservation is the full VM vCPU count even if `threads` is smaller.
 
-```python
-from fleet import Fleet
-f = Fleet()
-job = f.submit(
-    "isolated training", ["bin/train", "--output", "training"],
-    inputs={"bin/train": "./bin/train", "checkpoint": "./copied-checkpoint"},
-    vm=dict(image="macos", cpus=2, memory_mb=6144, disk_gb=50,
-            network="offline", gpu="exclusive"),
-    threads=2, max_seconds=600, publish=["training/*"],
-    on="m4pro", dest="runs/isolated", idempotency_key="experiment/phase-1",
-)
-result = f.wait(job)
-assert result["state"] == "succeeded", result
-f.fetch(job, "runs/isolated")
-```
-
-`wait` reports job completion; automatic fetching may still be catching up. Explicit `fetch` waits for that
-request's verified transfers. Save the submission key before sending and reuse it after an ambiguous response;
-the same key/specification returns the original job. A deliberate new attempt needs a new key.
+Save the submission key before sending and reuse it after an ambiguous response; the same
+key/specification returns the original job. A deliberate new attempt needs a new key.
+Current automation uses the [JSON CLI interface](NORMAL_FLEET.md#json-automation-interface).
 
 ## Placement and coexistence
 
@@ -111,7 +95,7 @@ folder mount is required. The program writes JSON-lines metrics and ordinary out
 }
 ```
 
-Add those fields to the complete job definition above (or use the corresponding Python submission arguments).
+Add those fields to the complete job definition above.
 `jsonl_field` reads the latest numeric value; a `total` enables a progress bar and host-calculated rate/ETA.
 `jsonl_series` reads recent numeric values. Dotted fields address nested objects. `*` in a metrics-file path selects
 the most recently modified matching regular file. The helper ignores incomplete trailing JSON lines. `glob_count`

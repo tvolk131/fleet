@@ -51,17 +51,8 @@ fleet gui                                     # the window (build with --feature
 
 Without a running daemon, the same commands work in-process, except that `submit` must find a machine at once.
 
-From Python (standard library only), for experiment runners: `contrib/fleet.py` talks to the daemon's socket.
-
-```python
-from fleet import Fleet
-f = Fleet()
-job = f.submit("smoke", ["bin/tool", "--flag"], inputs={"bin/tool": "/path/to/tool"}, publish=["out/*"],
-               gpu=True, tags=["gpu:metal"], dest="runs/smoke")
-f.wait(job)            # outputs land in runs/smoke as they appear
-```
-
-`python3 contrib/test_fleet_py.py` (after `cargo build --release`) tests it against a real agent and daemon.
+The historical Python wrapper has been removed. Current automation uses the
+[JSON CLI interface](NORMAL_FLEET.md#json-automation-interface).
 
 Persistent macOS VMs are an opt-in worker backend using Tart and Softnet. Protocol 3.3 adds
 `fleet instance create/start/stop/inspect/list/delete --on <machine>`, private persistent disks, and offline or
@@ -69,7 +60,7 @@ outbound-public-internet-only networking. Protocol 3.4 adds explicit best-effort
 active macOS VMs per worker, with aggregate CPU and VM memory budgets; exclusive GPU scheduling remains the default. See
 [`docs/VM_INSTANCES.md`](VM_INSTANCES.md) for worker setup, the image catalog, network policy and recovery.
 Protocol 3.5 adds readiness probes, durable guest commands with retained output, regular-file upload/download
-and storage inventory through the CLI and Python client, including for offline guests. See
+and storage inventory through the CLI, including for offline guests. See
 [`docs/VM_GUEST_OPERATIONS.md`](VM_GUEST_OPERATIONS.md) for the workflow and recovery limits.
 
 Protocol 3.6 adds queued jobs in disposable VMs: include `vm` in a job file or pass `--vm vm.json` to
@@ -118,14 +109,7 @@ Custom grace requires an updated coordinator and agent protocol **3.2**. Unsuppo
 settings fail at the coordinator or keep the job queued with an agent-upgrade explanation;
 they are never silently discarded. Existing jobs retain their saved configuration.
 
-Python controllers can assign a stable submission key:
-
-```python
-job = f.submit("train phase 2", ["bin/train", "--seed", "733"],
-               inputs={"bin/train": "./train"},
-               idempotency_key="experiment-uuid/train/phase-2")
-assert f.find_submission("experiment-uuid/train/phase-2") == job
-```
+The historical daemon protocol supports a stable submission key.
 
 The key is scoped to this coordinator's database. Repeating the same key with the same prepared
 specification returns the same job, including after a lost reply or coordinator restart. Input
@@ -134,19 +118,17 @@ as part of the specification; a changed specification is an error. A deliberate 
 a new key. Keep the key mapping for as long as clients may replay submissions.
 
 The local protocol exposes `submit_once` and `find_submission`; older daemons reject these
-operations explicitly. `FleetTransportError` means a response could not be received and the
-request may already have taken effect. Retrying an unkeyed submission is not safe. A semantic
-`FleetError` needs correction rather than a connection retry.
+operations explicitly. A lost response means the request may already have taken effect.
+Retrying an unkeyed submission is not safe; semantic errors require correction.
 
 If delivery to a worker is uncertain, the coordinator retains that worker assignment and its
 resource reservation, reconciles the existing job ID, and retries only on that same worker.
 An agent accepts a repeated matching ID without starting a second supervisor. This is recovery
 of an existing process submission, not automatic retry of failed training or reboot failover.
 
-Tests use isolated temporary homes. To test the Python API against a debug build:
+The historical Rust backend regression tests use isolated temporary homes:
 
 ```sh
 cargo test --all-features --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
-FLEET_TEST_BIN="$PWD/target/debug/fleet" python3 contrib/test_fleet_py.py
 ```

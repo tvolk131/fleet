@@ -129,9 +129,56 @@ fresh destination. These convenience commands currently need quorum to resolve t
 and logs stay out of Raft. The GUI polls the shared client API, displays progress/series and stale-view
 errors, and never schedules or cancels work simply because the window closes.
 
-Python uses `contrib/fleet.py`, invoking the same Rust `fleet api` implementation. `FleetUnknown` contains
-the request ID to retry. `wait(timeout=...)` only stops waiting. There is no daemon socket compatibility
-adapter. `fleet api` accepts one tagged JSON request on stdin and emits an `ok/result` or error envelope.
+## JSON automation interface
+
+`fleet --home /absolute/client-home api` accepts one tagged JSON request on stdin and emits one JSON
+response on stdout. Any language can invoke it. The Rust client owns authentication, discovery, saved
+request payloads, retries, input staging, and verified output transfers; there is no public Python SDK.
+The CLI and GUI use this same Rust implementation.
+
+For example, submit a job, inspect it, and retry a saved request using these stdin payloads:
+
+```json
+{"op":"submit","request_id":"experiment-1","id":"training-1","memory_mb":8192,"job":{"name":"training","argv":["bin/train"],"inputs":{"bin/train":"/absolute/train"},"publish":["out/*"],"keep_awake":false}}
+```
+
+```json
+{"op":"job","id":"training-1"}
+```
+
+```json
+{"op":"retry","request_id":"experiment-1"}
+```
+
+Submission options such as `worker`, `memory_mb`, `gpu`, `requires`, `after`, and `priority` belong to the
+outer request. Workload fields such as `argv`, `inputs`, `vm`, and `checkpoint` belong inside `job`.
+For JSON requests, use absolute local input paths and list individual files. Persist an explicit job ID
+and request ID before submitting; request IDs identify operations, not execution attempts. The complete
+request schema is `ApiRequest` in `src/control/client.rs`.
+
+Successful calls return `{"ok":true,"result":...}`. Mutation results contain a `reply`, such as
+`{"Accepted":{"job":"training-1","revision":1}}` or `{"Rejected":{"reason":"..."}}`.
+An `ok` envelope means the call returned a result; inspect the reply to determine whether the mutation
+was accepted. `RecoveryUnknown` means the old request history is unavailable after emergency recovery;
+it does not authorize repeating the operation under a new request ID.
+
+Client errors return `{"ok":false,"error":"...","outcome_unknown":true,"request_id":"experiment-1"}`
+(with `outcome_unknown` false when appropriate). Unknown outcomes require inspection or retry of the
+saved request. A nonzero exit, interrupted process, or incomplete response also cannot prove that a
+mutation failed. Invalid JSON/schema input can exit nonzero with diagnostics on stderr, without an envelope.
+Do not infer mutation success from the process exit code alone.
+
+Cancel/suspend/resume requests take `expected_revision` from a preceding `job` read and their own explicit
+`request_id`. For example:
+
+```json
+{"op":"cancel","id":"training-1","expected_revision":1,"request_id":"cancel-training-1"}
+```
+
+On a revision conflict, inspect the current state before deciding on a new operation. Retry an unknown
+operation with `retry`, preserving its original payload and revision. Poll `job` to observe completion;
+`succeeded`, `failed`, and `cancelled` are terminal, while `suspended` remains resumable. Stopping a polling
+loop does not cancel the job. Logs, outputs, and fetch accept an optional `attempt` number.
 
 ## Instances and cluster administration
 
@@ -178,7 +225,7 @@ administrative contract; automatic 90-day pruning remains future work. Metadata/
 the qualification remain applicable. Existing backend guarantees do not make CPU/GPU scheduling exclusive
 against unrelated host processes.
 
-The desktop GUI uses `iced-m3` Material 3 components, follows system light/dark appearance, and uses the same durable request journal and replicated API as the CLI and Python client. Closing the window never cancels a job.
+The desktop GUI uses `iced-m3` Material 3 components, follows system light/dark appearance, and uses the same durable request journal and replicated API as the CLI and JSON interface. Closing the window never cancels a job.
 
 ## Qualification and rollout status
 
