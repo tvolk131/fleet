@@ -1,0 +1,69 @@
+name: Fleet
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUST_BACKTRACE: 1
+      ICED_BACKEND: tiny-skia
+      PYTHONDONTWRITEBYTECODE: 1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Linux GUI build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libudev-dev libfontconfig1-dev libegl1-mesa-dev
+      - name: Rust toolchain
+        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Build normal and historical regression clients
+        run: cargo build --all-features --bins --locked
+      - name: Rust tests (including Raft, redb, workers, and headless M3 GUI)
+        run: cargo test --all-features --locked -- --test-threads=2 2>&1 | tee rust-tests.log
+      - name: Clippy
+        run: cargo clippy --all-features --all-targets --locked -- -D warnings
+      - name: Python clients and fixture safeguards
+        run: python3 -m unittest discover -s contrib -p 'test_*.py' -v 2>&1 | tee python-tests.log
+      - name: Three-replica CLI/service failure scenarios
+        run: |
+          python3 contrib/qualify_normal_multihost.py --local --binary "$PWD/target/debug/fleet" \
+            --home /tmp/fleet-control-ci --port 29300 2>&1 | tee local-three.log
+      - name: Collect safe evidence
+        if: always()
+        run: |
+          mkdir -p ci-evidence
+          cp *.log ci-evidence/ 2>/dev/null || true
+          if [ -f /tmp/fleet-control-ci/qualification.json ]; then
+            cp /tmp/fleet-control-ci/qualification.json ci-evidence/
+          fi
+          # Never upload fixture homes: they contain private identity keys and databases.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: evidence-${{ matrix.os }}
+          path: ci-evidence/
+          retention-days: 14

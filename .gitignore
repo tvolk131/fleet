@@ -1,0 +1,12 @@
+/target
+__pycache__/
+*.pyc
+.DS_Store
+node.key
+*.redb
+*.redb.*
+
+# Private local deployment and qualification evidence
+/docs/DEPLOYMENT_*.md
+/docs/PUBLICATION_*.md
+/docs/qualification/
