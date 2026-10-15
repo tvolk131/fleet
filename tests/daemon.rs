@@ -656,6 +656,14 @@ mkdir -p "$out/ckpt"
 while [ $step -lt 30 ]; do
   step=$((step + 1))
   echo "{\"step\": $step}" >> metrics.jsonl
+  if [ "${FLEET_TEST_CHECKPOINT_GATE:-0}" = 1 ]; then
+    # Hold checkpoint 5 until the suspend request is accepted, then hold 10 until stopped.
+    if [ "$step" -eq 6 ]; then
+      while [ ! -f release-checkpoint ]; do sleep 0.05; done
+    elif [ "$step" -eq 11 ]; then
+      while :; do sleep 0.05; done
+    fi
+  fi
   sleep 0.25
   if [ $((step % 5)) -eq 0 ]; then
     mkdir -p "$out/tmp"; echo $step > "$out/tmp/state"
@@ -803,16 +811,11 @@ async fn suspending_now_states_the_loss_and_the_next_segment_resumes_from_the_ch
 async fn suspending_when_safe_waits_for_the_next_checkpoint() {
     let mut f = Fleet::new("suspend-safe", &[("worker", &[])]).await;
     let core = f.daemon().await;
-    let id = submit(
-        &core,
-        training_job(&f, "train"),
-        Placement::default(),
-        None,
-        vec![],
-    )
-    .await;
+    let mut job = training_job(&f, "train");
+    job.env
+        .insert("FLEET_TEST_CHECKPOINT_GATE".into(), "1".into());
+    let id = submit(&core, job, Placement::default(), None, vec![]).await;
     wait_steps(&f, 0, &id, 6).await;
-    let before = steps(&f, 0, &id).last().copied().unwrap();
     core.handle(DaemonRequest::Suspend {
         job: id.clone(),
         now: false,
@@ -820,20 +823,27 @@ async fn suspending_when_safe_waits_for_the_next_checkpoint() {
     })
     .await;
     assert_eq!(core.job(&id).unwrap().unwrap().state, QState::Suspending);
+    // Do not derive a wall-clock bound on lost steps from the polling interval: the host
+    // scheduler can delay detection. Control checkpoint publication instead.
+    std::fs::write(
+        f.workers[0]
+            .home
+            .join("jobs")
+            .join(&id)
+            .join("work/release-checkpoint"),
+        "go",
+    )
+    .unwrap();
     let suspended = wait_for(&core, &id, "the suspension", |j| {
         j.state == QState::Suspended
     })
     .await;
     let at = suspended.checkpoint.unwrap().position.unwrap() as u32;
-    assert_eq!(
-        at,
-        before.div_ceil(5) * 5,
-        "stopped at the first checkpoint after the request"
-    );
+    assert_eq!(at, 10, "stopped at the first checkpoint after the request");
     let last = steps(&f, 0, &id).last().copied().unwrap();
     assert!(
-        last <= at + 4,
-        "lost at most the detection delay: stopped at {last}, checkpoint {at}"
+        (10..=11).contains(&last),
+        "the trainer stopped at checkpoint 10 or its following gate: {last}"
     );
     f.finish().await;
 }
