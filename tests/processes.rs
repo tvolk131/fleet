@@ -93,10 +93,12 @@ impl Homes {
                     .unwrap();
                 let read = |f: &str| std::fs::read_to_string(self.root.join(f)).unwrap_or_default();
                 panic!(
-                    "timed out waiting for {what}\nqueue: {}\n--- daemon.log\n{}\n--- agent.log\n{}",
+                    "timed out waiting for {what}\nqueue: {}\n--- daemon.log\n{}\n--- agent.log\n{}\n--- follower.stdout\n{}\n--- follower.stderr\n{}",
                     String::from_utf8_lossy(&queue.stdout),
                     read("daemon.log"),
-                    read("agent.log")
+                    read("agent.log"),
+                    read("follower.stdout"),
+                    read("follower.stderr")
                 );
             }
             std::thread::sleep(Duration::from_millis(250));
@@ -150,6 +152,11 @@ fn start(h: &Homes) -> Running {
         &format!("127.0.0.1:{}", h.port),
     ]);
     let running = Running(vec![h.start_agent(), h.start_daemon()]);
+    // CLI reads can fall back to an in-process coordinator before the daemon
+    // binds. Confirm the daemon is serving before treating those reads as readiness.
+    h.wait("the daemon socket to accept connections", || {
+        std::os::unix::net::UnixStream::connect(fleet::daemon::socket_path(&h.coordinator)).is_ok()
+    });
     h.wait("the machine to come online", || {
         h.command(&h.coordinator, &["machines", "--json"])
             .output()
@@ -248,8 +255,9 @@ fn a_follower_waits_out_a_daemon_restart_without_taking_its_key() {
     let h = Homes::new("follow");
     let mut running = start(&h);
     let follower_log = h.root.join("follower.stderr");
-    let follower = h
-        .command(
+    let follower_stdout = h.root.join("follower.stdout");
+    let mut follower = Running(vec![
+        h.command(
             &h.coordinator,
             &[
                 "run",
@@ -257,19 +265,21 @@ fn a_follower_waits_out_a_daemon_restart_without_taking_its_key() {
                 "--",
                 "/bin/sh",
                 "-c",
-                "while [ ! -e release ]; do sleep 0.1; done; echo finished",
+                "echo following; while [ ! -e release ]; do sleep 0.1; done; echo finished",
             ],
         )
-        .stdout(Stdio::piped())
+        .stdout(std::fs::File::create(&follower_stdout).unwrap())
         .stderr(std::fs::File::create(&follower_log).unwrap())
         .spawn()
-        .unwrap();
-    h.wait("the job to start", || {
-        h.json(&["queue", "--json"])
-            .as_array()
+        .unwrap(),
+    ]);
+    // A running queue entry alone does not prove the submitting CLI has entered
+    // follow mode: stopping the daemon before its initial ping selects direct mode.
+    h.wait("the follower to receive the first log line", || {
+        std::fs::read_to_string(&follower_stdout)
             .unwrap()
-            .iter()
-            .any(|j| j["state"] == "running")
+            .lines()
+            .any(|line| line == "following")
     });
     // The daemon restarts (stopped as launchd stops it) while the follower is polling.
     unsafe {
@@ -286,11 +296,14 @@ fn a_follower_waits_out_a_daemon_restart_without_taking_its_key() {
     let queue = h.json(&["queue", "--json"]);
     let id = queue[0]["id"].as_str().unwrap();
     std::fs::write(h.agent.join("jobs").join(id).join("work/release"), "go").unwrap();
-    let out = follower.wait_with_output().unwrap();
+    let status = follower.0[0].wait().unwrap();
     let stderr = std::fs::read_to_string(&follower_log).unwrap();
-    assert!(out.status.success(), "{stderr}");
+    assert!(status.success(), "{stderr}");
     assert_eq!(
-        String::from_utf8_lossy(&out.stdout).lines().last(),
+        std::fs::read_to_string(&follower_stdout)
+            .unwrap()
+            .lines()
+            .last(),
         Some("finished")
     );
     assert!(
