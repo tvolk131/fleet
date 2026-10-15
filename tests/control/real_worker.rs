@@ -44,6 +44,14 @@ fn vm_spec() -> instances::Spec {
     }
 }
 async fn prepare(c: &mut Cluster, tart: bool) -> (PathBuf, WorkerConfig) {
+    prepare_with_resources(c, tart, 4, 8192).await
+}
+async fn prepare_with_resources(
+    c: &mut Cluster,
+    tart: bool,
+    cpu_slots: u32,
+    memory_mb: u32,
+) -> (PathBuf, WorkerConfig) {
     let home = c.home.0.join("worker");
     let key = fleet::keys::load_or_create(&home.join("node.key")).unwrap();
     let socket = reserve_socket();
@@ -58,8 +66,8 @@ async fn prepare(c: &mut Cluster, tart: bool) -> (PathBuf, WorkerConfig) {
             },
             incarnation: "journal-1".into(),
             budget: Budget {
-                cpu_slots: 4,
-                memory_mb: 8192,
+                cpu_slots,
+                memory_mb,
                 disk_gb: 200,
                 vm_slots: if tart { 2 } else { 0 },
             },
@@ -525,7 +533,9 @@ async fn worker_process_sigkill_preserves_supervisor_and_durable_cancellation() 
         }
     }
     let mut c = Cluster::new(1).await;
-    let (home, config) = prepare(&mut c, false).await;
+    // This child probes real host capacity instead of the synthetic eight-core
+    // Hello used by in-process tests. One tiny job must fit small CI runners too.
+    let (home, config) = prepare_with_resources(&mut c, false, 1, 256).await;
     instances::write(&home.join("worker.json"), &config).unwrap();
     let start = || {
         Child(
@@ -547,6 +557,10 @@ async fn worker_process_sigkill_preserves_supervisor_and_durable_cancellation() 
     let path = home.join("backend/jobs/exec-process/supervisor.json");
     let end = tokio::time::Instant::now() + WAIT;
     while !path.exists() {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "worker process exited before launching the canary"
+        );
         assert!(tokio::time::Instant::now() < end);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

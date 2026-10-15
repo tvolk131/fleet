@@ -29,6 +29,10 @@ class FleetPy(unittest.TestCase):
                                                   check=True, capture_output=True, text=True).stdout.strip()
         coordinator = run(cls.home, 'id')
         run(cls.agent_home, 'allow', coordinator)
+        # The host default reserves two cores, leaving only one slot on a
+        # three-core runner. This isolated fixture explicitly needs two slots
+        # for its thread-propagation and fake-VM contracts.
+        (cls.agent_home / 'cpu-slots').write_text('2\n')
         agent = run(cls.agent_home, 'id', '--role', 'agent')
         run(cls.home, 'machine', 'add', 'local', agent, '--addr', f'127.0.0.1:{port}')
         cls.logs = [open(root / f'{cmd}.log', 'w') for cmd in ('agent', 'daemon')]
