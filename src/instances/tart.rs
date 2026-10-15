@@ -409,6 +409,12 @@ pub fn run_controller(home: &Path, id: &str) -> Result<()> {
             if instance.record.desired == Desired::Stopped {
                 observe(home, &instance, State::Stopped, None)?;
             } else {
+                // The launcher can exit while `tart list` runs, after the try_wait above.
+                // Reap it on the next iteration before considering another launch, so a
+                // late failure cannot be overwritten by a new Child and silently retried.
+                if child.is_some() {
+                    return Ok(false);
+                }
                 if info(home, id)?.record.revision != instance.record.revision {
                     return Ok(false);
                 }

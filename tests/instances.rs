@@ -565,8 +565,11 @@ fn a_late_launcher_failure_is_reported_without_a_restart_loop() {
     f.controller("one");
     f.wait("one", State::Stopped);
     fs::write(f.home.join("instance-tart/fail-after-lock"), "").unwrap();
+    fs::write(f.home.join("instance-tart/gate-launcher-failure"), "").unwrap();
     f.set("one", Desired::Running);
     f.wait("one", State::Running);
+    // Force the launcher to exit during inventory, between try_wait and reconciliation.
+    fs::write(f.home.join("instance-tart/fail-launcher-during-list"), "").unwrap();
     let failed = f.wait("one", State::Failed);
     assert!(failed.reserves_compute());
     assert!(

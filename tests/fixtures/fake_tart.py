@@ -10,6 +10,12 @@ root=Path(os.environ['TART_HOME']); (root/'vms').mkdir(parents=True,exist_ok=Tru
 with (root/'history').open('a') as f: f.write(' '.join(args)+'\n')
 op=args[0]
 if op=='list':
+    if (root/'fail-launcher-during-list').exists():
+        (root/'release-launcher-failure').touch()
+        deadline=time.monotonic()+10
+        while any((vm/'pid').exists() for vm in (root/'vms').iterdir()):
+            assert time.monotonic()<deadline, 'fixture launcher did not exit'
+            time.sleep(.01)
     result=[]
     for vm in (root/'vms').iterdir():
         state='stopped'
@@ -38,7 +44,9 @@ elif op=='run':
             (vm/'pid').unlink(missing_ok=True);sys.exit(0)
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGINT,stop)
         if (root/'fail-after-lock').exists():
-            time.sleep(3)
+            if (root/'gate-launcher-failure').exists():
+                while not (root/'release-launcher-failure').exists():time.sleep(.01)
+            else:time.sleep(3)
             print('Late virtual machine capacity error',file=sys.stderr)
             (vm/'pid').unlink(missing_ok=True)
             sys.exit(42)

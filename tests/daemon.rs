@@ -565,27 +565,26 @@ async fn pausing_freezes_a_job_without_spending_its_time_limit() {
         gpu: true,
         ..Placement::default()
     };
-    // 20 ticks of 0.2 s (4 s of work) under a 6 s limit.
+    // Gate completion so host scheduling cannot consume a tiny nominal runtime margin.
     let mut job = f.job(
         "ticker",
-        "mkdir -p out; for i in $(seq 1 20); do echo $i >> out/count; sleep 0.2; done",
+        "mkdir -p out; echo before >> out/count; while [ ! -f release ]; do sleep 0.05; done; echo after >> out/count",
     );
-    job.max_seconds = Some(6);
+    job.max_seconds = Some(10);
     let id = submit(&core, job, gpu.clone(), None, vec![]).await;
     wait_for(&core, &id, "the start", |j| j.state == QState::Running).await;
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    let work = f.workers[0].home.join("jobs").join(&id).join("work");
+    let count = work.join("out/count");
+    wait_for(&core, &id, "the first write", |_| lines(&count) == 1).await;
     assert!(matches!(
         core.handle(DaemonRequest::Pause { job: id.clone() }).await,
         DaemonResponse::Done
     ));
     assert_eq!(core.job(&id).unwrap().unwrap().state, QState::Paused);
-    let count = f.workers[0]
-        .home
-        .join("jobs")
-        .join(&id)
-        .join("work/out/count");
     let frozen = lines(&count);
-    assert!(frozen > 0 && frozen < 20, "{frozen}");
+    assert_eq!(frozen, 1);
+    // Make completion possible while paused: a broken pause would write the second line.
+    std::fs::write(work.join("release"), "go").unwrap();
 
     // While it is paused, its GPU is free for another GPU job.
     let other = submit(&core, f.job("other", "true"), gpu, None, vec![]).await;
@@ -595,7 +594,7 @@ async fn pausing_freezes_a_job_without_spending_its_time_limit() {
     .await;
 
     // Frozen for longer than its whole time limit.
-    tokio::time::sleep(Duration::from_secs(7)).await;
+    tokio::time::sleep(Duration::from_secs(11)).await;
     assert_eq!(lines(&count), frozen, "nothing ran while paused");
     assert!(matches!(
         core.handle(DaemonRequest::Continue { job: id.clone() })
@@ -608,7 +607,7 @@ async fn pausing_freezes_a_job_without_spending_its_time_limit() {
         QState::Succeeded,
         "paused time did not count toward the limit: {done:?}"
     );
-    assert_eq!(lines(&count), 20);
+    assert_eq!(lines(&count), 2);
 
     // A paused job can still be cancelled, promptly.
     let sleeper = submit(
