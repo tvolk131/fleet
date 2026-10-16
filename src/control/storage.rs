@@ -264,16 +264,27 @@ impl Agent {
                 "cleanup held after authority recovery"
             );
             // Tombstones survive a controller rollback. Never silently resurrect deleted payloads.
-            crate::instances::write(&tombstone, m)?;
+            if !tombstone.is_file() {
+                crate::instances::write(&tombstone, m)?;
+            }
             self.access
                 .write()
                 .expect("artifact access")
                 .objects
                 .remove(&m.id);
-            if root.exists() {
+            let removed = root.exists();
+            if removed {
                 std::fs::remove_dir_all(&root)?;
             }
-            std::fs::File::open(self.home.join("objects"))?.sync_all()?;
+            let acknowledged = artifact
+                .copies
+                .get(&format!("storage/{}", self.config.registration.id))
+                .is_some_and(|c| {
+                    c.phase == CopyPhase::Deleted && c.authority == self.config.cluster
+                });
+            if removed || !acknowledged {
+                std::fs::File::open(self.home.join("objects"))?.sync_all()?;
+            }
             return Ok(CopyPhase::Deleted);
         }
         ensure!(

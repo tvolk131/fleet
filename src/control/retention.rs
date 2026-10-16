@@ -55,7 +55,13 @@ impl State {
                     copy_problems: a
                         .copies
                         .iter()
-                        .filter(|(_, c)| !matches!(c.phase, CopyPhase::Ready | CopyPhase::Deleted))
+                        .filter(|(_, c)| {
+                            if a.deleted {
+                                c.phase != CopyPhase::Deleted
+                            } else {
+                                !matches!(c.phase, CopyPhase::Ready | CopyPhase::Deleted)
+                            }
+                        })
                         .map(|(location, c)| {
                             format!(
                                 "{location}: {:?}{}",

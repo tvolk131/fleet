@@ -78,6 +78,17 @@ impl Worker {
         }
         // Persist tombstones before removing local files. Replayed source reports cannot resurrect them.
         for a in view.artifacts.iter().filter(|a| a.deleted) {
+            // Completed deletions are history, not a new disk operation every tick. Recovery
+            // changes the authority and deliberately requires a fresh acknowledgement.
+            if saved.deleted_artifacts.contains(&a.manifest.id)
+                && a.copies
+                    .get(&format!("worker/{}", self.config.registration.id))
+                    .is_some_and(|c| {
+                        c.phase == CopyPhase::Deleted && c.authority == self.config.cluster
+                    })
+            {
+                continue;
+            }
             if !view.cleanup_allowed {
                 self.report_artifact(
                     a,
@@ -88,10 +99,12 @@ impl Worker {
                 continue;
             }
             let m = &a.manifest;
-            self.journal.change(|s| {
-                s.deleted_artifacts.insert(m.id.clone());
-                Ok(())
-            })?;
+            if !saved.deleted_artifacts.contains(&m.id) {
+                self.journal.change(|s| {
+                    s.deleted_artifacts.insert(m.id.clone());
+                    Ok(())
+                })?;
+            }
             self.artifact_access
                 .write()
                 .expect("artifact access")

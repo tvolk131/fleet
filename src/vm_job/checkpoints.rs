@@ -75,7 +75,11 @@ pub fn reclaimed(dir: &Path, id: &str) -> Result<()> {
         .parent()
         .context("capture parent")?
         .to_owned();
-    instances::write(&root.join("reclaimed.json"), &true)
+    let marker = root.join("reclaimed.json");
+    if !marker.is_file() {
+        instances::write(&marker, &true)?;
+    }
+    Ok(())
 }
 
 fn live<'a>(dir: &Path, ledger: &'a Ledger) -> impl Iterator<Item = &'a Captured> {
