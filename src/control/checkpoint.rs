@@ -123,11 +123,13 @@ impl State {
                 ensure!(old == c, "immutable checkpoint changed");
             } else {
                 ensure!(
-                    self.checkpoints
-                        .values()
-                        .filter(|old| old.attempt == c.attempt)
-                        .count()
-                        < crate::checkpoint::MAX_CHECKPOINTS,
+                    matches!(&a.workload, Workload::Job { spec, .. } if spec.checkpoint.as_ref().is_some_and(|p| p.retention.is_some()))
+                        || self
+                            .checkpoints
+                            .values()
+                            .filter(|old| old.attempt == c.attempt)
+                            .count()
+                            < crate::checkpoint::MAX_CHECKPOINTS,
                     "checkpoint retention limit reached"
                 );
             }

@@ -29,10 +29,12 @@ def main():
     parser.add_argument('--image-cache', type=Path)
     parser.add_argument('--job', type=Path)
     parser.add_argument('--backup-restore', action='store_true', help='qualify a separate storage home with source checkpoint/cache removed')
+    parser.add_argument('--rolling', action='store_true', help='capture 24 checkpoints with keep_last=2 and bounded host storage')
     a = parser.parse_args()
     assert a.home.is_absolute() and a.home.resolve().is_relative_to(Path('/tmp').resolve())
     assert a.home.name.startswith('fleet-control-'), 'isolated fixture prefix required'
     assert a.fake or (a.instances and a.image_cache)
+    assert not (a.rolling and a.job), 'rolling fixture uses the built-in job'
     assert not (a.backup_restore and a.job), 'backup fixture uses the built-in job without original input dependencies'
     a.home.mkdir(mode=0o700, parents=True, exist_ok=False)
     # Supervisors and restarted services must use one immutable candidate, even while a developer rebuilds.
@@ -126,10 +128,26 @@ def main():
             '--worker-home', worker, '--bootstrap', *storage_args)
     request = partial(api_result, a.binary, client_home)
     first = "import hashlib,json,pathlib,time; p=pathlib.Path('checkpoints/one'); p.mkdir(parents=True); (p/'state').write_text('7'); m={'version':1,'position':7,'files':{'state':{'size':1,'sha256':hashlib.sha256(b'7').hexdigest()}}}; (p/'ready.tmp').write_text(json.dumps(m)); (p/'ready.tmp').rename(p/'fleet.json'); print('initial-once',flush=True); time.sleep(180)"
-    resume = "import pathlib,sys; n=int(pathlib.Path(sys.argv[1]).read_text()); pathlib.Path('result.txt').write_text(str(n+1)); print('resumed-once',flush=True)"
+    resume = "import pathlib,sys; n=int(pathlib.Path(sys.argv[1]).read_text().splitlines()[0]); pathlib.Path('result.txt').write_text(str(n+1)); print('resumed-once',flush=True)"
     job = json.loads(a.job.read_text()) if a.job else dict(
         name='Checkpoint qualification', argv=['/usr/bin/python3', '-c', first], publish=['result.txt'],
         checkpoint={'manifests': 'checkpoints/*/fleet.json', 'resume_argv': ['/usr/bin/python3', '-c', resume, '{checkpoint}/state']})
+    if a.rolling:
+        job['argv'] = ['/usr/bin/python3', '-c', """
+import hashlib,json,pathlib,time
+for n in range(1,25):
+ p=pathlib.Path('checkpoints/%03d'%n); p.mkdir(parents=True)
+ data=(str(n)+'\\n').encode()+b'x'*(65536-len(str(n))-1)
+ (p/'state').write_bytes(data)
+ m={'version':1,'position':n,'files':{'state':{'size':len(data),'sha256':hashlib.sha256(data).hexdigest()}}}
+ (p/'ready.tmp').write_text(json.dumps(m)); (p/'ready.tmp').rename(p/'fleet.json')
+print('initial-once',flush=True)
+time.sleep(500)
+"""]
+        job['checkpoint']['retention'] = dict(keep_last=2, max_live_checkpoints=6,
+                                             max_live_bytes=2<<20, transfer_bytes_per_hour=8<<20)
+    expected_checkpoint = '24' if a.rolling else '7'
+    expected_result = '25' if a.rolling else '8'
     job.update(keep_awake=False, settle_seconds=0, max_seconds=600, threads=vm_cpus,
                vm=dict(image='macos', cpus=vm_cpus, memory_mb=vm_memory, disk_gb=50, network='offline', gpu='exclusive'))
     try:
@@ -139,7 +157,22 @@ def main():
             command('--home', client_home, 'storage', 'enroll', storage_home / 'registration.json', '--request-id', 'storage-enroll')
             command('--home', client_home, 'storage', 'policy', '--revision', 0, '--checkpoint', 'checkpoint-backup', '--output', 'checkpoint-backup', '--request-id', 'storage-policy')
         request(op='submit', id='resumable', request_id='submit', worker='checkpoint-worker', memory_mb=vm_memory, job=job)
-        cp = wait(lambda: request(op='checkpoints', id='resumable'), bool)[0]
+        if a.rolling:
+            captures = wait(lambda: request(op='checkpoints', id='resumable'), lambda rows: len(rows) == 24, seconds=480)
+            def bounded(status):
+                reports = [r['report'] for r in status['workers'] if r['report']]
+                return bool(reports) and all(
+                    u['live_checkpoints'] == 2 for r in reports for u in r['checkpoints'].values())
+            status = wait(lambda: request(op='storage'), bounded)
+            save('rolling-storage.json', status)
+            assert all(r['report']['blob_payload_bytes'] <= 2*65536 for r in status['workers'])
+            artifacts = request(op='artifacts')
+            assert sum(not r['artifact']['deleted'] for r in artifacts) == 2
+            result.update(rolling_captures=len(captures), rolling_live=2, rolling_cache_bytes=2*65536,
+                          rolling_reclamation_verified=True)
+            cp = request(op='job', id='resumable')['latest_checkpoint']
+        else:
+            cp = wait(lambda: request(op='checkpoints', id='resumable'), bool)[0]
         print('Verified checkpoint published', flush=True)
         backup_artifact = None
         if a.backup_restore:
@@ -168,8 +201,13 @@ def main():
         child = start()
         suspended = wait(lambda: request(op='job', id='resumable'), lambda j: j['phase'] == 'suspended')
         if a.backup_restore:
+            # Catalog Ready survives restart, while the new storage process must audit its bytes
+            # and rebuild serving access. Its first complete status report confirms that pass.
+            wait(lambda: request(op='storage'), lambda status: any(
+                r['storage'] == 'checkpoint-backup' and r['report'] is not None
+                for r in status['storage_reports']))
             request(op='fetch_checkpoint', id=cp['id'], destination=str(a.home / 'backup-only-export'))
-            assert (a.home / 'backup-only-export/files/state').read_text() == '7'
+            assert (a.home / 'backup-only-export/files/state').read_text().splitlines()[0] == expected_checkpoint
             result['backup_only_export_verified'] = True
         request(op='resume', id='resumable', request_id='resume', expected_revision=suspended['revision'])
         request(op='retry', request_id='resume')
@@ -182,11 +220,11 @@ def main():
             save(f'attempt-{n}-logs.json', request(op='logs', id='resumable', attempt=n)['Logs'])
         request(op='fetch', id='resumable', destination=str(a.home / 'outputs'), attempt=2)
         if not a.job:
-            assert (a.home / 'outputs/result.txt').read_text() == '8'
+            assert (a.home / 'outputs/result.txt').read_text() == expected_result
             assert request(op='logs', id='resumable', attempt=1)['Logs']['data'].count('initial-once') == 1
             assert request(op='logs', id='resumable', attempt=2)['Logs']['data'].count('resumed-once') == 1
         if a.backup_restore:
-            assert (worker / 'restored' / backup_artifact['manifest']['id'] / 'state').read_text() == '7'
+            assert (worker / 'restored' / backup_artifact['manifest']['id'] / 'state').read_text().splitlines()[0] == expected_checkpoint
             outputs = wait(lambda: request(op='artifacts'), lambda rows: any(
                 r['artifact']['manifest']['kind'] == 'FinalOutputs' and r['artifact']['copies']['storage/checkpoint-backup']['phase'] == 'Ready' for r in rows))
             save('artifacts-before-cleanup.json', outputs)

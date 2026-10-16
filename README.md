@@ -69,3 +69,5 @@ Testing: `cargo test --all-features --locked`; `cargo clippy --all-features --al
 `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s contrib -p 'test_*.py'` after building all feature binaries.
 `fleet-control-lab` is retained for fault qualification. The retired CLI, GUI, standalone daemon,
 and their installers are removed. Normal clients always use the replicated control plane.
+
+Rolling checkpoint retention is opt-in; see [rolling storage](docs/ROLLING_STORAGE.md) for budgets, pins, reclamation and storage reports.

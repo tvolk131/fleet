@@ -45,6 +45,8 @@ pub struct AgentConfig {
 
 #[derive(Debug, Clone)]
 pub struct Agent {
+    /// Serializes output publication/input reservations with reclamation planning.
+    blob_gate: Arc<tokio::sync::Mutex<()>>,
     _watchers: Arc<Watchers>,
     allow: Arc<HashSet<EndpointId>>,
     submitting: Arc<tokio::sync::Mutex<()>>,
@@ -78,6 +80,31 @@ impl Drop for Staging {
 }
 
 impl Agent {
+    #[cfg(feature = "control-plane")]
+    pub(crate) async fn blob_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.blob_gate.lock().await
+    }
+
+    #[cfg(feature = "control-plane")]
+    pub(crate) async fn reserve_inputs(&self, hashes: &[Hash]) -> Result<Response> {
+        let _guard = self.blob_gate.lock().await;
+        anyhow::ensure!(hashes.len() <= 4096, "too many input reservations");
+        for hash in hashes {
+            // Reservations intentionally survive the gap between push and committed Stage, including
+            // client crashes. This milestone does not expire original input caches.
+            self.config
+                .store
+                .tags()
+                .set(
+                    format!("input/{hash}"),
+                    iroh_blobs::HashAndFormat::raw(*hash),
+                )
+                .await?;
+        }
+        self.config.store.sync_db().await?;
+        Ok(Response::Missing(Vec::new()))
+    }
+
     /// Opens the event log (`$FLEET_HOME/events.jsonl`) and starts watching the jobs. Must run inside a Tokio runtime.
     pub fn start(
         allow: Arc<HashSet<EndpointId>>,
@@ -134,6 +161,7 @@ impl Agent {
             origins.clone(),
         ));
         Ok(Self {
+            blob_gate: Arc::default(),
             _watchers: Arc::new(Watchers(vec![vm_watch, job_watch])),
             allow,
             submitting,
@@ -177,6 +205,11 @@ impl Agent {
     }
 
     pub(crate) async fn handle(&self, peer: EndpointId, request: Request) -> Result<Response> {
+        let _blobs = if matches!(&request, Request::Outputs { .. }) {
+            Some(self.blob_gate.lock().await)
+        } else {
+            None
+        };
         let home = &self.config.home;
         Ok(match request {
             Request::CancelVmJob { job, spec } => {
@@ -679,18 +712,19 @@ impl Agent {
             let hash = match cached {
                 Some(hash) => hash,
                 None => {
-                    let tag = self
-                        .config
-                        .store
-                        .blobs()
-                        .add_path(&abs)
-                        .with_named_tag(format!("output/{job}/{path}"))
-                        .await?;
-                    self.hashed
-                        .lock()
-                        .expect("hash cache")
-                        .insert(key, tag.hash);
-                    tag.hash
+                    let source = abs.clone();
+                    let hash =
+                        tokio::task::spawn_blocking(move || crate::blobs::hash_file(&source))
+                            .await??;
+                    crate::blobs::import_named(
+                        &self.config.store,
+                        &abs,
+                        hash,
+                        format!("output/{job}/{path}"),
+                    )
+                    .await?;
+                    self.hashed.lock().expect("hash cache").insert(key, hash);
+                    hash
                 }
             };
             out.push(OutputFile { path, size, hash });

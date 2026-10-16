@@ -19,6 +19,7 @@ print('initial-once',flush=True)
 time.sleep(150)
 "#.into()];
     spec.checkpoint = Some(fleet::checkpoint::Policy {
+        retention: None,
         manifests: "cp/*/fleet.json".into(),
         resume_argv: vec!["/usr/bin/python3".into(), "-c".into(), "import pathlib,sys; n=int(pathlib.Path(sys.argv[1]).read_text()); pathlib.Path('result.txt').write_text(str(n+1)); print('resumed-once',flush=True)".into(), "{checkpoint}/state".into()],
     });
@@ -678,6 +679,13 @@ async fn checkpoint_backup_restores_without_worker_payloads_and_retention_preser
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn format_six_upgrade_preserves_suspended_checkpoint_and_request_receipts() {
+    upgrade_suspended(6).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn format_seven_upgrade_preserves_suspended_checkpoint_and_request_receipts() {
+    upgrade_suspended(7).await;
+}
+async fn upgrade_suspended(source_version: u32) {
     use redb::{Database, ReadableTable, TableDefinition};
     let mut c = Cluster::new(1).await;
     let (home, config) = prepare(&mut c, true).await;
@@ -727,9 +735,16 @@ async fn format_six_upgrade_preserves_suspended_checkpoint_and_request_receipts(
                 .unwrap();
             let mut value: serde_json::Value =
                 serde_json::from_slice(table.get("state").unwrap().unwrap().value()).unwrap();
-            value["format"] = serde_json::json!(6);
-            for field in ["storage", "artifacts", "deleted_artifacts"] {
-                value.as_object_mut().unwrap().remove(field);
+            value["format"] = serde_json::json!(source_version);
+            if source_version == 6 {
+                for field in ["storage", "artifacts", "deleted_artifacts"] {
+                    value.as_object_mut().unwrap().remove(field);
+                }
+            } else if let Some(catalog) = value.get_mut("storage") {
+                catalog.as_object_mut().unwrap().remove("next_ordinal");
+                for artifact in catalog["artifacts"].as_object_mut().unwrap().values_mut() {
+                    artifact.as_object_mut().unwrap().remove("ordinal");
+                }
             }
             table
                 .insert("state", serde_json::to_vec(&value).unwrap().as_slice())
@@ -738,7 +753,7 @@ async fn format_six_upgrade_preserves_suspended_checkpoint_and_request_receipts(
                 let mut identity: serde_json::Value =
                     serde_json::from_slice(table.get("identity").unwrap().unwrap().value())
                         .unwrap();
-                identity[0] = serde_json::json!(6);
+                identity[0] = serde_json::json!(source_version);
                 table
                     .insert(
                         "identity",
@@ -750,8 +765,15 @@ async fn format_six_upgrade_preserves_suspended_checkpoint_and_request_receipts(
         tx.commit().unwrap();
     }
     fleet::control::upgrade::run(&controller, std::slice::from_ref(&home), &[]).unwrap();
-    assert!(controller.join("control.redb.v6-backup").exists());
-    assert!(home.join("worker.redb.v6-backup").exists());
+    assert!(
+        controller
+            .join(format!("control.redb.v{source_version}-backup"))
+            .exists()
+    );
+    assert!(
+        home.join(format!("worker.redb.v{source_version}-backup"))
+            .exists()
+    );
     let mut cfg = c.config.clone();
     cfg.id = 1;
     c.replicas
@@ -808,6 +830,177 @@ async fn format_six_upgrade_preserves_suspended_checkpoint_and_request_receipts(
         WorkPhase::Job(AttemptPhase::Succeeded),
     )
     .await;
+    w.shutdown().await.unwrap();
+    c.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rolling_capture_reclaims_beyond_sixteen_preserves_pin_and_resumes_after_restart() {
+    let mut c = Cluster::new(1).await;
+    let (home, config) = prepare(&mut c, true).await;
+    let mut w = Worker::start(&home, config.clone(), hello()).await.unwrap();
+    let mut work = resumable();
+    let Workload::Job { spec, .. } = &mut work else {
+        unreachable!()
+    };
+    spec.argv = vec!["/usr/bin/python3".into(), "-c".into(), r#"
+import hashlib,json,pathlib,time
+for n in range(1,29):
+ p=pathlib.Path('cp/%03d'%n); p.mkdir(parents=True)
+ data=(str(n)+'\n').encode()+b'x'*(65536-len(str(n))-1)
+ (p/'state').write_bytes(data)
+ m={'version':1,'position':n,'files':{'state':{'size':len(data),'sha256':hashlib.sha256(data).hexdigest()}}}
+ (p/'ready.tmp').write_text(json.dumps(m)); (p/'ready.tmp').rename(p/'fleet.json')
+print('initial-once',flush=True)
+time.sleep(150)
+"#.into()];
+    let policy = spec.checkpoint.as_mut().unwrap();
+    policy.retention = Some(fleet::checkpoint::Rolling {
+        keep_last: 2,
+        max_live_checkpoints: 6,
+        max_live_bytes: 2 << 20,
+        transfer_bytes_per_hour: 8 << 20,
+    });
+    policy.resume_argv = vec!["/usr/bin/python3".into(),"-c".into(),
+        "import pathlib,sys; n=int(pathlib.Path(sys.argv[1]).read_text().splitlines()[0]); pathlib.Path('result.txt').write_text(str(n+1))".into(),"{checkpoint}/state".into()];
+    queued(&mut c, work).await;
+    let unrelated = w.store.blobs().add_slice(b"unrelated cache").await.unwrap();
+    w.store.tags().delete(unrelated.name).await.unwrap();
+    let mut pinned = None;
+    let mut restarted = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(110);
+    let state = loop {
+        w.tick().await.unwrap();
+        let state = c.client.read(WAIT).await.unwrap();
+        if pinned.is_none() && state.checkpoints.len() >= 6 {
+            let latest = fleet::control::client::latest_checkpoint(&state, "logical").unwrap();
+            let artifact = state
+                .storage
+                .artifacts
+                .values()
+                .find(|a| {
+                    a.manifest.kind == fleet::control::artifact::Kind::Checkpoint(latest.id.clone())
+                })
+                .unwrap();
+            let reply = c
+                .client
+                .write(
+                    Request {
+                        origin: c.config.cluster.clone(),
+                        id: "pin-research-point".into(),
+                        mutation: Mutation::ArtifactRetention {
+                            id: artifact.manifest.id.clone(),
+                            expected_revision: artifact.revision,
+                            pinned: true,
+                            expires_at: None,
+                        },
+                    },
+                    WAIT,
+                )
+                .await
+                .unwrap();
+            assert_eq!(reply, Reply::Recorded);
+            pinned = Some(artifact.manifest.id.clone());
+        }
+        if !restarted && state.checkpoints.len() >= 12 {
+            w.shutdown().await.unwrap();
+            w = Worker::start(&home, config.clone(), hello()).await.unwrap();
+            restarted = true;
+        }
+        if state.checkpoints.len() == 28
+            && state
+                .storage
+                .artifacts
+                .values()
+                .filter(|a| !a.deleted)
+                .count()
+                == 3
+        {
+            let report: serde_json::Value = jobs::read_json(&home.join("storage-report.json"))
+                .unwrap()
+                .unwrap();
+            let usage = report["checkpoints"]
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap();
+            if usage["live_checkpoints"] == 3
+                && report["blob_payload_bytes"].as_u64().unwrap() < 4 * 65536
+            {
+                break state;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rolling capture stalled: {:?}; report {:?}",
+            state.checkpoints.len(),
+            std::fs::read_to_string(home.join("storage-report.json"))
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(restarted);
+    assert!(!state.storage.artifacts[&pinned.unwrap()].deleted);
+    assert!(w.store.blobs().has(unrelated.hash).await.unwrap());
+    let latest = fleet::control::client::latest_checkpoint(&state, "logical").unwrap();
+    assert_eq!(latest.content.manifest.position, Some(28));
+    let reply = c
+        .client
+        .write(
+            Request {
+                origin: c.config.cluster.clone(),
+                id: "rolling-suspend".into(),
+                mutation: Mutation::SuspendJob {
+                    id: "logical".into(),
+                    expected_revision: state.jobs["logical"].revision,
+                    checkpoint: latest.id.clone(),
+                },
+            },
+            WAIT,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(reply, Reply::Accepted { .. }));
+    wait(
+        &mut c,
+        &mut w,
+        "logical",
+        WorkPhase::Job(AttemptPhase::Suspended),
+    )
+    .await;
+    let state = c.client.read(WAIT).await.unwrap();
+    let reply = c
+        .client
+        .write(
+            Request {
+                origin: c.config.cluster.clone(),
+                id: "rolling-resume".into(),
+                mutation: Mutation::ResumeJob {
+                    id: "logical".into(),
+                    expected_revision: state.jobs["logical"].revision,
+                },
+            },
+            WAIT,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(reply, Reply::Accepted { .. }));
+    let final_attempt = wait(
+        &mut c,
+        &mut w,
+        "logical",
+        WorkPhase::Job(AttemptPhase::Succeeded),
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(
+            home.join("backend/jobs")
+                .join(final_attempt.execution)
+                .join("work/result.txt")
+        )
+        .unwrap(),
+        "29"
+    );
     w.shutdown().await.unwrap();
     c.close().await;
 }

@@ -202,6 +202,9 @@ impl State {
             };
         }
         let reply = self.mutate(&principal, &request.id, &request.mutation, index);
+        if matches!(reply, Reply::Recorded | Reply::Accepted { .. }) {
+            self.apply_rolling_retention();
+        }
         let resource = match &reply {
             Reply::Accepted { job, .. } => Some(job.clone()),
             Reply::MembershipAccepted { operation, .. } => Some(operation.clone()),

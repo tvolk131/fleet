@@ -78,6 +78,17 @@ impl Worker {
         }
         // Persist tombstones before removing local files. Replayed source reports cannot resurrect them.
         for a in view.artifacts.iter().filter(|a| a.deleted) {
+            // Completed deletions are history, not a new disk operation every tick. Recovery
+            // changes the authority and deliberately requires a fresh acknowledgement.
+            if saved.deleted_artifacts.contains(&a.manifest.id)
+                && a.copies
+                    .get(&format!("worker/{}", self.config.registration.id))
+                    .is_some_and(|c| {
+                        c.phase == CopyPhase::Deleted && c.authority == self.config.cluster
+                    })
+            {
+                continue;
+            }
             if !view.cleanup_allowed {
                 self.report_artifact(
                     a,
@@ -88,10 +99,12 @@ impl Worker {
                 continue;
             }
             let m = &a.manifest;
-            self.journal.change(|s| {
-                s.deleted_artifacts.insert(m.id.clone());
-                Ok(())
-            })?;
+            if !saved.deleted_artifacts.contains(&m.id) {
+                self.journal.change(|s| {
+                    s.deleted_artifacts.insert(m.id.clone());
+                    Ok(())
+                })?;
+            }
             self.artifact_access
                 .write()
                 .expect("artifact access")
@@ -215,6 +228,7 @@ impl Worker {
             }
         }
         *self.artifact_access.write().expect("artifact access") = access;
+        self.reclaim_and_report_storage().await?;
         Ok(())
     }
     async fn capture_final_outputs(&self, a: &Assignment) -> Result<Option<Manifest>> {
@@ -313,16 +327,13 @@ impl Worker {
         if artifact_io::verify(&local, &manifest).is_ok() {
             for file in &cp.content.files {
                 cp.content.verify_file(&local, file)?;
-                let imported = self
-                    .store
-                    .blobs()
-                    .add_path(local.join(&file.path))
-                    .with_named_tag(format!("checkpoint/{id}/{}", file.path))
-                    .await?;
-                ensure!(
-                    imported.hash == file.hash,
-                    "local checkpoint import mismatch"
-                );
+                blobs::import_named(
+                    &self.store,
+                    &local.join(&file.path),
+                    file.hash,
+                    format!("checkpoint/{id}/{}", file.path),
+                )
+                .await?;
             }
             self.store.sync_db().await?;
             return Ok(());
@@ -393,13 +404,13 @@ impl Worker {
         }
         for file in &cp.content.files {
             cp.content.verify_file(&destination, file)?;
-            let tag = self
-                .store
-                .blobs()
-                .add_path(destination.join(&file.path))
-                .with_named_tag(format!("checkpoint/{id}/{}", file.path))
-                .await?;
-            ensure!(tag.hash == file.hash, "restored checkpoint import mismatch");
+            blobs::import_named(
+                &self.store,
+                &destination.join(&file.path),
+                file.hash,
+                format!("checkpoint/{id}/{}", file.path),
+            )
+            .await?;
         }
         self.store.sync_db().await?;
         Ok(())

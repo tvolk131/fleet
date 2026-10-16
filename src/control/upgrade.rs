@@ -65,11 +65,11 @@ pub(crate) fn mutation(value: &mut Value, assignments: &Value) -> Result<()> {
 }
 
 pub(crate) fn state(mut value: Value) -> Result<State> {
-    if value["format"] == 6 {
+    if value["format"] == 6 || value["format"] == 7 {
         let mut state: State = serde_json::from_value(value)?;
         ensure!(
             state.recovery.is_none(),
-            "format-6 recovery-bound state requires a separate migration"
+            "format-6/7 recovery-bound state requires a separate migration"
         );
         ensure!(
             state.membership.voter_ids().count() == 1
@@ -199,10 +199,10 @@ pub(crate) fn journal(mut value: Value) -> Result<Value> {
     if value["format"] == super::FORMAT {
         return Ok(value);
     }
-    if value["format"] == 6 {
+    if value["format"] == 6 || value["format"] == 7 {
         ensure!(
             value["recovery_inventory"].is_null() && value["recovery_binding"].is_null(),
-            "format-6 recovery-bound worker requires a separate migration"
+            "format-6/7 recovery-bound worker requires a separate migration"
         );
         for (_, item) in value["observations"]
             .as_object()

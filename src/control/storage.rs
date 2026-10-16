@@ -83,6 +83,7 @@ fn free_bytes(path: &Path) -> Result<u64> {
 }
 
 pub struct Agent {
+    status: Arc<RwLock<serde_json::Value>>,
     pub config: Config,
     pub home: PathBuf,
     client: Client,
@@ -138,7 +139,16 @@ impl Agent {
         let endpoint =
             super::network::connect_endpoint(key, config.registration.peer.address).await?;
         let access = Arc::new(RwLock::new(artifact_io::Access::default()));
+        let status = Arc::new(RwLock::new(serde_json::Value::Null));
         let router = Router::builder(endpoint.clone())
+            .accept(
+                super::storage_status::ALPN,
+                super::storage_status::Handler {
+                    cluster: config.cluster.clone(),
+                    administrators: config.administrators.clone(),
+                    report: status.clone(),
+                },
+            )
             .accept(
                 artifact_io::ALPN,
                 artifact_io::Handler {
@@ -155,6 +165,7 @@ impl Agent {
             &config.cluster,
         ))?;
         Ok(Self {
+            status,
             config,
             home: home.into(),
             client,
@@ -235,6 +246,11 @@ impl Agent {
                 anyhow::bail!("storage report refused: {reply:?}");
             }
         }
+        *self.status.write().expect("storage status") = serde_json::json!({
+            "observed_at":crate::jobs::now(),"capacity_bytes":r.capacity_bytes,
+            "objects":usage(&self.home.join("objects"))?,"staging":usage(&self.home.join("staging"))?,
+            "free_filesystem_bytes":free_bytes(&self.home)?,"cleanup_allowed":view.cleanup_allowed,
+        });
         Ok(())
     }
     async fn reconcile(&mut self, artifact: &Artifact, view: &View) -> Result<CopyPhase> {
@@ -248,16 +264,27 @@ impl Agent {
                 "cleanup held after authority recovery"
             );
             // Tombstones survive a controller rollback. Never silently resurrect deleted payloads.
-            crate::instances::write(&tombstone, m)?;
+            if !tombstone.is_file() {
+                crate::instances::write(&tombstone, m)?;
+            }
             self.access
                 .write()
                 .expect("artifact access")
                 .objects
                 .remove(&m.id);
-            if root.exists() {
+            let removed = root.exists();
+            if removed {
                 std::fs::remove_dir_all(&root)?;
             }
-            std::fs::File::open(self.home.join("objects"))?.sync_all()?;
+            let acknowledged = artifact
+                .copies
+                .get(&format!("storage/{}", self.config.registration.id))
+                .is_some_and(|c| {
+                    c.phase == CopyPhase::Deleted && c.authority == self.config.cluster
+                });
+            if removed || !acknowledged {
+                std::fs::File::open(self.home.join("objects"))?.sync_all()?;
+            }
             return Ok(CopyPhase::Deleted);
         }
         ensure!(

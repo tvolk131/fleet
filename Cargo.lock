@@ -1412,6 +1412,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "futures-lite",
  "iced",
  "iced-m3",
  "iced_test",

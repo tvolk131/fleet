@@ -24,6 +24,7 @@ use std::{
 };
 
 mod artifacts;
+mod reclaim;
 
 pub const DATA_ALPN: &[u8] = b"fleet/worker-data/1";
 const JOURNAL: TableDefinition<&str, &[u8]> = TableDefinition::new("worker_journal");
@@ -214,6 +215,10 @@ impl Journal {
 /// Direct data plane has no execute or lifecycle commands. Those must pass through consensus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DataRequest {
+    Storage,
+    ReserveInputs {
+        hashes: Vec<iroh_blobs::Hash>,
+    },
     Status,
     Jobs,
     Instances,
@@ -242,6 +247,7 @@ struct DataFrame {
 
 #[derive(Clone, Debug)]
 struct DataHandler {
+    home: PathBuf,
     cluster: String,
     allow: Arc<HashSet<EndpointId>>,
     agent: Agent,
@@ -261,34 +267,50 @@ impl ProtocolHandler for DataHandler {
                     let frame: DataFrame =
                         serde_json::from_slice(&recv.read_to_end(MAX_FRAME).await?)?;
                     ensure!(frame.cluster == self.cluster, "cluster mismatch");
-                    let request = match frame.request {
-                        DataRequest::Status => proto::Request::Status,
-                        DataRequest::Jobs => proto::Request::Jobs,
-                        DataRequest::Instances => proto::Request::Instances,
-                        DataRequest::Logs {
-                            execution,
-                            stderr,
-                            from,
-                            max,
-                        } => proto::Request::Logs {
-                            job: execution,
-                            stderr,
-                            from,
-                            max,
-                        },
-                        DataRequest::Outputs { execution } => {
-                            proto::Request::Outputs { job: execution }
+                    let special = match &frame.request {
+                        DataRequest::Storage => Some(proto::Response::StorageReport(
+                            jobs::read_json(&self.home.join("storage-report.json"))?
+                                .unwrap_or(serde_json::Value::Null),
+                        )),
+                        DataRequest::ReserveInputs { hashes } => {
+                            Some(self.agent.reserve_inputs(hashes).await?)
                         }
-                        DataRequest::Events { since, wait_ms } => {
-                            proto::Request::Events { since, wait_ms }
-                        }
-                        DataRequest::Missing { hashes } => proto::Request::Missing { hashes },
+                        _ => None,
                     };
-                    let response = self
-                        .agent
-                        .handle(peer, request)
-                        .await
-                        .unwrap_or_else(|e| proto::Response::Error(format!("{e:#}")));
+                    let response = if let Some(response) = special {
+                        response
+                    } else {
+                        let request = match frame.request {
+                            DataRequest::Storage | DataRequest::ReserveInputs { .. } => {
+                                unreachable!()
+                            }
+                            DataRequest::Status => proto::Request::Status,
+                            DataRequest::Jobs => proto::Request::Jobs,
+                            DataRequest::Instances => proto::Request::Instances,
+                            DataRequest::Logs {
+                                execution,
+                                stderr,
+                                from,
+                                max,
+                            } => proto::Request::Logs {
+                                job: execution,
+                                stderr,
+                                from,
+                                max,
+                            },
+                            DataRequest::Outputs { execution } => {
+                                proto::Request::Outputs { job: execution }
+                            }
+                            DataRequest::Events { since, wait_ms } => {
+                                proto::Request::Events { since, wait_ms }
+                            }
+                            DataRequest::Missing { hashes } => proto::Request::Missing { hashes },
+                        };
+                        self.agent
+                            .handle(peer, request)
+                            .await
+                            .unwrap_or_else(|e| proto::Response::Error(format!("{e:#}")))
+                    };
                     if matches!(&response, proto::Response::Missing(hashes) if hashes.is_empty()) {
                         // A staging acknowledgement must survive worker process restart.
                         self.store.sync_db().await?;
@@ -337,6 +359,7 @@ pub async fn data_call(
 }
 
 pub struct Worker {
+    reclamation: blobs::Reclamation,
     pub config: WorkerConfig,
     pub home: PathBuf,
     pub client: Client,
@@ -515,7 +538,7 @@ impl Worker {
                 .copied()
                 .collect::<HashSet<_>>(),
         );
-        let store = blobs::open(&home.join("blobs")).await?;
+        let (store, reclamation) = blobs::open_managed(&home.join("blobs")).await?;
         let agent = Agent::start_managed(
             allow.clone(),
             hello,
@@ -539,6 +562,7 @@ impl Worker {
             .accept(
                 DATA_ALPN,
                 DataHandler {
+                    home: home.into(),
                     cluster: config.cluster.clone(),
                     allow: allow.clone(),
                     agent: agent.clone(),
@@ -555,6 +579,7 @@ impl Worker {
         ))?;
         Ok(Self {
             config,
+            reclamation,
             home: home.into(),
             client,
             router,
@@ -665,11 +690,19 @@ impl Worker {
                 tracing::warn!(error=%e, "artifact lifecycle will retry");
             }
             let saved = self.journal.read()?;
-            for checkpoint in saved
+            let mut pending: Vec<_> = saved
                 .checkpoints
                 .values()
                 .filter(|c| !saved.known_checkpoints.contains(&c.id))
-            {
+                .collect();
+            pending.sort_by_key(|c| {
+                (
+                    c.content.captured_at,
+                    c.content.source.clone(),
+                    c.id.clone(),
+                )
+            });
+            for checkpoint in pending {
                 let reply = self
                     .client
                     .write(
@@ -733,16 +766,13 @@ impl Worker {
             let root = vm_job::checkpoint_files_dir(&dir, &checkpoint.content.id)?;
             for file in &checkpoint.content.files {
                 checkpoint.content.verify_file(&root, file)?;
-                let imported = self
-                    .store
-                    .blobs()
-                    .add_path(root.join(&file.path))
-                    .with_named_tag(format!("checkpoint/{}/{}", checkpoint.id, file.path))
-                    .await?;
-                ensure!(
-                    imported.hash == file.hash,
-                    "checkpoint import hash mismatch"
-                );
+                blobs::import_named(
+                    &self.store,
+                    &root.join(&file.path),
+                    file.hash,
+                    format!("checkpoint/{}/{}", checkpoint.id, file.path),
+                )
+                .await?;
             }
             self.store.sync_db().await?;
             self.journal.change(|s| {
@@ -1019,6 +1049,19 @@ pub async fn push_inputs(
     spec: &jobs::JobSpec,
 ) -> Result<()> {
     let hashes: Vec<_> = spec.inputs.values().map(|i| i.hash).collect();
+    let reserved = data_call(
+        endpoint,
+        cluster,
+        worker,
+        DataRequest::ReserveInputs {
+            hashes: hashes.clone(),
+        },
+    )
+    .await?;
+    ensure!(
+        matches!(reserved, proto::Response::Missing(ref missing) if missing.is_empty()),
+        "input reservation failed: {reserved:?}"
+    );
     let connection = blobs::push(store, endpoint, worker.addr(), &hashes).await?;
     let end = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {

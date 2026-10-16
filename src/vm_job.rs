@@ -22,6 +22,7 @@ use std::{
 mod checkpoints;
 mod observe;
 pub use checkpoints::{captured as captured_checkpoints, files_dir as checkpoint_files_dir};
+pub use checkpoints::{reclaimed as checkpoint_reclaimed, usage as checkpoint_usage};
 pub use observe::{Progress, output_revision};
 
 pub const MAX_INPUTS: usize = 128;
