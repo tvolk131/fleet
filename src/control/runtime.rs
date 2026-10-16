@@ -178,6 +178,14 @@ impl Journal {
                 s.assignments.insert(a.id.clone(), a);
             }
             ensure!(!view.recovery_required, "worker recovery has not committed");
+            for (id, cp) in view.resume_checkpoints {
+                cp.content.validate()?;
+                ensure!(
+                    s.checkpoints.get(&id).is_none_or(|old| old == &cp),
+                    "resume checkpoint changed"
+                );
+                s.checkpoints.insert(id, cp);
+            }
             s.known_checkpoints = view.checkpoints;
             s.held = view.held;
             s.starts_allowed = view.starts_allowed;
@@ -372,6 +380,85 @@ pub struct Worker {
 }
 
 impl Worker {
+    /// Offline half of an additive catalog update. A crash between the journal and config
+    /// writes fails startup closed; rerunning repairs the config without replacing history.
+    pub fn prepare_runtimes(home: &Path) -> Result<Request> {
+        let path = home.join("worker.json");
+        let mut config: WorkerConfig = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let db = Database::open(home.join("worker.redb"))
+            .context("stop the worker before updating runtimes")?;
+        let journal = Journal { db };
+        let state = journal.read()?;
+        ensure!(
+            state.format == super::FORMAT && state.cluster == config.cluster,
+            "upgrade worker metadata first"
+        );
+        let mut identity = state.registration.clone();
+        identity.runtimes = config.registration.runtimes.clone();
+        ensure!(
+            identity == config.registration,
+            "worker identity/configuration mismatch"
+        );
+        ensure!(
+            state.starts_allowed && state.held.is_empty() && state.recovery_inventory.is_none(),
+            "worker requires recovery reconciliation"
+        );
+        ensure!(
+            state.outbox.is_empty(),
+            "let the controller acknowledge all worker reports before stopping it"
+        );
+        ensure!(
+            state.assignments.values().all(|a| state
+                .observations
+                .get(&a.id)
+                .is_some_and(|(r, o)| *r == a.revision && o.phase.terminal())),
+            "worker has unfinished or unconfirmed work"
+        );
+        let vm = instances::Config::load(&home.join("backend"))?;
+        ensure!(
+            vm.memory_budget_mb == config.registration.budget.memory_mb
+                && vm.disk_budget_gb == config.registration.budget.disk_gb
+                && vm.images.keys().cloned().collect::<BTreeSet<_>>() == config.registration.images,
+            "runtime update cannot change budgets or image aliases"
+        );
+        let runtimes = vm.runtimes()?;
+        let next = state.registration.with_added_runtimes(&runtimes)?;
+        config.registration.with_added_runtimes(&runtimes)?;
+        ensure!(
+            home.join("node.key").is_file()
+                && crate::keys::load_or_create(&home.join("node.key"))?.public()
+                    == next.peer.identity,
+            "worker key mismatch"
+        );
+        let mutation = Mutation::AddWorkerRuntimes {
+            worker: next.id.clone(),
+            incarnation: next.incarnation.clone(),
+            runtimes,
+        };
+        let request = Request {
+            origin: config.cluster.clone(),
+            id: format!(
+                "worker-runtimes-{}",
+                blake3::hash(&serde_json::to_vec(&mutation)?).to_hex()
+            ),
+            mutation,
+        };
+        if state.registration != next {
+            super::upgrade::backup_version(&home.join("worker.redb"), super::FORMAT)?;
+            journal.change(|s| {
+                s.registration = next.clone();
+                Ok(())
+            })?;
+        }
+        if config.registration != next {
+            super::upgrade::backup_version(&path, super::FORMAT)?;
+            config.registration = next;
+            instances::write(&path, &config)?;
+        }
+        instances::write(&home.join("runtimes-request.json"), &request)?;
+        Ok(request)
+    }
+
     pub(crate) fn upgrade_v5(
         db: &Database,
         home: &Path,
@@ -450,7 +537,12 @@ impl Worker {
                     }
                 }
                 s.recovery_inventory = Some(super::recovery::Inventory {
-                    checkpoints: s.checkpoints.clone(),
+                    checkpoints: s
+                        .checkpoints
+                        .iter()
+                        .filter(|(_, c)| c.worker == s.registration.id)
+                        .map(|(id, c)| (id.clone(), c.clone()))
+                        .collect(),
                     held: s.held.clone(),
                     registration: s.registration.clone(),
                     sequence: s.sequence,
@@ -616,7 +708,12 @@ impl Worker {
                                 }
                             }
                             s.recovery_inventory = Some(super::recovery::Inventory {
-                                checkpoints: s.checkpoints.clone(),
+                                checkpoints: s
+                                    .checkpoints
+                                    .iter()
+                                    .filter(|(_, c)| c.worker == s.registration.id)
+                                    .map(|(id, c)| (id.clone(), c.clone()))
+                                    .collect(),
                                 held: s.held.clone(),
                                 registration: s.registration.clone(),
                                 sequence: s.sequence,
@@ -859,6 +956,7 @@ impl Worker {
                     }
                 } else {
                     if !attempted {
+                        self.restore_inputs(a).await?;
                         self.restore_checkpoint(a).await?;
                         let hashes = spec.inputs.values().map(|i| i.hash).collect();
                         if let proto::Response::Missing(missing) = self

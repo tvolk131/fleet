@@ -4,7 +4,7 @@ use fleet::control::{
     artifact_io, storage,
 };
 
-async fn backup(
+pub(super) async fn backup(
     c: &mut Cluster,
     id: &str,
     capacity: u64,
@@ -80,6 +80,7 @@ async fn storage_quota_corruption_restart_and_peer_repair_are_visible_and_verifi
     let mut request = super::assign("output", workload("printf verified-output > result.txt"));
     // Artifact publication belongs to a logical job, created by Enqueue in normal use.
     request.mutation = Mutation::Enqueue(fleet::control::queue::Submission {
+        inputs: Default::default(),
         id: "output".into(),
         workload: workload("printf verified-output > result.txt"),
         worker: Some("worker-real".into()),

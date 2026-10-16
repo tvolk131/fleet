@@ -74,6 +74,7 @@ fn submit(id: &str, job: &str) -> Request {
         origin: "cluster".into(),
         id: id.into(),
         mutation: Mutation::Enqueue(fleet::control::queue::Submission {
+            inputs: Default::default(),
             id: job.into(),
             workload: real_worker::workload("echo test"),
             worker: None,
@@ -507,7 +508,7 @@ async fn membership_grows_replaces_leader_and_shrinks_preserving_history() {
         exchange(
             &old_connection,
             &c.config.cluster,
-            Message::Write(forbidden_admin)
+            Message::Write(Box::new(forbidden_admin))
         )
         .await
         .unwrap(),
@@ -715,7 +716,7 @@ async fn membership_lost_acceptance_and_offline_learner_resume_on_a_new_leader()
         exchange(
             &connection,
             &c.config.cluster,
-            Message::Write(request.clone())
+            Message::Write(Box::new(request.clone()))
         )
         .await
         .is_err()
@@ -848,9 +849,13 @@ async fn leader_failover_lost_reply_and_worker_reconciliation() {
         .await
         .unwrap();
     assert!(
-        exchange(&conn, &c.config.cluster, Message::Write(request.clone()))
-            .await
-            .is_err()
+        exchange(
+            &conn,
+            &c.config.cluster,
+            Message::Write(Box::new(request.clone()))
+        )
+        .await
+        .is_err()
     );
     assert_eq!(
         c.replicas[&leader].store.state().await.unwrap().jobs.len(),
@@ -952,7 +957,7 @@ async fn minority_cannot_commit_or_serve_strong_reads_and_recovers_after_healing
         exchange(
             &connection,
             &c.config.cluster,
-            Message::Write(submit("uncertain", "uncertain")),
+            Message::Write(Box::new(submit("uncertain", "uncertain"))),
         ),
     )
     .await;
@@ -1481,6 +1486,7 @@ mod queue_tests;
 fn simulation_registration(identity: iroh::EndpointId) -> fleet::control::workload::Registration {
     use fleet::control::workload::*;
     Registration {
+        runtimes: Default::default(),
         id: "worker".into(),
         peer: Peer {
             identity,

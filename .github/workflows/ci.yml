@@ -51,8 +51,14 @@ jobs:
         run: |
           python3 contrib/qualify_checkpoint_tart.py --fake --rolling --backup-restore --binary "$PWD/target/debug/fleet" \
             --home /tmp/fleet-control-checkpoint-ci 2>&1 | tee checkpoint-client.log
+      - name: Portable Tart jobs with durable inputs and cooperative cross-worker resume
+        run: |
+          python3 contrib/qualify_portable_tart.py --fake --binary "$PWD/target/debug/fleet" \
+            --home /tmp/fleet-control-portable-ci 2>&1 | tee portable-client.log
       - name: Rust tests (including Raft, redb, workers, and headless M3 GUI)
         run: cargo test --all-features --locked --no-fail-fast -- --test-threads=2 2>&1 | tee rust-tests.log
+      - name: Worker library without the optional control plane
+        run: cargo check --no-default-features --lib --locked
       - name: Clippy
         run: cargo clippy --all-features --all-targets --locked -- -D warnings
       - name: JSON CLI contracts and fixture safeguards
@@ -71,6 +77,9 @@ jobs:
           fi
           if [ -f /tmp/fleet-control-checkpoint-ci/qualification.json ]; then
             cp /tmp/fleet-control-checkpoint-ci/qualification.json ci-evidence/checkpoint-qualification.json
+          fi
+          if [ -f /tmp/fleet-control-portable-ci/qualification.json ]; then
+            cp /tmp/fleet-control-portable-ci/qualification.json ci-evidence/portable-qualification.json
           fi
           # Never upload fixture homes: they contain private identity keys and databases.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

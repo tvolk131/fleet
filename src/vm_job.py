@@ -57,6 +57,12 @@ def values(path, field, points):
 
 
 if spec['kind'] == 'prepare':
+    if spec.get('platform'):
+        import platform
+        actual = {'os': {'Darwin': 'macos'}.get(platform.system(), platform.system().lower()),
+                  'arch': {'arm64': 'aarch64'}.get(platform.machine(), platform.machine())}
+        if any(actual[k] != spec['platform'][k] for k in ('os', 'arch')):
+            raise RuntimeError('guest OS/architecture differs from portable runtime: ' + str(actual))
     os.makedirs(root, mode=0o700, exist_ok=True)
 elif spec['kind'] in ('manifest', 'observe'):
     paths, result, total, visited = [], [], 0, 0

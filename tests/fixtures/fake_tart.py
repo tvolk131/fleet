@@ -60,6 +60,18 @@ elif op in ['exec','stop']:
         # Disposable VM job paths live only under this fixture, not the host /tmp namespace.
         prefix = "/tmp/" + args[2] + "/work"
         args[-1] = args[-1].replace(prefix, str(root/"vms"/args[2]/"guest-work"))
+        request = json.loads(args[-1])
+        # This fixture models a macOS ARM guest even on Linux CI. Only its fixed
+        # VM preparation helper receives the simulated platform; job code stays untouched.
+        argv = request.get('argv', [])
+        if request.get('kind') == 'exec' and len(argv) == 5 and argv[:3] == ['/usr/bin/python3', '-I', '-c']:
+            try:
+                helper = json.loads(argv[4])
+            except ValueError:
+                helper = {}
+            if helper.get('kind') == 'prepare' and helper.get('platform'):
+                argv[3] = "import platform; platform.system=lambda:'Darwin'; platform.machine=lambda:'arm64';\n" + argv[3]
+                args[-1] = json.dumps(request)
         os.execv(args[3], args[3:])
     if op=='exec':
         assert args[2:]==['/usr/bin/sudo','-n','/sbin/shutdown','-h','now']

@@ -12,6 +12,7 @@ async fn enqueue(c: &mut Cluster, id: &str, spec: jobs::JobSpec) {
                 origin: c.config.cluster.clone(),
                 id: format!("enqueue-{id}"),
                 mutation: Mutation::Enqueue(fleet::control::queue::Submission {
+                    inputs: Default::default(),
                     id: id.into(),
                     worker: Some("worker-real".into()),
                     priority: 0,

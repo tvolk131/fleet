@@ -39,17 +39,28 @@ impl Registration {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Kind {
+    Inputs,
     Checkpoint(String),
     FinalOutputs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Origin {
+    Attempt { worker: String, attempt: String },
+    Job(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Manifest {
     pub id: String,
-    pub worker: String,
-    pub attempt: String,
+    pub origin: Origin,
     pub kind: Kind,
     pub files: Vec<OutputFile>,
+}
+pub(crate) fn read_manifest(path: &std::path::Path) -> Result<Manifest> {
+    let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    super::upgrade::artifact_origins(&mut value);
+    Ok(serde_json::from_value(value)?)
 }
 impl Manifest {
     pub fn new(
@@ -64,20 +75,53 @@ impl Manifest {
             .to_string();
         let value = Self {
             id,
-            worker,
-            attempt,
+            origin: Origin::Attempt { worker, attempt },
             kind,
             files,
         };
         value.validate()?;
         Ok(value)
     }
+    pub fn inputs(job: String, mut files: Vec<OutputFile>) -> Result<Self> {
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let origin = Origin::Job(job);
+        let kind = Kind::Inputs;
+        let id = blake3::hash(&serde_json::to_vec(&(&origin, &kind, &files))?)
+            .to_hex()
+            .to_string();
+        let value = Self {
+            id,
+            origin,
+            kind,
+            files,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+    pub fn worker(&self) -> Option<&str> {
+        match &self.origin {
+            Origin::Attempt { worker, .. } => Some(worker),
+            _ => None,
+        }
+    }
+    pub fn attempt(&self) -> Option<&str> {
+        match &self.origin {
+            Origin::Attempt { attempt, .. } => Some(attempt),
+            _ => None,
+        }
+    }
+    pub fn job(&self) -> Option<&str> {
+        match &self.origin {
+            Origin::Job(job) => Some(job),
+            _ => None,
+        }
+    }
     pub fn bytes(&self) -> u64 {
         self.files.iter().map(|f| f.size).sum()
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            !self.files.is_empty() && self.files.len() <= MAX_FILES,
+            (self.kind == Kind::Inputs || !self.files.is_empty()) && self.files.len() <= MAX_FILES,
             "artifact requires 1 to 256 files"
         );
         let mut paths = BTreeSet::new();
@@ -105,14 +149,21 @@ impl Manifest {
             self.files.windows(2).all(|w| w[0].path < w[1].path),
             "artifact paths must be sorted"
         );
-        let id = blake3::hash(&serde_json::to_vec(&(
-            &self.worker,
-            &self.attempt,
-            &self.kind,
-            &self.files,
-        ))?)
-        .to_hex()
-        .to_string();
+        let encoded = match &self.origin {
+            Origin::Attempt { worker, attempt } => {
+                ensure!(self.kind != Kind::Inputs, "inputs must be job-owned");
+                serde_json::to_vec(&(worker, attempt, &self.kind, &self.files))?
+            }
+            Origin::Job(job) => {
+                crate::instances::valid_id(job)?;
+                ensure!(
+                    self.kind == Kind::Inputs,
+                    "job-owned artifact must be inputs"
+                );
+                serde_json::to_vec(&(&self.origin, &self.kind, &self.files))?
+            }
+        };
+        let id = blake3::hash(&encoded).to_hex().to_string();
         ensure!(self.id == id, "artifact identity mismatch");
         Ok(())
     }
@@ -160,6 +211,8 @@ pub struct Artifact {
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Policy {
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub inputs: BTreeSet<String>,
     pub checkpoints: BTreeSet<String>,
     pub outputs: BTreeSet<String>,
 }
@@ -287,7 +340,7 @@ impl State {
             m.validate()?;
             let worker = self
                 .workers
-                .get(&m.worker)
+                .get(m.worker().context("artifact has no worker")?)
                 .context("unknown artifact worker")?;
             ensure!(
                 worker.peer.identity.to_string() == principal
@@ -295,18 +348,19 @@ impl State {
                 "artifact worker identity mismatch"
             );
             ensure!(
-                !self.worker_recovery_required(&m.worker),
+                !self.worker_recovery_required(m.worker().context("artifact has no worker")?),
                 "artifact worker must reconcile first"
             );
             let a = self
                 .assignments
-                .get(&m.attempt)
+                .get(m.attempt().context("artifact has no attempt")?)
                 .context("unknown artifact attempt")?;
             ensure!(
-                a.worker == m.worker && a.attempt.is_some(),
+                Some(a.worker.as_str()) == m.worker() && a.attempt.is_some(),
                 "artifact must belong to a job attempt"
             );
             match &m.kind {
+                Kind::Inputs => anyhow::bail!("inputs are registered by job submission"),
                 Kind::Checkpoint(id) => {
                     let cp = self.checkpoints.get(id).context("unknown checkpoint")?;
                     let expected = Manifest::new(
@@ -338,7 +392,7 @@ impl State {
                             .storage
                             .artifacts
                             .values()
-                            .any(|old| old.manifest.attempt == m.attempt
+                            .any(|old| old.manifest.attempt() == m.attempt()
                                 && old.manifest.kind == Kind::FinalOutputs
                                 && old.manifest != *m),
                         "final output manifest is immutable"
@@ -362,18 +416,22 @@ impl State {
         }
         self.storage.next_ordinal += 1;
         let targets = match manifest.kind {
+            Kind::Inputs => self.storage.policy.inputs.clone(),
             Kind::Checkpoint(_) => self.storage.policy.checkpoints.clone(),
             Kind::FinalOutputs => self.storage.policy.outputs.clone(),
         };
-        let mut copies = BTreeMap::from([(
-            format!("worker/{}", manifest.worker),
-            Copy {
-                authority: self.cluster.clone(),
-                version: 1,
-                phase: CopyPhase::Ready,
-                detail: None,
-            },
-        )]);
+        let mut copies = BTreeMap::new();
+        if let Some(worker) = manifest.worker() {
+            copies.insert(
+                format!("worker/{worker}"),
+                Copy {
+                    authority: self.cluster.clone(),
+                    version: 1,
+                    phase: CopyPhase::Ready,
+                    detail: None,
+                },
+            );
+        }
         copies.extend(
             targets
                 .iter()
@@ -401,6 +459,7 @@ impl State {
         if policy
             .checkpoints
             .union(&policy.outputs)
+            .chain(policy.inputs.iter())
             .any(|id| !self.storage.stores.contains_key(id))
         {
             return Reply::rejected("unknown storage target");
@@ -410,6 +469,7 @@ impl State {
         // Removing a default does not delete existing copies. Retention is a separate explicit action.
         for artifact in self.storage.artifacts.values_mut().filter(|a| !a.deleted) {
             let targets = match artifact.manifest.kind {
+                Kind::Inputs => &policy.inputs,
                 Kind::Checkpoint(_) => &policy.checkpoints,
                 Kind::FinalOutputs => &policy.outputs,
             };

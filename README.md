@@ -71,3 +71,6 @@ Testing: `cargo test --all-features --locked`; `cargo clippy --all-features --al
 and their installers are removed. Normal clients always use the replicated control plane.
 
 Rolling checkpoint retention is opt-in; see [rolling storage](docs/ROLLING_STORAGE.md) for budgets, pins, reclamation and storage reports.
+
+[Portable Tart jobs](docs/PORTABLE_JOBS.md) provide durable executable/input bundles, explicit runtime
+compatibility and cooperative resume on another worker after confirmed suspension.

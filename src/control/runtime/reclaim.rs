@@ -75,10 +75,13 @@ impl Worker {
                         .checkpoints
                         .get(id)
                         .context("checkpoint metadata missing")?;
-                    let a = saved
-                        .assignments
-                        .get(&artifact.manifest.attempt)
-                        .context("checkpoint attempt missing")?;
+                    let Some(a) = artifact
+                        .manifest
+                        .attempt()
+                        .and_then(|id| saved.assignments.get(id))
+                    else {
+                        continue;
+                    };
                     // Do not release capture budget until every cache copy is gone or retained
                     // for another live reference. A delayed GC safely backpressures capture.
                     let mut pending = false;
@@ -107,7 +110,7 @@ impl Worker {
         let report = json!({"observed_at":jobs::now(),"cleanup_allowed":view.cleanup_allowed,
             "blob_filesystem":super::super::storage::usage(&self.home.join("blobs"))?,
             "blob_payload_bytes":cache_bytes,"reclaimable_blob_bytes":reclaimable_bytes,"checkpoints":captures,
-            "scope":"Fleet checkpoint/output payloads and their cache entries; original inputs, logs, metadata, Tart images and guest-owned files are retained separately"});
+            "scope":"Fleet input-bundle/checkpoint/output payloads and their cache entries; client input spools, logs, metadata, Tart images and guest-owned files are retained separately"});
         instances::write(&self.home.join("storage-report.json"), &report)?;
         Ok(())
     }

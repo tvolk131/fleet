@@ -30,7 +30,7 @@ use super::discovery::save_cache;
 use super::membership::{MembershipView, spawn_reconciler};
 use super::{Command, FORMAT, Raft, Reply, Request, State, Store, TypeConfig, store::MAX_SNAPSHOT};
 
-pub const ALPN: &[u8] = b"fleet/control/8";
+pub const ALPN: &[u8] = b"fleet/control/9";
 const MAX_FRAME: usize = 8 << 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,7 +80,7 @@ pub enum Message {
     Append(AppendEntriesRequest<TypeConfig>),
     Vote(VoteRequest<u64>),
     Snapshot(InstallSnapshotRequest<TypeConfig>),
-    Write(Request),
+    Write(Box<Request>),
     Read,
     /// Local diagnostics can be stale and never authorize worker action or a membership change.
     Inspect,
@@ -417,7 +417,7 @@ impl Handler {
                 if is_admin
                     || matches!(&request.mutation,
                 super::Mutation::WorkerReport(report) if self.store.state().await.ok().and_then(|s| s.workers.get(&report.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == report.incarnation))
-                    || matches!(&request.mutation, super::Mutation::ArtifactReady(ready) if self.store.state().await.ok().and_then(|s| s.workers.get(&ready.manifest.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == ready.incarnation))
+                    || matches!(&request.mutation, super::Mutation::ArtifactReady(ready) if self.store.state().await.ok().and_then(|s| ready.manifest.worker().and_then(|id| s.workers.get(id)).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == ready.incarnation))
                     || matches!(&request.mutation, super::Mutation::ArtifactReport(report) if self.store.state().await.ok().is_some_and(|s| s.artifact_reporter(&peer.to_string(), &report.location, &report.incarnation)))
                     || matches!(&request.mutation, super::Mutation::CheckpointReady(ready) if self.store.state().await.ok().and_then(|s| s.workers.get(&ready.checkpoint.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == ready.incarnation))
                     || matches!(&request.mutation, super::Mutation::RecoverWorker(inventory) if self.store.state().await.ok().and_then(|s| s.workers.get(&inventory.registration.id).cloned()).is_some_and(|w| w.peer.identity == peer && w == inventory.registration)) =>
@@ -429,7 +429,7 @@ impl Handler {
                     self.raft
                         .client_write(Command {
                             principal: peer.to_string(),
-                            request,
+                            request: *request,
                         })
                         .await
                         .map(|r| r.data)
@@ -476,17 +476,36 @@ impl Handler {
                         .storage
                         .artifacts
                         .values()
-                        .filter(|a| a.manifest.worker == worker)
+                        .filter(|a| a.copies.contains_key(&format!("worker/{worker}")))
                         .cloned()
                         .collect(),
                     stores: state.storage.stores.clone(),
                     cleanup_allowed: state
                         .artifact_cleanup_allowed(Some(&format!("worker/{worker}"))),
                     starts_allowed: state.recovery.as_ref().is_none_or(|r| r.resumed),
+                    resume_checkpoints: state
+                        .checkpoints
+                        .values()
+                        .filter(|c| {
+                            state.assignments.values().any(|a| {
+                                a.worker == worker
+                                    && a.attempt.as_ref().and_then(|p| p.checkpoint.as_ref())
+                                        == Some(&c.id)
+                            })
+                        })
+                        .map(|c| (c.id.clone(), c.clone()))
+                        .collect(),
                     checkpoints: state
                         .checkpoints
                         .values()
-                        .filter(|c| c.worker == worker)
+                        .filter(|c| {
+                            c.worker == worker
+                                || state.assignments.values().any(|a| {
+                                    a.worker == worker
+                                        && a.attempt.as_ref().and_then(|p| p.checkpoint.as_ref())
+                                            == Some(&c.id)
+                                })
+                        })
                         .map(|c| c.id.clone())
                         .collect(),
                     recovery_required: state.worker_recovery_required(&worker),
@@ -956,7 +975,10 @@ impl Client {
         bail!("control-plane request deadline exceeded: {last_error}")
     }
     pub async fn write(&mut self, request: Request, deadline: Duration) -> Result<Reply> {
-        match self.call(Message::Write(request), deadline).await? {
+        match self
+            .call(Message::Write(Box::new(request)), deadline)
+            .await?
+        {
             Answer::Write(Ok(reply)) => Ok(reply),
             other => bail!("unexpected reply: {other:?}"),
         }

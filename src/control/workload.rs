@@ -1,7 +1,7 @@
 //! Committed placement and worker observations. Bulk logs and files stay off the Raft log.
 use super::{Reply, State, network::Peer};
 use crate::{instances, jobs};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,6 +21,8 @@ pub struct Registration {
     pub incarnation: String,
     pub budget: Budget,
     pub images: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub runtimes: BTreeMap<String, super::portable::Runtime>,
     pub tags: BTreeSet<String>,
 }
 
@@ -151,6 +153,7 @@ pub struct WorkerView {
     pub cleanup_allowed: bool,
     pub starts_allowed: bool,
     pub checkpoints: BTreeSet<String>,
+    pub resume_checkpoints: BTreeMap<String, super::checkpoint::Checkpoint>,
     pub recovery_required: bool,
     pub held: BTreeSet<String>,
     pub registration: Registration,
@@ -159,8 +162,29 @@ pub struct WorkerView {
 }
 
 impl Registration {
+    /// Monotonic catalog updates keep every previously accepted workload compatible.
+    pub fn with_added_runtimes(
+        &self,
+        runtimes: &BTreeMap<String, super::portable::Runtime>,
+    ) -> Result<Self> {
+        for (image, old) in &self.runtimes {
+            old.accepts(
+                runtimes
+                    .get(image)
+                    .ok_or_else(|| anyhow::anyhow!("cannot remove an advertised runtime"))?,
+            )?;
+        }
+        let mut next = self.clone();
+        next.runtimes = runtimes.clone();
+        next.validate()?;
+        Ok(next)
+    }
     pub fn validate(&self) -> Result<()> {
         self.peer.validate()?;
+        for (image, runtime) in &self.runtimes {
+            ensure!(self.images.contains(image), "runtime image not advertised");
+            runtime.validate()?;
+        }
         instances::valid_id(&self.id)?;
         ensure!(
             !self.incarnation.is_empty() && self.incarnation.len() <= 128,
@@ -235,6 +259,14 @@ impl Workload {
             );
         }
         if let Some(vm) = self.vm() {
+            if let Some(required) = &vm.runtime {
+                required.accepts(
+                    worker
+                        .runtimes
+                        .get(&vm.image)
+                        .context("image platform is not advertised")?,
+                )?;
+            }
             ensure!(
                 vm.cpus > 0 && vm.memory_mb >= 4096 && vm.disk_gb >= 50,
                 "invalid VM resources"
@@ -317,6 +349,47 @@ impl Assignment {
 }
 
 impl State {
+    pub fn add_worker_runtimes(
+        &mut self,
+        worker: &str,
+        incarnation: &str,
+        runtimes: &BTreeMap<String, super::portable::Runtime>,
+    ) -> Reply {
+        let validate = || -> Result<Registration> {
+            let old = self
+                .workers
+                .get(worker)
+                .ok_or_else(|| anyhow::anyhow!("unknown worker"))?;
+            ensure!(old.incarnation == incarnation, "worker incarnation differs");
+            ensure!(
+                self.drained.contains(worker),
+                "drain worker before updating runtimes"
+            );
+            ensure!(
+                self.recovery_allows_work(worker),
+                "worker recovery is not reconciled"
+            );
+            ensure!(
+                self.assignments
+                    .values()
+                    .filter(|a| a.worker == worker)
+                    .all(|a| a
+                        .observed
+                        .as_ref()
+                        .is_some_and(|(r, o)| *r == a.revision && o.phase.terminal())),
+                "worker has unfinished or unconfirmed assignments"
+            );
+            old.with_added_runtimes(runtimes)
+        };
+        match validate() {
+            Ok(next) => {
+                self.workers.insert(worker.into(), next);
+                Reply::Recorded
+            }
+            Err(e) => Reply::rejected(&e.to_string()),
+        }
+    }
+
     pub fn enroll(&mut self, worker: &Registration) -> Reply {
         if let Err(e) = worker.validate() {
             return Reply::rejected(&e.to_string());
@@ -401,6 +474,7 @@ impl State {
         }
         if matches!(workload, Workload::Job { .. }) {
             let mut job = super::queue::Submission {
+                inputs: None,
                 id: id.into(),
                 workload: workload.clone(),
                 worker: Some(worker.into()),

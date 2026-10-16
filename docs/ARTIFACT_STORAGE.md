@@ -1,6 +1,6 @@
 # Artifact storage and lifecycle
 
-Fleet catalogs checkpoint and final-output artifacts in its replicated control plane and keeps file
+Fleet catalogs portable input, checkpoint and final-output artifacts in its replicated control plane and keeps file
 contents outside Raft. Independently enrolled storage agents retain verified copies over authenticated
 iroh. A storage role can run alone or share a service process with a controller or worker; each role
 has a separate identity and non-overlapping state home. Storage placement is independent of replica
@@ -8,12 +8,12 @@ membership. Growing to three controllers does not create three checkpoint copies
 
 ## What is retained
 
-An artifact has an immutable content manifest, source worker and attempt, kind, byte count, retention
+An artifact has an immutable content manifest, owning job or source worker/attempt, kind, byte count, retention
 revision, optional pin/expiry, and observations for its source and configured backup targets. Kinds are
-an application checkpoint or one final output set for a finished attempt. A suspended attempt can have
+a portable job input bundle, an application checkpoint or one final output set for a finished attempt. A suspended attempt can have
 final outputs too. Intermediate logs, metrics, and output reads retain their existing worker path.
 
-`CheckpointReady` registers the checkpoint artifact atomically with the resume metadata. Final outputs
+`Enqueue` registers a portable input bundle with the job. `CheckpointReady` registers the checkpoint artifact atomically with the resume metadata. Final outputs
 are registered after confirmed attempt cleanup. Backup policy applies to existing live artifacts as
 well as future ones. Removing a default target does not delete its existing copies. Defaults are empty,
 so enroll and configure storage explicitly. No payload expires automatically by default.
@@ -57,7 +57,7 @@ fleet service run --config /absolute/storage-service.json
 ```
 
 Policy revisions are explicit. Read `storage status` before changing an existing policy; repeated
-`--checkpoint` and `--output` options select multiple destinations. Registration (identity, incarnation,
+`--input`, `--checkpoint` and `--output` options select multiple destinations. Registration (identity, incarnation,
 address, failure domain, quota) is immutable in this milestone; prepare a new role/home to replace one.
 Storage agents can read source artifacts and report their assigned copies, but cannot enqueue work,
 change policy, or read the administrator-only control-plane state.
@@ -100,12 +100,13 @@ the source worker. A worker does not have to be online for backup export. Destin
 failed transfers remove their partial download. Exports validate every file before returning success.
 The GUI shows checkpoint backup status, and its existing output download uses the same fallback path.
 
-Resume still creates a new attempt on the **original worker identity**. If its checkpoint input blobs
-are missing, the worker retrieves a registered backup, verifies it, atomically publishes a restored
-copy, and imports the inputs before launching the new VM. The worker journal, attempt ownership, and
-original input dependencies must remain available. Backup restoration does not authorize reconstruction
-of a lost worker identity, speculative retry, or execution on a different machine. Initial input files,
-VM disks, live logs, and metric streams are not backed up by this artifact policy.
+[Portable Tart jobs](PORTABLE_JOBS.md) can resume on a different compatible worker after confirmed
+suspension and VM cleanup. The original executable/inputs and selected checkpoint must have verified
+storage copies. The destination imports verified bytes before launching; the original worker and client
+can be unavailable. Jobs without an explicit portable runtime retain original-worker resume semantics.
+Neither path authorizes lost-worker takeover. VM disks, live logs and metric streams are not backed up
+by this artifact policy. Input bundles are protected while their job is unfinished or its checkpoints
+are retained; rolling checkpoint retention never selects the input bundle.
 
 ## Retention and cleanup
 

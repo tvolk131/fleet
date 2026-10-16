@@ -1,4 +1,4 @@
-//! Worker-owned immutable manifests, source cleanup, and same-worker checkpoint restoration.
+//! Immutable execution dependencies, worker copy observations, and owned-payload cleanup.
 use super::*;
 use crate::control::{
     artifact::{self, CopyPhase, Kind, Manifest},
@@ -8,17 +8,18 @@ use crate::control::{
 impl Worker {
     fn artifact_root(&self, manifest: &Manifest) -> Result<PathBuf> {
         let restored = self.home.join("restored").join(&manifest.id);
-        if restored.exists() {
+        if restored.exists() || manifest.worker() != Some(self.config.registration.id.as_str()) {
             return Ok(restored);
         }
         let journal = self.journal.read()?;
         let a = journal
             .assignments
-            .get(&manifest.attempt)
+            .get(manifest.attempt().context("artifact has no attempt")?)
             .context("artifact attempt missing")?;
         let dir = jobs::jobs_dir(&self.home.join("backend")).join(&a.execution);
         Ok(match &manifest.kind {
             Kind::FinalOutputs => dir.join("work"),
+            Kind::Inputs => anyhow::bail!("input bundle cannot be attempt-owned"),
             Kind::Checkpoint(id) => {
                 let cp = journal
                     .checkpoints
@@ -33,6 +34,19 @@ impl Worker {
             .storage_view
             .clone()
             .context("no committed storage view")?;
+        self.journal.change(|s| {
+            for a in &view.artifacts {
+                ensure!(
+                    s.artifacts
+                        .get(&a.manifest.id)
+                        .is_none_or(|old| old == &a.manifest),
+                    "artifact manifest changed"
+                );
+                s.artifacts
+                    .insert(a.manifest.id.clone(), a.manifest.clone());
+            }
+            Ok(())
+        })?;
         let saved = self.journal.read()?;
         for a in &view.assignments {
             if !a.terminal()
@@ -40,7 +54,7 @@ impl Worker {
                 || saved
                     .artifacts
                     .values()
-                    .any(|m| m.attempt == a.id && m.kind == Kind::FinalOutputs)
+                    .any(|m| m.attempt() == Some(a.id.as_str()) && m.kind == Kind::FinalOutputs)
             {
                 continue;
             }
@@ -117,13 +131,14 @@ impl Worker {
                         .checkpoints
                         .get(id)
                         .context("checkpoint metadata missing")?;
-                    let a = &saved.assignments[&m.attempt];
-                    let original = vm_job::checkpoint_files_dir(
-                        &jobs::jobs_dir(&self.home.join("backend")).join(&a.execution),
-                        &cp.content.id,
-                    )?;
-                    if !roots.contains(&original) {
-                        roots.push(original);
+                    if let Some(a) = m.attempt().and_then(|id| saved.assignments.get(id)) {
+                        let original = vm_job::checkpoint_files_dir(
+                            &jobs::jobs_dir(&self.home.join("backend")).join(&a.execution),
+                            &cp.content.id,
+                        )?;
+                        if !roots.contains(&original) {
+                            roots.push(original);
+                        }
                     }
                 }
                 for file in &m.files {
@@ -131,13 +146,20 @@ impl Worker {
                         artifact_io::remove_owned_file(root, &file.path)?;
                     }
                     let tag = match &m.kind {
+                        Kind::Inputs => format!("artifact/{}/{}", m.id, file.path),
                         Kind::Checkpoint(id) => format!("checkpoint/{id}/{}", file.path),
                         Kind::FinalOutputs => format!(
                             "output/{}/{}",
-                            saved.assignments[&m.attempt].execution, file.path
+                            saved.assignments[m.attempt().context("artifact has no attempt")?]
+                                .execution,
+                            file.path
                         ),
                     };
                     self.store.tags().delete(tag).await?;
+                    self.store
+                        .tags()
+                        .delete(format!("artifact/{}/{}", m.id, file.path))
+                        .await?;
                 }
                 self.store.sync_db().await?;
                 Ok::<_, anyhow::Error>(())
@@ -188,7 +210,7 @@ impl Worker {
                 if present
                     && !a.deleted
                     && a.copies
-                        .get(&format!("worker/{}", m.worker))
+                        .get(&format!("worker/{}", self.config.registration.id))
                         .is_some_and(|c| {
                             c.phase == CopyPhase::Missing
                                 || c.phase == CopyPhase::Pending
@@ -294,44 +316,63 @@ impl Worker {
             .await?;
         Ok(())
     }
+    pub(super) async fn restore_inputs(&self, a: &Assignment) -> Result<()> {
+        if super::super::portable::runtime(&a.workload).is_none() {
+            return Ok(());
+        }
+        let job = &a
+            .attempt
+            .as_ref()
+            .context("portable job attempt missing")?
+            .job;
+        let view = self.storage_view.as_ref().context("storage view missing")?;
+        let artifact = view
+            .artifacts
+            .iter()
+            .find(|m| m.manifest.job() == Some(job.as_ref()) && m.manifest.kind == Kind::Inputs)
+            .context("input bundle missing")?;
+        self.restore_artifact(artifact).await
+    }
     pub(super) async fn restore_checkpoint(&self, a: &Assignment) -> Result<()> {
         let Some(id) = a.attempt.as_ref().and_then(|a| a.checkpoint.as_ref()) else {
             return Ok(());
         };
+        let view = self.storage_view.as_ref().context("storage view missing")?;
+        let artifact = view
+            .artifacts
+            .iter()
+            .find(|a| a.manifest.kind == Kind::Checkpoint(id.clone()))
+            .context("checkpoint artifact missing")?;
+        self.restore_artifact(artifact).await
+    }
+    async fn restore_artifact(&self, artifact: &artifact::Artifact) -> Result<()> {
+        let m = &artifact.manifest;
         let journal = self.journal.read()?;
-        let cp = journal
-            .checkpoints
-            .get(id)
-            .context("resume checkpoint metadata missing")?;
-        let manifest = Manifest::new(
-            cp.worker.clone(),
-            cp.attempt.to_string(),
-            Kind::Checkpoint(id.clone()),
-            cp.content.files.clone(),
-        )?;
         ensure!(
-            !journal.deleted_artifacts.contains(&manifest.id),
-            "local checkpoint deletion requires reconciliation"
+            !artifact.deleted && !journal.deleted_artifacts.contains(&m.id),
+            "artifact was deleted"
         );
-        // Staged inputs are verified again by the backend before launch, even when already cached.
-        let mut missing = false;
-        for f in &cp.content.files {
-            if !self.store.blobs().has(f.hash).await? {
-                missing = true;
+        let verify = |root: &Path| -> Result<()> {
+            artifact_io::verify(root, m)?;
+            if let Kind::Checkpoint(id) = &m.kind {
+                let cp = journal
+                    .checkpoints
+                    .get(id)
+                    .context("checkpoint metadata missing")?;
+                for f in &m.files {
+                    cp.content.verify_file(root, f)?;
+                }
             }
-        }
-        if !missing {
-            return Ok(());
-        }
-        let local = self.artifact_root(&manifest)?;
-        if artifact_io::verify(&local, &manifest).is_ok() {
-            for file in &cp.content.files {
-                cp.content.verify_file(&local, file)?;
+            Ok(())
+        };
+        let local = self.artifact_root(m)?;
+        if verify(&local).is_ok() {
+            for f in &m.files {
                 blobs::import_named(
                     &self.store,
-                    &local.join(&file.path),
-                    file.hash,
-                    format!("checkpoint/{id}/{}", file.path),
+                    &local.join(&f.path),
+                    f.hash,
+                    format!("artifact/{}/{}", m.id, f.path),
                 )
                 .await?;
             }
@@ -341,78 +382,65 @@ impl Worker {
         let view = self
             .storage_view
             .as_ref()
-            .context("restore requires committed storage locations")?;
-        let artifact = view
-            .artifacts
-            .iter()
-            .find(|a| a.manifest.kind == Kind::Checkpoint(id.clone()) && !a.deleted)
-            .context("checkpoint artifact is unavailable or deleted")?;
-        ensure!(
-            !journal.deleted_artifacts.contains(&artifact.manifest.id),
-            "local checkpoint deletion requires reconciliation"
-        );
+            .context("restore requires storage locations")?;
         let parent = self.home.join("restored");
         std::fs::create_dir_all(&parent)?;
-        let destination = parent.join(&artifact.manifest.id);
-        if destination.exists() && artifact_io::verify(&destination, &artifact.manifest).is_err() {
+        let destination = parent.join(&m.id);
+        if destination.exists() {
             std::fs::remove_dir_all(&destination)?;
         }
-        if !destination.exists() {
-            let stage = parent.join(format!("pending-{}", artifact.manifest.id));
-            if stage.exists() {
-                std::fs::remove_dir_all(&stage)?;
-            }
-            let mut errors = Vec::new();
-            for target in &artifact.targets {
-                if !artifact
-                    .copies
-                    .get(&format!("storage/{target}"))
-                    .is_some_and(|c| c.phase == CopyPhase::Ready)
-                {
-                    continue;
-                }
-                let store = view
-                    .stores
-                    .get(target)
-                    .context("storage target disappeared")?;
-                match artifact_io::fetch(
-                    &self.client.endpoint,
-                    &store.peer,
-                    &self.config.cluster,
-                    &artifact.manifest,
-                    &stage,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        errors.clear();
-                        break;
-                    }
-                    Err(e) => errors.push(e.to_string()),
-                }
-            }
-            ensure!(
-                stage.is_dir() && errors.is_empty(),
-                "waiting for checkpoint backup restore: {}",
-                errors.join("; ")
-            );
-            for file in &cp.content.files {
-                cp.content.verify_file(&stage, file)?;
-            }
-            std::fs::rename(&stage, &destination)?;
-            std::fs::File::open(&parent)?.sync_all()?;
+        let stage = parent.join(format!("pending-{}", m.id));
+        if stage.exists() {
+            std::fs::remove_dir_all(&stage)?;
         }
-        for file in &cp.content.files {
-            cp.content.verify_file(&destination, file)?;
-            blobs::import_named(
-                &self.store,
-                &destination.join(&file.path),
-                file.hash,
-                format!("checkpoint/{id}/{}", file.path),
+        let mut errors = Vec::new();
+        for target in &artifact.targets {
+            if !artifact
+                .copies
+                .get(&format!("storage/{target}"))
+                .is_some_and(|c| c.authority == self.config.cluster && c.phase == CopyPhase::Ready)
+            {
+                continue;
+            }
+            let store = view
+                .stores
+                .get(target)
+                .context("storage target disappeared")?;
+            match artifact_io::fetch(
+                &self.client.endpoint,
+                &store.peer,
+                &self.config.cluster,
+                m,
+                &stage,
             )
-            .await?;
+            .await
+            {
+                Ok(()) => {
+                    if let Err(e) = verify(&stage) {
+                        std::fs::remove_dir_all(&stage)?;
+                        errors.push(e.to_string());
+                        continue;
+                    }
+                    std::fs::rename(&stage, &destination)?;
+                    std::fs::File::open(&parent)?.sync_all()?;
+                    for f in &m.files {
+                        blobs::import_named(
+                            &self.store,
+                            &destination.join(&f.path),
+                            f.hash,
+                            format!("artifact/{}/{}", m.id, f.path),
+                        )
+                        .await?;
+                    }
+                    self.store.sync_db().await?;
+                    return Ok(());
+                }
+                Err(e) => errors.push(e.to_string()),
+            }
         }
-        self.store.sync_db().await?;
-        Ok(())
+        bail!(
+            "waiting for verified artifact restore: {}",
+            errors.join("; ")
+        )
     }
 }

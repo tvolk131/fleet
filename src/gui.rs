@@ -79,7 +79,7 @@ enum Message {
     Submit,
     Cancel(String, u64),
     Suspend(String, u64, String),
-    Resume(String, u64),
+    Resume(String, u64, Option<String>),
     Instance(String, u64, crate::control::workload::InstanceDesired),
     Fetch,
     Retry,
@@ -363,8 +363,9 @@ impl App {
                     checkpoint,
                 });
             }
-            Message::Resume(job, revision) => {
+            Message::Resume(job, revision, worker) => {
                 return self.act(ApiRequest::Resume {
+                    worker,
                     request_id: id(),
                     id: job,
                     expected_revision: revision,
@@ -574,6 +575,7 @@ impl App {
                         .on_press(Message::Resume(
                             id.into(),
                             j["revision"].as_u64().unwrap_or(0),
+                            None,
                         )),
                 );
             } else if phase == "running"
@@ -593,6 +595,44 @@ impl App {
             }
             let mut card =
                 column![heading, typography(id, TypeScale::BodySmall).style(muted)].spacing(8);
+            if let Some(runtime) = j.get("portable").filter(|v| !v.is_null()) {
+                let state = j["portability_waiting"]
+                    .as_str()
+                    .unwrap_or("Execution dependencies have verified storage copies");
+                card = card.push(
+                    typography(
+                        format!(
+                            "Portable: {}/{} · {}",
+                            runtime["platform"]["os"].as_str().unwrap_or("?"),
+                            runtime["platform"]["arch"].as_str().unwrap_or("?"),
+                            state
+                        ),
+                        TypeScale::BodySmall,
+                    )
+                    .style(muted),
+                );
+                if phase == "suspended"
+                    && let Some(targets) = j["resume_targets"].as_object()
+                {
+                    for (worker, reason) in targets {
+                        let action = button(format!("Resume on {worker}"))
+                            .variant(ButtonVariant::Outlined)
+                            .size(ButtonSize::Small)
+                            .disabled(self.acting || !reason.is_null())
+                            .on_press(Message::Resume(
+                                id.into(),
+                                j["revision"].as_u64().unwrap_or(0),
+                                Some(worker.clone()),
+                            ));
+                        let mut target = row![action].spacing(8);
+                        if let Some(reason) = reason.as_str() {
+                            target =
+                                target.push(typography(reason, TypeScale::BodySmall).style(muted));
+                        }
+                        card = card.push(target);
+                    }
+                }
+            }
             if let Some(attempt) = j
                 .pointer("/assignment/attempt/number")
                 .and_then(Value::as_u64)
@@ -1019,6 +1059,38 @@ mod tests {
         }
     }
     #[test]
+    fn portable_resume_routes_compatible_target_and_disables_incompatible_worker() {
+        let mut app = sample();
+        app.jobs[0]["phase"] = json!("suspended");
+        app.jobs[0]["portable"] =
+            json!({"platform":{"os":"macos","arch":"aarch64"},"image_digest":"sha256:example"});
+        app.jobs[0]["portable_ready"] = json!(true);
+        app.jobs[0]["resume_targets"] =
+            json!({"compatible":null,"wrong-image":"VM image digest differs"});
+        let mut ui = simulator(&app);
+        ui.click("Resume on compatible").unwrap();
+        assert!(ui.into_messages().any(|m| matches!(m,
+            Message::Resume(id,2,Some(worker)) if id=="training" && worker=="compatible")));
+        let mut ui = simulator(&app);
+        ui.click("Resume on wrong-image").unwrap();
+        assert!(!ui.into_messages().any(|m| matches!(m, Message::Resume(..))));
+        for dark in [false, true] {
+            app.dark = dark;
+            let snapshot = simulator(&app).snapshot(&app.theme()).unwrap();
+            if let Some(dir) = std::env::var_os("FLEET_GUI_PREVIEW") {
+                assert!(
+                    snapshot
+                        .matches_image(PathBuf::from(dir).join(if dark {
+                            "portable-dark"
+                        } else {
+                            "portable-light"
+                        }))
+                        .unwrap()
+                );
+            }
+        }
+    }
+    #[test]
     fn checkpoint_actions_and_attempt_log_reset() {
         let mut app = sample();
         app.jobs[0]["latest_checkpoint"] =
@@ -1049,7 +1121,7 @@ mod tests {
         ui.click("Resume").unwrap();
         assert!(
             ui.into_messages()
-                .any(|m| matches!(m, Message::Resume(id,2) if id=="training"))
+                .any(|m| matches!(m, Message::Resume(id,2,None) if id=="training"))
         );
         app.log = "old-attempt".into();
         app.log_next = 11;

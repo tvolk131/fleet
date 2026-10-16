@@ -124,25 +124,26 @@ and checkpoint export are available through the CLI/JSON interface.
 ## Durability and scope
 
 Checkpoints survive VM deletion and worker process restart. Configured [storage agents](ARTIFACT_STORAGE.md)
-retain off-worker copies and can restore missing checkpoint inputs before resume on the original worker.
+retain off-worker copies. [Portable Tart jobs](PORTABLE_JOBS.md) also back up executable/input bundles
+and can cooperatively resume on another compatible worker; other jobs resume on the original worker.
 A replicated control-plane catalog alone is not a checkpoint backup. Physical host-loss protection
 requires a copy on another machine; original input dependencies and worker identity/history are separate.
 The control plane need not be always online for capture, but quorum is required to publish metadata,
 accept suspend/resume, and resolve normal client reads.
 
-There is no automatic retry, cross-worker migration, user-defined
+There is no automatic retry, lost-worker takeover, user-defined
 checkpoint hook, exactly-once external side-effect guarantee, or automatic resume after failure in this
 milestone. Cancellation is terminal. Explicit suspension frees VM compute and disk reservations only
 after confirmed deletion; host checkpoint storage is retained separately and is bounded per attempt,
 with explicit artifact retention/pinning and safe cleanup available through the storage catalog.
 Tart networking and VM isolation are unchanged.
 
-## Explicit format-5/6/7 upgrade
+## Explicit format-5/6/7/8 upgrade
 
-The model uses control-plane/worker format 8. Mixed-version operation is rejected. Fresh homes need no
-migration. For an existing format-5, format-6 or format-7 installation:
+The model uses control-plane/worker format 9. Mixed-version operation is rejected. Fresh homes need no
+migration. For an existing format-5, format-6, format-7 or format-8 installation:
 
-1. Finish or cancel queued/active jobs and stop or delete persistent VMs. Formats 6 and 7 can also retain suspended jobs. Do not upgrade under training.
+1. Finish or cancel queued/active jobs and stop or delete persistent VMs. Formats 6–8 can also retain suspended jobs. Do not upgrade under training.
 2. If needed, cooperatively shrink to a single voter using the old binary and let it settle.
 3. Stop controller, worker, and client-staging services. Preserve old binaries and service definitions.
 4. Run the new binary offline, listing all applicable worker and client homes:
@@ -156,14 +157,14 @@ migration. For an existing format-5, format-6 or format-7 installation:
    replicas to grow back to three. Never start an old replica against the upgraded cluster.
 
 The command locks and validates every selected database before writing, backs up each changed file with
-`.v5-backup`, `.v6-backup` or `.v7-backup` (a unique suffix prevents overwriting an earlier backup), and converts it transactionally.
+`.v5-backup`, `.v6-backup`, `.v7-backup` or `.v8-backup` (a unique suffix prevents overwriting an earlier backup), and converts it transactionally.
 It preserves cluster identity, applied log boundary, votes/membership, receipts, backend execution IDs,
 and completed job history. Each old job's existing assignment becomes its first attempt. A current-format snapshot
 replaces the compacted historical log; original raw log bytes remain in the backup. Repeating the command
 skips already-converted databases, allowing recovery from interruption between database commits.
 
 It refuses active/uncertain work, unapplied log suffixes, mixed cluster identities, nonempty prototype
-job databases, pending membership operations, and format-5/6/7 installations bound to emergency recovery
+job databases, pending membership operations, and format-5/6/7/8 installations bound to emergency recovery
 history. Those need a separately reviewed migration, not an override. Historical released receipt
 tombstones remain non-executable; a transformed old request may report a fingerprint conflict rather
 than an expired receipt. Full retained receipts and saved requests are rehashed for the typed commands.
