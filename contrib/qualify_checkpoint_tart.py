@@ -174,7 +174,10 @@ time.sleep(500)
             save('rolling-storage.json', status)
             assert all(r['report']['blob_payload_bytes'] <= 2*65536 for r in status['workers'])
             artifacts = request(op='artifacts')
-            assert sum(not r['artifact']['deleted'] for r in artifacts) == 2
+            assert sum(not r['artifact']['deleted']
+                       and isinstance(r['artifact']['manifest']['kind'], dict)
+                       and 'Checkpoint' in r['artifact']['manifest']['kind']
+                       for r in artifacts) == 2
             result.update(rolling_captures=len(captures), rolling_live=2, rolling_cache_bytes=2*65536,
                           rolling_reclamation_verified=True)
             cp = request(op='job', id='resumable')['latest_checkpoint']
