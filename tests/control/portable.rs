@@ -257,6 +257,31 @@ async fn portable_inputs_and_checkpoint_resume_on_another_worker_without_source_
         "resume must preserve explicit worker restriction"
     );
     let first = state.current_attempt("portable").unwrap().clone();
+    // Each artifact fits its own limit, but the new VM must stage both together.
+    let mut oversized = state.clone();
+    let full_bundle = artifact::Manifest::inputs(
+        "portable".into(),
+        (0..4)
+            .map(|n| jobs::OutputFile {
+                path: format!("dataset-{n}"),
+                hash: iroh_blobs::Hash::new([n]),
+                size: 1 << 30,
+            })
+            .collect(),
+    )
+    .unwrap();
+    oversized
+        .storage
+        .artifacts
+        .get_mut(&bundle.id)
+        .unwrap()
+        .manifest = full_bundle;
+    let rejection = oversized.resume_job_on(
+        "portable",
+        state.jobs["portable"].revision,
+        Some("destination"),
+    );
+    assert!(matches!(rejection, Reply::Rejected { reason } if reason.contains("staging limit")));
     assert_eq!(first.worker, "worker-real");
     a.shutdown().await.unwrap();
     // The destination must not access source files, the source journal, or the original client spool.

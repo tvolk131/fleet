@@ -119,6 +119,10 @@ impl State {
                 self.durable_artifact(a),
                 "waiting for verified checkpoint storage copies"
             );
+            ensure!(
+                bundle.manifest.bytes() + a.manifest.bytes() <= crate::vm_job::MAX_TOTAL,
+                "original inputs plus checkpoint exceed the 4 GiB VM staging limit"
+            );
         }
         Ok(())
     }

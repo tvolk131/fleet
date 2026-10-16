@@ -68,6 +68,8 @@ executable flags in the job specification. Declare every file needed to restart,
 libraries or other dependencies that are not supplied by the pinned guest image. Inputs use relative,
 non-overlapping paths: up to 256 files, 1 GiB each and 4 GiB total. This first implementation does not
 provide dataset streaming, directory packaging, VM-image archival or a package manager.
+The combined original inputs and selected checkpoint must also fit the 4 GiB VM staging limit;
+an oversized combination is refused before a resume attempt is created.
 
 ```sh
 fleet submit /absolute/job.json --id training --request-id training-submit
