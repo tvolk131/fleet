@@ -10,6 +10,8 @@ struct Ledger {
     #[serde(default)]
     window_start: u64,
     charged: BTreeSet<String>,
+    #[serde(default)]
+    charge_requests: BTreeMap<String, (u64, String)>,
     captured: BTreeMap<String, Captured>,
 }
 
@@ -20,13 +22,18 @@ impl Ledger {
         {
             self.window_start = now;
             self.transferred = 0;
+            self.charge_requests.clear();
             true
         } else {
             false
         }
     }
-    fn charge(&mut self, id: &str, size: u64, limit: u64) -> Result<()> {
+    fn charge(&mut self, id: &str, size: u64, limit: u64, request: &str) -> Result<()> {
         if self.charged.contains(id) {
+            anyhow::ensure!(
+                self.charge_requests.get(id) == Some(&(size, request.into())),
+                "checkpoint transfer reservation changed during replay; retry in a new batch"
+            );
             return Ok(());
         }
         let transferred = self
@@ -39,6 +46,8 @@ impl Ledger {
         );
         self.transferred = transferred;
         self.charged.insert(id.into());
+        self.charge_requests
+            .insert(id.into(), (size, request.into()));
         Ok(())
     }
 }
@@ -130,7 +139,8 @@ impl Runner {
             .as_ref()
             .and_then(|p| p.retention.as_ref())
             .map_or(MAX_RETAINED_BYTES, |r| r.transfer_bytes_per_hour);
-        ledger.charge(id, size, limit)?;
+        let request = serde_json::to_string(&(&path, size, &version))?;
+        ledger.charge(id, size, limit, &request)?;
         instances::write(&self.dir.join("vm-checkpoints.json"), ledger)?;
         let op = self.run_operation(
             id,
@@ -353,6 +363,7 @@ impl Runner {
             .checked_add(1)
             .context("checkpoint generation overflow")?;
         ledger.charged.clear();
+        ledger.charge_requests.clear();
         instances::write(&path, &ledger)?;
         self.prune_checkpoint_operations(None)?;
         if let Err(e) = result {
@@ -389,16 +400,18 @@ mod tests {
     fn transfer_budget_survives_restart_failed_charges_and_clock_rollback() {
         let mut ledger = Ledger::default();
         assert!(ledger.renew(100));
-        ledger.charge("download", 80, 100).unwrap();
+        ledger.charge("download", 80, 100, "source-a").unwrap();
         let mut ledger: Ledger =
             serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
         assert!(
             !ledger.renew(4000),
             "an interrupted batch retains its original charges"
         );
-        ledger.charge("download", 80, 100).unwrap();
+        ledger.charge("download", 80, 100, "source-a").unwrap();
+        assert!(ledger.charge("download", 81, 100, "source-a").is_err());
+        assert!(ledger.charge("download", 80, 100, "source-b").is_err());
         assert_eq!(ledger.transferred, 80);
-        assert!(ledger.charge("too-large", 30, 100).is_err());
+        assert!(ledger.charge("too-large", 30, 100, "source-b").is_err());
         assert!(!ledger.charged.contains("too-large"));
         ledger.charged.clear();
         assert!(
@@ -407,7 +420,7 @@ mod tests {
         );
         assert!(!ledger.renew(3699));
         assert!(ledger.renew(3700));
-        ledger.charge("new-window", 100, 100).unwrap();
-        assert!(ledger.charge("over-budget", 1, 100).is_err());
+        ledger.charge("new-window", 100, 100, "source-c").unwrap();
+        assert!(ledger.charge("over-budget", 1, 100, "source-d").is_err());
     }
 }
