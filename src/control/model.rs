@@ -23,6 +23,15 @@ pub struct Command {
 /// Deterministic application commands. External effects are reconciled by workers after commit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Mutation {
+    HistoryReport(super::history::Report),
+    HistoryPolicy {
+        job: String,
+        expected_revision: u64,
+        policy: crate::history::Policy,
+    },
+    SweepHistory {
+        as_of: u64,
+    },
     Enqueue(super::queue::Submission),
     EnrollStorage(super::artifact::Registration),
     ReviewStorageRecovery {
@@ -144,6 +153,8 @@ pub struct Receipt {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct State {
     #[serde(default)]
+    pub history: super::history::Catalog,
+    #[serde(default)]
     pub storage: super::artifact::Catalog,
     pub jobs: BTreeMap<String, super::queue::Job>,
     pub checkpoints: BTreeMap<String, super::checkpoint::Checkpoint>,
@@ -169,6 +180,7 @@ pub fn key(principal: &str, id: &str) -> String {
 impl State {
     pub fn new(cluster: String) -> Self {
         Self {
+            history: Default::default(),
             storage: Default::default(),
             jobs: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
@@ -209,9 +221,35 @@ impl State {
                 current: self.cluster.clone(),
             };
         }
+        // Diagnostic producers have durable, monotonic stream/copy cursors. Their internal
+        // observations converge without retaining an unbounded receipt per chunk or sample.
+        // User mutations (including history policy and pins) retain normal request receipts.
+        let diagnostic = match &request.mutation {
+            Mutation::HistoryReport(r) => self.history_reporter(&principal, r),
+            Mutation::ArtifactReady(r) => {
+                matches!(r.manifest.kind, super::artifact::Kind::History { .. })
+                    && r.manifest
+                        .worker()
+                        .and_then(|id| self.workers.get(id))
+                        .is_some_and(|w| {
+                            w.peer.identity.to_string() == principal
+                                && w.incarnation == r.incarnation
+                        })
+            }
+            Mutation::ArtifactReport(r) => {
+                request.id.starts_with("history-copy-")
+                    && self.artifact_reporter(&principal, &r.location, &r.incarnation)
+            }
+            Mutation::SweepHistory { .. } => principal == "history-maintenance",
+            _ => false,
+        };
         let reply = self.mutate(&principal, &request.id, &request.mutation, index);
         if matches!(reply, Reply::Recorded | Reply::Accepted { .. }) {
             self.apply_rolling_retention();
+            self.apply_history_retention();
+        }
+        if diagnostic {
+            return reply;
         }
         let resource = match &reply {
             Reply::Accepted { job, .. } => Some(job.clone()),
@@ -240,6 +278,13 @@ impl State {
         index: u64,
     ) -> Reply {
         match mutation {
+            Mutation::HistoryReport(r) => self.history_report(principal, r),
+            Mutation::HistoryPolicy {
+                job,
+                expected_revision,
+                policy,
+            } => self.history_policy(job, *expected_revision, policy),
+            Mutation::SweepHistory { as_of } => self.sweep_history(*as_of),
             Mutation::Enqueue(s) => self.enqueue(s, index),
             Mutation::EnrollStorage(r) => self.enroll_storage(r),
             Mutation::ReviewStorageRecovery {

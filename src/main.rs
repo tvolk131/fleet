@@ -152,6 +152,28 @@ enum Command {
     Attempts {
         id: String,
     },
+    /// Diagnostic retention, archive copies, gaps, and all execution attempts.
+    History {
+        id: String,
+    },
+    /// Read a page of captured JSON-lines metric history using a stable byte offset.
+    Metrics {
+        id: String,
+        #[arg(long)]
+        attempt: Option<u32>,
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+    },
+    /// Replace diagnostic retention using a JSON policy file and the current retention revision.
+    HistoryRetention {
+        id: String,
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
     Logs {
         id: String,
         #[arg(long)]
@@ -246,6 +268,8 @@ enum StorageCommand {
         request_id: Option<String>,
     },
     Policy {
+        #[arg(long)]
+        history: Vec<String>,
         #[arg(long)]
         input: Vec<String>,
         #[arg(long)]
@@ -460,6 +484,7 @@ async fn run(args: Args) -> Result<()> {
                 registration: serde_json::from_slice(&std::fs::read(registration)?)?,
             },
             StorageCommand::Policy {
+                history,
                 input,
                 revision,
                 checkpoint,
@@ -469,6 +494,7 @@ async fn run(args: Args) -> Result<()> {
                 request_id: request_id(rid),
                 expected_revision: revision,
                 policy: fleet::control::artifact::Policy {
+                    history: history.into_iter().collect(),
                     inputs: input.into_iter().collect(),
                     checkpoints: checkpoint.into_iter().collect(),
                     outputs: output.into_iter().collect(),
@@ -635,6 +661,24 @@ async fn run(args: Args) -> Result<()> {
             ApiRequest::FetchCheckpoint { id, destination }
         }
         Command::Attempts { id } => ApiRequest::Attempts { id },
+        Command::History { id } => ApiRequest::History { id },
+        Command::Metrics { id, attempt, from } => ApiRequest::Metrics {
+            id,
+            attempt,
+            from,
+            max: 65536,
+        },
+        Command::HistoryRetention {
+            id,
+            policy,
+            revision,
+            request_id: rid,
+        } => ApiRequest::HistoryRetention {
+            request_id: request_id(rid),
+            id,
+            expected_revision: revision,
+            policy: serde_json::from_slice(&std::fs::read(policy)?)?,
+        },
         Command::Logs {
             id,
             attempt,
@@ -642,6 +686,20 @@ async fn run(args: Args) -> Result<()> {
             mut from,
             follow,
         } => {
+            let attempt = if follow && attempt.is_none() {
+                let history =
+                    client::call(&client_home, ApiRequest::History { id: id.clone() }).await?;
+                Some(
+                    history["attempts"]
+                        .as_array()
+                        .and_then(|a| a.last())
+                        .and_then(|a| a.pointer("/attempt/number"))
+                        .and_then(serde_json::Value::as_u64)
+                        .context("job has no attempt to follow")? as u32,
+                )
+            } else {
+                attempt
+            };
             loop {
                 let value = client::call(
                     &client_home,
@@ -658,6 +716,12 @@ async fn run(args: Args) -> Result<()> {
                     return print(&value);
                 }
                 if let Some(chunk) = value.get("Logs") {
+                    if let Some(gap) = chunk.get("gap").filter(|g| !g.is_null()) {
+                        eprintln!(
+                            "[Fleet: history unavailable for bytes {}..{}]",
+                            gap["start"], gap["end"]
+                        );
+                    }
                     if let Some(data) = chunk.get("data").and_then(|s| s.as_str()) {
                         print!("{data}");
                     }

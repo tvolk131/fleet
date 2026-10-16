@@ -39,6 +39,11 @@ impl Registration {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Kind {
+    History {
+        stream: crate::history::Stream,
+        start: u64,
+        end: u64,
+    },
     Inputs,
     Checkpoint(String),
     FinalOutputs,
@@ -120,6 +125,16 @@ impl Manifest {
         self.files.iter().map(|f| f.size).sum()
     }
     pub fn validate(&self) -> Result<()> {
+        if let Kind::History { start, end, .. } = self.kind {
+            ensure!(
+                end > start
+                    && end - start <= crate::history::BLOCK_BYTES
+                    && self.files.len() == 1
+                    && self.files[0].path == "data"
+                    && self.files[0].size == end - start,
+                "invalid diagnostic history manifest"
+            );
+        }
         ensure!(
             (self.kind == Kind::Inputs || !self.files.is_empty()) && self.files.len() <= MAX_FILES,
             "artifact requires 1 to 256 files"
@@ -211,6 +226,8 @@ pub struct Artifact {
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Policy {
+    #[serde(default)]
+    pub history: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub inputs: BTreeSet<String>,
     pub checkpoints: BTreeSet<String>,
@@ -360,6 +377,7 @@ impl State {
                 "artifact must belong to a job attempt"
             );
             match &m.kind {
+                Kind::History { .. } => self.validate_history_chunk(m)?,
                 Kind::Inputs => anyhow::bail!("inputs are registered by job submission"),
                 Kind::Checkpoint(id) => {
                     let cp = self.checkpoints.get(id).context("unknown checkpoint")?;
@@ -407,7 +425,9 @@ impl State {
         if let Err(e) = check() {
             return Reply::rejected(&e.to_string());
         }
-        self.register_artifact(m.clone());
+        if self.accept_history_chunk(m) {
+            self.register_artifact(m.clone());
+        }
         Reply::Recorded
     }
     pub(crate) fn register_artifact(&mut self, manifest: Manifest) {
@@ -416,6 +436,7 @@ impl State {
         }
         self.storage.next_ordinal += 1;
         let targets = match manifest.kind {
+            Kind::History { .. } => self.storage.policy.history.clone(),
             Kind::Inputs => self.storage.policy.inputs.clone(),
             Kind::Checkpoint(_) => self.storage.policy.checkpoints.clone(),
             Kind::FinalOutputs => self.storage.policy.outputs.clone(),
@@ -460,6 +481,7 @@ impl State {
             .checkpoints
             .union(&policy.outputs)
             .chain(policy.inputs.iter())
+            .chain(policy.history.iter())
             .any(|id| !self.storage.stores.contains_key(id))
         {
             return Reply::rejected("unknown storage target");
@@ -469,6 +491,7 @@ impl State {
         // Removing a default does not delete existing copies. Retention is a separate explicit action.
         for artifact in self.storage.artifacts.values_mut().filter(|a| !a.deleted) {
             let targets = match artifact.manifest.kind {
+                Kind::History { .. } => &policy.history,
                 Kind::Inputs => &policy.inputs,
                 Kind::Checkpoint(_) => &policy.checkpoints,
                 Kind::FinalOutputs => &policy.outputs,

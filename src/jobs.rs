@@ -1,7 +1,7 @@
 //! Jobs: their specification, their folder on the agent, and the state read back from it.
 //!
 //! A job's folder (`$FLEET_HOME/jobs/<id>/`) holds `job.json` (the [`Job`]), `work/` (its working directory, where
-//! its inputs are placed and its outputs appear), `stdout.log` and `stderr.log`, `supervisor.json` (the supervisor's
+//! its inputs are placed and its outputs appear), bounded `history/` streams, `supervisor.json` (the supervisor's
 //! and the job's process IDs, once started), `cancel` (present once cancellation was requested) and `exit.json` (the
 //! [`Exit`], once finished). The folder is the job's whole state, so an agent that restarts reads it back.
 
@@ -26,6 +26,10 @@ pub struct Input {
 /// What to run, as the agent receives it: inputs by hash.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct JobSpec {
+    #[serde(default)]
+    pub metric_files: Vec<String>,
+    #[serde(default)]
+    pub history: crate::history::Policy,
     /// Absent executes as a trusted native process; present provisions one disposable Tart VM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm: Option<crate::instances::Spec>,
@@ -196,6 +200,8 @@ pub fn safe_relative(path: &str) -> Result<PathBuf> {
 
 impl JobSpec {
     pub fn validate(&self) -> Result<()> {
+        self.history.validate()?;
+        crate::history::jsonl::validate_paths(&self.metric_files)?;
         if self.name.trim().is_empty() {
             bail!("a job needs a name");
         }

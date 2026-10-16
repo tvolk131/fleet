@@ -23,6 +23,10 @@ use crate::{
 /// A job as written by hand or by a runner: inputs are local files.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct JobFile {
+    #[serde(default)]
+    pub metric_files: Vec<String>,
+    #[serde(default)]
+    pub history: crate::history::Policy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm: Option<crate::instances::Spec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -193,6 +197,8 @@ impl Coordinator {
             );
         }
         let spec = JobSpec {
+            metric_files: job.metric_files.clone(),
+            history: job.history.clone(),
             vm: job.vm.clone(),
             checkpoint: job.checkpoint.clone(),
             name: job.name.clone(),

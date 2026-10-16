@@ -277,7 +277,12 @@ impl Agent {
                 detail,
             };
             let id = format!(
-                "artifact-{}",
+                "{}-{}",
+                if matches!(artifact.manifest.kind, Kind::History { .. }) {
+                    "history-copy"
+                } else {
+                    "artifact"
+                },
                 blake3::hash(&serde_json::to_vec(&report)?).to_hex()
             );
             let reply = self
@@ -307,16 +312,15 @@ impl Agent {
         let m = &artifact.manifest;
         m.validate()?;
         let root = self.home.join("objects").join(&m.id);
-        let tombstone = self.home.join("deleted").join(format!("{}.json", m.id));
+
         if artifact.deleted {
             ensure!(
                 view.cleanup_allowed,
                 "cleanup held after authority recovery"
             );
             // Tombstones survive a controller rollback. Never silently resurrect deleted payloads.
-            if !tombstone.is_file() {
-                crate::instances::write(&tombstone, m)?;
-            }
+            tombstone(&self.home, m, true)?;
+            self.audited.remove(&m.id);
             self.access
                 .write()
                 .expect("artifact access")
@@ -338,7 +342,7 @@ impl Agent {
             return Ok(CopyPhase::Deleted);
         }
         ensure!(
-            !tombstone.exists(),
+            !tombstone(&self.home, m, false)?,
             "local deletion tombstone conflicts with controller; operator reconciliation required"
         );
         if root.exists() {
@@ -477,4 +481,86 @@ pub fn accept_recovery(home: &Path, manifest: &super::recovery::Manifest) -> Res
     crate::instances::write(&home.join("identity.json"), &config)?;
     crate::instances::write(&home.join("storage.json"), &config)?;
     Ok(())
+}
+
+/// History deletion is remembered as coalesced byte ranges, not a permanent file per chunk.
+/// Pinned/live holes remain separate; a rollback cannot fetch any previously erased range.
+fn tombstone(home: &Path, manifest: &Manifest, delete: bool) -> Result<bool> {
+    if let Kind::History { stream, start, end } = manifest.kind {
+        let identity = serde_json::to_vec(&(manifest.worker(), manifest.attempt(), stream))?;
+        let path = home
+            .join("deleted")
+            .join(format!("history-{}.json", blake3::hash(&identity).to_hex()));
+        let mut ranges: Vec<crate::history::Block> =
+            crate::jobs::read_json(&path)?.unwrap_or_default();
+        let overlaps = ranges.iter().any(|r| r.start < end && r.end > start);
+        if !delete {
+            return Ok(overlaps);
+        }
+        if ranges.iter().any(|r| r.start <= start && r.end >= end) {
+            return Ok(true);
+        }
+        ranges.push(crate::history::Block { start, end });
+        ranges.sort_by_key(|r| r.start);
+        let mut merged: Vec<crate::history::Block> = vec![];
+        for range in ranges {
+            if let Some(last) = merged.last_mut().filter(|last| last.end >= range.start) {
+                last.end = last.end.max(range.end);
+            } else {
+                merged.push(range);
+            }
+        }
+        crate::instances::write(&path, &merged)?;
+        Ok(true)
+    } else {
+        let path = home.join("deleted").join(format!("{}.json", manifest.id));
+        if delete && !path.exists() {
+            crate::instances::write(&path, manifest)?;
+        }
+        Ok(path.exists())
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    #[test]
+    fn compact_deletion_ranges_preserve_live_holes_and_refuse_rollback() {
+        let home = std::env::temp_dir().join(format!(
+            "fleet-history-delete-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(home.join("deleted")).unwrap();
+        let manifest = |n| {
+            Manifest::new(
+                "w".into(),
+                "a".into(),
+                Kind::History {
+                    stream: crate::history::Stream::Stdout,
+                    start: n,
+                    end: n + 1,
+                },
+                vec![crate::jobs::OutputFile {
+                    path: "data".into(),
+                    size: 1,
+                    hash: iroh_blobs::Hash::new(b"x"),
+                }],
+            )
+            .unwrap()
+        };
+        for n in (0..100).filter(|n| *n != 50) {
+            assert!(tombstone(&home, &manifest(n), true).unwrap());
+        }
+        assert!(!tombstone(&home, &manifest(50), false).unwrap());
+        assert!(tombstone(&home, &manifest(0), false).unwrap());
+        let files: Vec<_> = std::fs::read_dir(home.join("deleted")).unwrap().collect();
+        assert_eq!(files.len(), 1);
+        let path = files[0].as_ref().unwrap().path();
+        let ranges: Vec<crate::history::Block> = crate::jobs::read_json(&path).unwrap().unwrap();
+        assert_eq!(ranges.len(), 2);
+        tombstone(&home, &manifest(50), true).unwrap();
+        let ranges: Vec<crate::history::Block> = crate::jobs::read_json(&path).unwrap().unwrap();
+        assert_eq!(ranges, vec![crate::history::Block { start: 0, end: 100 }]);
+        std::fs::remove_dir_all(home).unwrap();
+    }
 }

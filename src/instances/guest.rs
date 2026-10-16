@@ -473,6 +473,7 @@ fn execute(
     dir: &Path,
     limit: u64,
     seconds: u64,
+    job_capture: Option<PathBuf>,
     check: impl Fn() -> Result<()>,
 ) -> Result<i32> {
     let mut child = cmd.spawn()?;
@@ -484,10 +485,18 @@ fn execute(
     let err_path = dir.join("stderr");
     let flag = exceeded.clone();
     let stop = stopped.clone();
-    let out = std::thread::spawn(move || collect(stdout, &out_path, limit, flag, stop));
+    let capture = job_capture.clone();
+    let out = std::thread::spawn(move || match capture {
+        Some(job) => crate::history::collect(stdout, &job, crate::history::Stream::Stdout, stop),
+        None => collect(stdout, &out_path, limit, flag, stop),
+    });
     let flag = exceeded.clone();
     let stop = stopped.clone();
-    let err = std::thread::spawn(move || collect(stderr, &err_path, MAX_LOG, flag, stop));
+    let capture = job_capture.clone();
+    let err = std::thread::spawn(move || match capture {
+        Some(job) => crate::history::collect(stderr, &job, crate::history::Stream::Stderr, stop),
+        None => collect(stderr, &err_path, MAX_LOG, flag, stop),
+    });
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let result = loop {
         match child.try_wait() {
@@ -513,10 +522,19 @@ fn execute(
     }
     let _ = child.wait();
     stopped.store(true, Ordering::Relaxed);
-    out.join()
-        .map_err(|_| anyhow::anyhow!("stdout reader panicked"))??;
-    err.join()
-        .map_err(|_| anyhow::anyhow!("stderr reader panicked"))??;
+    for (stream, reader) in [("stdout", out), ("stderr", err)] {
+        let captured = reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("{stream} reader panicked"))
+            .and_then(|r| r);
+        if job_capture.is_some() {
+            if let Err(error) = captured {
+                tracing::warn!(%error, stream, "job log capture incomplete");
+            }
+        } else {
+            captured?;
+        }
+    }
     if exceeded.load(Ordering::Relaxed) {
         bail!("guest output exceeded its byte limit");
     }
@@ -553,10 +571,25 @@ pub fn supervise(home: &Path, id: &str, operation: &str) -> Result<()> {
             }
             cmd.stdin(fs::File::open(path)?);
         }
-        execute(cmd, &dir, op.spec.stdout_limit(), op.spec.timeout(), || {
-            running(home, id, op.revision)?;
-            super::storage::guard(home)
-        })
+        let capture = if operation == "execute" {
+            super::info(home, id)?
+                .record
+                .job
+                .map(|job| jobs::jobs_dir(home).join(job))
+        } else {
+            None
+        };
+        execute(
+            cmd,
+            &dir,
+            op.spec.stdout_limit(),
+            op.spec.timeout(),
+            capture,
+            || {
+                running(home, id, op.revision)?;
+                super::storage::guard(home)
+            },
+        )
     })();
     match result {
         Ok(code) => {
@@ -637,7 +670,9 @@ pub fn readiness(home: &Path, id: &str) -> Result<Readiness> {
     let result = (|| -> Result<()> {
         let mut cmd = command(home, id)?;
         cmd.arg(r#"{"kind":"ready"}"#);
-        let code = execute(cmd, &temp, 4096, 5, || running(home, id, i.record.revision))?;
+        let code = execute(cmd, &temp, 4096, 5, None, || {
+            running(home, id, i.record.revision)
+        })?;
         if code != 0 || fs::read(temp.join("stdout"))? != b"fleet-guest-v1\n" {
             bail!("guest agent or /usr/bin/python3 is not ready");
         }

@@ -6,6 +6,8 @@ pub mod artifact_io;
 pub mod checkpoint;
 pub mod client;
 pub mod discovery;
+pub mod history;
+mod history_read;
 pub mod ids;
 pub mod input_upload;
 pub mod membership;
@@ -38,4 +40,4 @@ openraft::declare_raft_types!(
 
 pub type Raft = openraft::Raft<TypeConfig>;
 pub type Entry = openraft::Entry<TypeConfig>;
-pub const FORMAT: u32 = 9;
+pub const FORMAT: u32 = 10;

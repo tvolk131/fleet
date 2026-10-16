@@ -302,8 +302,10 @@ impl Agent {
             },
             Request::Events { since, wait_ms } => {
                 let wait = Duration::from_millis(u64::from(wait_ms.min(25_000)));
+                let events = self.events.wait_since(since, wait).await;
                 Response::Events {
-                    events: self.events.wait_since(since, wait).await,
+                    first: self.events.first(),
+                    events,
                     last: self.events.last(),
                 }
             }
@@ -332,6 +334,29 @@ impl Agent {
             } => {
                 let dir = jobs::dir(home, &job)?;
                 let finished = jobs::info(&dir)?.state.finished();
+                let stream = crate::history::Stream::log(stderr);
+                if crate::history::root(&dir, stream)
+                    .join("state.json")
+                    .exists()
+                {
+                    let r =
+                        crate::history::read(&dir, stream, from, max.min(MAX_LOG_CHUNK) as usize)?;
+                    let (data, next) = log_text(
+                        &r.data,
+                        r.next,
+                        if r.data.len() < (max.min(MAX_LOG_CHUNK) as usize) {
+                            r.next
+                        } else {
+                            r.observed
+                        },
+                    );
+                    return Ok(Response::Logs {
+                        data,
+                        next,
+                        done: finished && next >= r.observed,
+                        gap: r.gap,
+                    });
+                }
                 let path = dir.join(if stderr { "stderr.log" } else { "stdout.log" });
                 let (bytes, next, len) = read_from(&path, from, max.min(MAX_LOG_CHUNK))?;
                 let (data, next) = log_text(&bytes, next, len);
@@ -339,6 +364,7 @@ impl Agent {
                     data,
                     next,
                     done: finished && next >= len,
+                    gap: None,
                 }
             }
             Request::Cancel { job } => {
@@ -938,6 +964,27 @@ async fn watch(home: PathBuf, events: Arc<EventLog>, store: Store, origins: Orig
             if finished && settled.contains(&job.id) {
                 continue;
             }
+            let mut history_complete = true;
+            let dir = jobs::jobs_dir(&home).join(&job.id);
+            let metrics_closed = crate::history::state(&dir, crate::history::Stream::Metrics)
+                .is_ok_and(|s| s.closed);
+            if let Ok(Some(record)) = jobs::read_json::<Job>(&dir.join("job.json"))
+                && record.spec.vm.is_none()
+                && !metrics_closed
+                && !record.spec.metric_files.is_empty()
+            {
+                match crate::history::jsonl::capture(&dir, &record.spec.metric_files, finished) {
+                    Ok(complete) => history_complete = complete,
+                    Err(error) => {
+                        let _ = crate::history::record_loss(
+                            &dir,
+                            crate::history::Stream::Metrics,
+                            0,
+                            &format!("JSONL capture: {error}"),
+                        );
+                    }
+                }
+            }
             let home2 = home.clone();
             let id = job.id.clone();
             let scan = tokio::task::spawn_blocking(move || -> Result<(u32, u64, u64)> {
@@ -1009,6 +1056,20 @@ async fn watch(home: PathBuf, events: Arc<EventLog>, store: Store, origins: Orig
                         && (finished || now().saturating_sub(*at) >= 15)
                 });
                 if due && !values.is_empty() {
+                    let dir = jobs::jobs_dir(&home).join(&job.id);
+                    let captured = (|| -> Result<()> {
+                        if metrics_closed {
+                            return Ok(());
+                        }
+                        let mut bytes = serde_json::to_vec(
+                            &serde_json::json!({"at":now(),"kind":"probes","values":values}),
+                        )?;
+                        bytes.push(b'\n');
+                        crate::history::append(&dir, crate::history::Stream::Metrics, &bytes)
+                    })();
+                    if let Err(error) = captured {
+                        tracing::warn!(job=%job.id,%error,"metric capture unavailable");
+                    }
                     let kind = EventKind::Progress {
                         job: job.id.clone(),
                         probes: values.clone(),
@@ -1029,7 +1090,13 @@ async fn watch(home: PathBuf, events: Arc<EventLog>, store: Store, origins: Orig
                         outputs.insert(job.id.clone(), signature);
                     }
                 }
-                if finished {
+                if finished && history_complete {
+                    if let Err(error) = crate::history::close(
+                        &jobs::jobs_dir(&home).join(&job.id),
+                        crate::history::Stream::Metrics,
+                    ) {
+                        tracing::warn!(job=%job.id,%error,"metric history close unavailable");
+                    }
                     settled.insert(job.id);
                 }
             }
@@ -1039,7 +1106,7 @@ async fn watch(home: PathBuf, events: Arc<EventLog>, store: Store, origins: Orig
 
 /// A log chunk as text: cut before a character that the chunk's end splits (it comes whole with the next chunk), so
 /// returns the text and the offset to continue from. Bytes that are not text at all are replaced.
-fn log_text(bytes: &[u8], next: u64, len: u64) -> (String, u64) {
+pub(crate) fn log_text(bytes: &[u8], next: u64, len: u64) -> (String, u64) {
     let keep = match std::str::from_utf8(bytes) {
         Err(e) if e.error_len().is_none() && next < len => e.valid_up_to(),
         _ => bytes.len(),

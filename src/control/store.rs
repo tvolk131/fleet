@@ -71,7 +71,7 @@ impl Store {
         if identity.0 == FORMAT {
             return read(&table, "state")?.context("missing state");
         }
-        ensure!(matches!(identity.0, 5..=8), "unsupported source format");
+        ensure!(matches!(identity.0, 5..=9), "unsupported source format");
         let state = super::upgrade::state(read(&table, "state")?.context("missing state")?)?;
         let applied = state
             .last_applied

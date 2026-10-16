@@ -10,6 +10,7 @@ pub mod coordinator;
 pub mod events;
 #[cfg(feature = "gui")]
 pub mod gui;
+pub mod history;
 pub mod instances;
 pub mod jobs;
 pub mod keys;

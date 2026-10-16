@@ -21,6 +21,24 @@ const WAIT: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ApiRequest {
+    History {
+        id: String,
+    },
+    Metrics {
+        id: String,
+        #[serde(default)]
+        attempt: Option<u32>,
+        #[serde(default)]
+        from: u64,
+        #[serde(default = "log_size")]
+        max: u32,
+    },
+    HistoryRetention {
+        request_id: String,
+        id: String,
+        expected_revision: u64,
+        policy: crate::history::Policy,
+    },
     Storage,
     ReviewStorageRecovery {
         request_id: String,
@@ -185,6 +203,7 @@ fn log_size() -> u32 {
 impl ApiRequest {
     pub fn request_id(&self) -> Option<&str> {
         match self {
+            Self::HistoryRetention { request_id, .. } => Some(request_id),
             Self::ReviewStorageRecovery { request_id, .. }
             | Self::EnrollStorage { request_id, .. }
             | Self::StoragePolicy { request_id, .. }
@@ -304,6 +323,16 @@ impl AppClient {
             ApiRequest::EnrollStorage { registration, .. } => {
                 Mutation::EnrollStorage(registration.clone())
             }
+            ApiRequest::HistoryRetention {
+                id,
+                expected_revision,
+                policy,
+                ..
+            } => Mutation::HistoryPolicy {
+                job: id.clone(),
+                expected_revision: *expected_revision,
+                policy: policy.clone(),
+            },
             ApiRequest::StoragePolicy {
                 expected_revision,
                 policy,
@@ -678,6 +707,7 @@ impl AppClient {
                 Ok(answer)
             }
             ApiRequest::ReviewStorageRecovery { .. }
+            | ApiRequest::HistoryRetention { .. }
             | ApiRequest::EnrollStorage { .. }
             | ApiRequest::StoragePolicy { .. }
             | ApiRequest::ArtifactRetention { .. }
@@ -732,6 +762,21 @@ impl AppClient {
                 Ok(
                     json!({"format":state.format,"cluster":state.cluster,"quorum":true,"membership":state.membership_view(),"replicas":replicas,"recovery":state.recovery,"pending":state.scheduling_order().len()}),
                 )
+            }
+            ApiRequest::History { id } => {
+                let state = self.read().await?;
+                super::history_read::summary(&state, id)
+            }
+            ApiRequest::Metrics {
+                id,
+                attempt,
+                from,
+                max,
+            } => {
+                let state = self.read().await?;
+                let a = super::history_read::attempt(&state, id, *attempt)?;
+                self.history_read(&state, a, crate::history::Stream::Metrics, *from, *max)
+                    .await
             }
             ApiRequest::Queue => Ok(json!(job_views(&self.read().await?))),
             ApiRequest::Job { id } => job_views(&self.read().await?)
@@ -852,6 +897,19 @@ impl AppClient {
                 }
                 .context("job has no such attempt")?;
                 let w = &state.workers[&a.worker];
+                if let ApiRequest::Logs {
+                    stderr, from, max, ..
+                } = api
+                    && state
+                        .history
+                        .attempts
+                        .get(&a.id)
+                        .is_some_and(|s| s.contains_key(&crate::history::Stream::log(stderr)))
+                {
+                    return Ok(
+                        json!({"Logs":self.history_read(&state,a,crate::history::Stream::log(stderr),from,max).await?}),
+                    );
+                }
                 let request = match api {
                     ApiRequest::Logs {
                         stderr, from, max, ..

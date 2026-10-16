@@ -172,7 +172,7 @@ async fn recovery_imports_forgotten_running_native_work_and_fences_old_authority
             .unwrap();
     assert_eq!(supervisor.supervisor_pid, after.supervisor_pid);
     assert_eq!(
-        std::fs::read_to_string(home.join("backend/jobs/exec-missing/stdout.log")).unwrap(),
+        super::real_worker::stdout(&home, "exec-missing"),
         "started-once\n"
     );
     // Rebinding the client is explicit and signed. A tampered manifest is rejected.
@@ -236,7 +236,7 @@ async fn recovery_imports_forgotten_running_native_work_and_fences_old_authority
     let mut worker = Worker::start(&home, next, hello()).await.unwrap();
     worker.tick().await.unwrap();
     assert_eq!(
-        std::fs::read_to_string(home.join("backend/jobs/exec-missing/stdout.log")).unwrap(),
+        super::real_worker::stdout(&home, "exec-missing"),
         "started-once\n"
     );
     worker.shutdown().await.unwrap();
@@ -743,7 +743,7 @@ async fn recovered_worker_does_not_start_accepted_pending_work_before_explicit_r
     )
     .await;
     assert_eq!(
-        std::fs::read_to_string(home.join("backend/jobs/exec-pending/stdout.log")).unwrap(),
+        super::real_worker::stdout(&home, "exec-pending"),
         "started-once\n"
     );
     worker.shutdown().await.unwrap();

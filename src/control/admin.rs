@@ -53,7 +53,7 @@ pub enum Command {
         #[arg(long)]
         manifest: PathBuf,
     },
-    /// Offline format-5 through 8 upgrade: idle singleton, stopped workers, and paused client staging. Keeps backups.
+    /// Offline format-5 through 9 upgrade: idle singleton, stopped workers, and paused client staging. Keeps backups.
     Upgrade {
         #[arg(long)]
         controller_home: PathBuf,

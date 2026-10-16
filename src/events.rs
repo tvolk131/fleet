@@ -1,9 +1,9 @@
-//! The agent's event log: numbered, append-only, kept in `$FLEET_HOME/events.jsonl`, so a coordinator that was away
-//! asks for everything after the last number it saw and misses nothing.
+//! Bounded worker notification history. This is not the worker's authority journal or durable job
+//! archive. A reader can detect an expired notification cursor using `first` and refresh its view.
 
 use std::{
     fs,
-    io::Write,
+    io::{BufRead, Write},
     path::{Path, PathBuf},
     sync::Mutex,
     time::Duration,
@@ -74,6 +74,7 @@ pub struct Event {
 
 /// The most events one answer carries.
 pub const MAX_EVENTS: usize = 500;
+const RETAINED_EVENTS: usize = 5000;
 
 #[derive(Debug)]
 pub struct EventLog {
@@ -82,17 +83,37 @@ pub struct EventLog {
     notify: Notify,
 }
 
+fn persist(path: &Path, events: &[Event]) -> Result<()> {
+    let temporary = path.with_extension("jsonl.tmp");
+    let mut compact = fs::File::create(&temporary)?;
+    for event in events {
+        writeln!(compact, "{}", serde_json::to_string(event)?)?;
+    }
+    compact.sync_all()?;
+    fs::rename(temporary, path)?;
+    fs::File::open(path.parent().expect("event log parent"))?.sync_all()?;
+    Ok(())
+}
+
 impl EventLog {
     pub fn open(path: &Path) -> Result<Self> {
         let mut events = Vec::new();
         if path.exists() {
-            for line in fs::read_to_string(path)?.lines() {
+            for line in std::io::BufReader::new(fs::File::open(path)?).lines() {
+                let line = line?;
                 // A line cut off by a crash is skipped; every complete one is kept.
-                if let Ok(event) = serde_json::from_str::<Event>(line) {
+                if let Ok(event) = serde_json::from_str::<Event>(&line) {
                     events.push(event);
+                }
+                if events.len() > RETAINED_EVENTS * 2 {
+                    events.drain(..RETAINED_EVENTS);
                 }
             }
         }
+        if events.len() > RETAINED_EVENTS {
+            events.drain(..events.len() - RETAINED_EVENTS);
+        }
+        persist(path, &events)?;
         Ok(Self {
             path: path.to_path_buf(),
             events: Mutex::new(events),
@@ -105,6 +126,13 @@ impl EventLog {
             .lock()
             .expect("events")
             .last()
+            .map_or(0, |e| e.seq)
+    }
+    pub fn first(&self) -> u64 {
+        self.events
+            .lock()
+            .expect("events")
+            .first()
             .map_or(0, |e| e.seq)
     }
 
@@ -122,6 +150,10 @@ impl EventLog {
         writeln!(file, "{}", serde_json::to_string(&event)?)?;
         let seq = event.seq;
         events.push(event);
+        if events.len() > RETAINED_EVENTS {
+            events.drain(..MAX_EVENTS);
+            persist(&self.path, &events)?;
+        }
         drop(events);
         self.notify.notify_waiters();
         Ok(seq)
@@ -207,6 +239,32 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn rollover_and_partial_crash_tail_preserve_cursor_and_bound_disk_history() {
+        let dir =
+            std::env::temp_dir().join(format!("fleet-events-{:032x}", rand::random::<u128>()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("events.jsonl");
+        let log = EventLog::open(&path).unwrap();
+        for _ in 0..5501 {
+            log.append(EventKind::Unknown).unwrap();
+        }
+        assert!(log.first() > 1);
+        assert_eq!(log.last(), 5501);
+        assert!(fs::read_to_string(&path).unwrap().lines().count() <= RETAINED_EVENTS);
+        drop(log);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{partial")
+            .unwrap();
+        let log = EventLog::open(&path).unwrap();
+        assert_eq!(log.append(EventKind::Unknown).unwrap(), 5502);
+        drop(log);
+        assert_eq!(EventLog::open(&path).unwrap().last(), 5502);
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn an_event_of_an_unknown_kind_keeps_its_number() {
         let event: Event =

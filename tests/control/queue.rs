@@ -1,6 +1,6 @@
 use super::*;
 use fleet::control::{queue::Submission, workload::*};
-fn state() -> State {
+pub(super) fn state() -> State {
     let mut s = State::new("cluster".into());
     s.enroll(&Registration {
         runtimes: Default::default(),
@@ -21,7 +21,7 @@ fn state() -> State {
     });
     s
 }
-fn queued(id: &str) -> Submission {
+pub(super) fn queued(id: &str) -> Submission {
     Submission {
         inputs: Default::default(),
         id: id.into(),

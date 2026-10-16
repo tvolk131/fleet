@@ -55,6 +55,11 @@ impl State {
             .values()
             .map(|a| {
                 let job = match &a.manifest.kind {
+                    Kind::History { .. } => a
+                        .manifest
+                        .attempt()
+                        .and_then(|id| self.history_job(id))
+                        .map(str::to_owned),
                     Kind::Checkpoint(id) => self.checkpoints.get(id).map(|c| c.job.to_string()),
                     Kind::FinalOutputs => None,
                     Kind::Inputs => a.manifest.job().map(str::to_owned),
@@ -100,6 +105,10 @@ impl State {
                     return d;
                 }
                 d.reasons = self.artifact_protection(a);
+                if matches!(a.manifest.kind, Kind::History { .. }) {
+                    d.reasons.push("diagnostic history policy".into());
+                    return d;
+                }
                 if a.manifest.kind == Kind::Inputs {
                     d.reasons
                         .push("job input bundle; explicit retention".into());

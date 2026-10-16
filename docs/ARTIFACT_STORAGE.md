@@ -1,6 +1,6 @@
 # Artifact storage and lifecycle
 
-Fleet catalogs portable input, checkpoint and final-output artifacts in its replicated control plane and keeps file
+Fleet catalogs portable inputs, checkpoints, final outputs and diagnostic history in its replicated control plane and keeps file
 contents outside Raft. Independently enrolled storage agents retain verified copies over authenticated
 iroh. A storage role can run alone or share a service process with a controller or worker; each role
 has a separate identity and non-overlapping state home. Storage placement is independent of replica
@@ -10,13 +10,16 @@ membership. Growing to three controllers does not create three checkpoint copies
 
 An artifact has an immutable content manifest, owning job or source worker/attempt, kind, byte count, retention
 revision, optional pin/expiry, and observations for its source and configured backup targets. Kinds are
-a portable job input bundle, an application checkpoint or one final output set for a finished attempt. A suspended attempt can have
-final outputs too. Intermediate logs, metrics, and output reads retain their existing worker path.
+a portable job input bundle, an application checkpoint, one final output set for a finished attempt, or an
+immutable log/metric chunk. A suspended attempt can have final outputs too. [Durable history](DURABLE_HISTORY.md)
+combines archived chunks with the worker's newest unarchived output; intermediate application output
+reads retain their existing worker path.
 
 `Enqueue` registers a portable input bundle with the job. `CheckpointReady` registers the checkpoint artifact atomically with the resume metadata. Final outputs
 are registered after confirmed attempt cleanup. Backup policy applies to existing live artifacts as
 well as future ones. Removing a default target does not delete its existing copies. Defaults are empty,
-so enroll and configure storage explicitly. No payload expires automatically by default.
+so enroll and configure storage explicitly. Inputs, checkpoints and final outputs do not expire
+automatically by default; history has its own rolling byte/count limits and completion-age expiry.
 
 Files are limited to 1 GiB each, 4 GiB per artifact, and 256 files per final-output artifact. Checkpoints
 retain their stricter 128-file/64-KiB manifest limits. Oversized or changing final outputs cannot become
@@ -27,7 +30,8 @@ Application consistency remains the application's responsibility.
 
 The closed command enum adds `EnrollStorage`, `StoragePolicy`, `ArtifactReady`, `ArtifactReport`,
 `ArtifactRetention`, `DeleteArtifact`, `ExpireArtifacts`, and `ReviewStorageRecovery`.
-`CheckpointReady` also registers the corresponding artifact. Applying these commands changes only
+`CheckpointReady` also registers the corresponding artifact. History adds `HistoryReport`, `HistoryPolicy`
+and `SweepHistory`, reusing the artifact copy/retention commands. Applying these commands changes only
 metadata. Authenticated `StorageRead` and `WorkerRead` return quorum-confirmed intent. The storage and
 worker reconcilers perform transfers/deletion afterward, then propose versioned observations. Disk IO,
 network IO, and wall-clock expiry decisions never run inside the replicated state machine.
@@ -48,7 +52,7 @@ fleet cluster prepare-storage --home /absolute/storage \
 # On an administrator client, after transferring registration.json (not node.key).
 fleet storage enroll /absolute/registration.json --request-id enroll-backup-1
 fleet storage status
-fleet storage policy --revision 0 --checkpoint backup-1 --output backup-1 \
+fleet storage policy --revision 0 --input backup-1 --checkpoint backup-1 --output backup-1 --history backup-1 \
   --request-id configure-backups
 
 # On the storage host; alternatively add --storage-home when configuring a combined service.
@@ -57,7 +61,8 @@ fleet service run --config /absolute/storage-service.json
 ```
 
 Policy revisions are explicit. Read `storage status` before changing an existing policy; repeated
-`--input`, `--checkpoint` and `--output` options select multiple destinations. Registration (identity, incarnation,
+`--input`, `--checkpoint`, `--output` and `--history` options select multiple destinations. Supply every
+desired category when replacing the default policy. Registration (identity, incarnation,
 address, failure domain, quota) is immutable in this milestone; prepare a new role/home to replace one.
 Storage agents can read source artifacts and report their assigned copies, but cannot enqueue work,
 change policy, or read the administrator-only control-plane state.
@@ -104,13 +109,17 @@ The GUI shows checkpoint backup status, and its existing output download uses th
 suspension and VM cleanup. The original executable/inputs and selected checkpoint must have verified
 storage copies. The destination imports verified bytes before launching; the original worker and client
 can be unavailable. Jobs without an explicit portable runtime retain original-worker resume semantics.
-Neither path authorizes lost-worker takeover. VM disks, live logs and metric streams are not backed up
-by this artifact policy. Input bundles are protected while their job is unfinished or its checkpoints
+Neither path authorizes lost-worker takeover. VM disks are not backed up by this artifact policy.
+Logs and metrics use the separate `history` destination set; their newest unarchived tail remains
+worker-local. Input bundles are protected while their job is unfinished or its checkpoints
 are retained; rolling checkpoint retention never selects the input bundle.
 
 ## Retention and cleanup
 
-By default artifacts are retained indefinitely until explicitly deleted or given an expiry. Jobs can opt into [rolling checkpoint retention](ROLLING_STORAGE.md); final outputs retain their separate policy. A pin protects an
+By default inputs, checkpoints and final outputs are retained until explicitly deleted or given an expiry.
+Jobs can opt into [rolling checkpoint retention](ROLLING_STORAGE.md). [History](DURABLE_HISTORY.md#retention-and-pressure)
+defaults to 1 GiB combined logs and 128 MiB metrics, with 30/90-day expiry after logical completion,
+plus chunk-count limits. A pin protects an
 artifact regardless of expiry. The selected resume checkpoint and latest checkpoint of an unfinished
 logical job are also protected. Unpinning cannot bypass those dependencies.
 
@@ -123,17 +132,19 @@ fleet expire-artifacts --as-of 1800000000 --request-id retention-sweep-1
 fleet delete-artifact ARTIFACT_ID --revision CURRENT_REVISION --request-id delete-result
 ```
 
-Expiry uses an explicit Unix timestamp so the state-machine decision is deterministic. There is no
-background expiry scheduler yet: invoke `expire-artifacts` when desired. Deletion first commits a
-permanent tombstone. Agents then remove owned payloads and report `Deleted`; unavailable agents remain
+Expiry uses an explicit Unix timestamp so the state-machine decision is deterministic. Invoke
+`expire-artifacts` for explicit artifact expiries; history's own completion-age policy is swept
+automatically. Deletion first commits a tombstone. Agents then remove owned payloads and report `Deleted`; unavailable agents remain
 pending until they return. Deletion is irreversible through Fleet. Source reports cannot resurrect an
-artifact. Job/attempt histories, checkpoint descriptors, request receipts, and deletion records remain.
+artifact. Job/attempt summaries, checkpoint descriptors and user request receipts remain. Fully deleted
+history chunks can leave the catalogue; stream cursors and compact storage deletion ranges prevent replay.
 
 Cleanup removes retained storage objects, registered source checkpoint/final-output files, restored
 checkpoint files, and their named blob tags. The worker then collects only eligible cache hashes from
 committed artifact tombstones. Other retained artifacts, active resume inputs, original input reservations
 and in-flight imports protect shared hashes. Unknown cache entries are retained. Cleanup does **not**
-erase job directories, logs, initial-input spools or VM image caches. Artifact deletion is not a promise
+erase job directories, old loose logs, initial-input spools or VM image caches. History capture buffers
+have their own bounded reclamation after verified backup or committed deletion. Artifact deletion is not a promise
 to erase every historical copy from the host or external exports. Rolling jobs release capture slots
 after local reclamation; the default cumulative per-attempt limit is not reset by deletion.
 
@@ -168,11 +179,11 @@ The normal `fleet api` interface exposes `storage`, `artifacts`, `enroll_storage
 `review_storage_recovery`. Mutations require an explicit request ID and applicable revision/fingerprint.
 Use `retry` after an unknown mutation outcome; do not invent a new request ID to bypass uncertainty.
 
-The protocol/metadata format is 8. Mixed versions are refused. The explicit offline singleton upgrade
-accepts idle format 5, 6 or 7; formats 6 and 7 may include suspended jobs. It preserves checkpoint metadata and
+The current protocol/metadata format is 10. Mixed versions are refused. The explicit offline singleton upgrade
+accepts idle formats 5–9; formats 6–9 may include suspended jobs. It preserves checkpoint metadata and
 receipts, registers existing checkpoints as source artifacts, and creates versioned backups. It refuses
 recovery-bound old-format installations pending a separately reviewed migration. See
-[the upgrade procedure](CHECKPOINT_JOBS.md#explicit-format-567-upgrade).
+[the upgrade procedure](CHECKPOINT_JOBS.md#explicit-format-56789-upgrade).
 
 Rust qualification covers three-replica checkpoint backup/export/resume with the original worker payloads
 and blob cache unavailable, leader loss, immutable attempt history, pins/expiry/cleanup, quotas,

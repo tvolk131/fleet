@@ -24,6 +24,7 @@ use std::{
 };
 
 mod artifacts;
+mod history;
 mod reclaim;
 
 pub const DATA_ALPN: &[u8] = b"fleet/worker-data/1";
@@ -223,6 +224,12 @@ impl Journal {
 /// Direct data plane has no execute or lifecycle commands. Those must pass through consensus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DataRequest {
+    History {
+        execution: String,
+        stream: crate::history::Stream,
+        from: u64,
+        max: u32,
+    },
     Storage,
     ReserveInputs {
         hashes: Vec<iroh_blobs::Hash>,
@@ -276,6 +283,20 @@ impl ProtocolHandler for DataHandler {
                         serde_json::from_slice(&recv.read_to_end(MAX_FRAME).await?)?;
                     ensure!(frame.cluster == self.cluster, "cluster mismatch");
                     let special = match &frame.request {
+                        DataRequest::History {
+                            execution,
+                            stream,
+                            from,
+                            max,
+                        } => {
+                            let dir = jobs::dir(&self.home.join("backend"), execution)?;
+                            Some(proto::Response::History(crate::history::read(
+                                &dir,
+                                *stream,
+                                *from,
+                                *max as usize,
+                            )?))
+                        }
                         DataRequest::Storage => Some(proto::Response::StorageReport(
                             jobs::read_json(&self.home.join("storage-report.json"))?
                                 .unwrap_or(serde_json::Value::Null),
@@ -289,7 +310,9 @@ impl ProtocolHandler for DataHandler {
                         response
                     } else {
                         let request = match frame.request {
-                            DataRequest::Storage | DataRequest::ReserveInputs { .. } => {
+                            DataRequest::Storage
+                            | DataRequest::ReserveInputs { .. }
+                            | DataRequest::History { .. } => {
                                 unreachable!()
                             }
                             DataRequest::Status => proto::Request::Status,
@@ -783,6 +806,9 @@ impl Worker {
             self.journal.observe(a, observation)?;
         }
         if online {
+            if let Err(e) = self.reconcile_history().await {
+                tracing::warn!(error=%e, "history archival will retry");
+            }
             if let Err(e) = self.reconcile_artifacts().await {
                 tracing::warn!(error=%e, "artifact lifecycle will retry");
             }
@@ -932,7 +958,23 @@ impl Worker {
                         for file in &c.content.files {
                             c.content.verify_file(&root, file)?;
                         }
+                        // Cooperative suspension may drain declared metrics before stopping. Keep
+                        // the reservation and a durable hard deadline; cancellation still stops now.
+                        if !spec.metric_files.is_empty()
+                            && !dir.join("history-stop-deadline.json").exists()
+                        {
+                            instances::write(
+                                &dir.join("history-stop-deadline.json"),
+                                &jobs::now().saturating_add(35),
+                            )?;
+                        }
                         instances::write(&dir.join("suspend.json"), checkpoint)?;
+                    }
+                    if !dir.join("exit.json").exists()
+                        && (spec.metric_files.is_empty()
+                            || jobs::read_json::<u64>(&dir.join("history-stop-deadline.json"))?
+                                .is_none_or(|d| jobs::now() >= d))
+                    {
                         instances::release_job(&home, id, instances::Desired::Stopped)?;
                     }
                 } else if a.desired == Desired::Job(JobDesired::Cancelled) {
