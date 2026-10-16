@@ -20,6 +20,7 @@ def main():
     p.add_argument('--binary', type=Path, required=True)
     p.add_argument('--home', type=Path, required=True)
     p.add_argument('--fake', action='store_true')
+    p.add_argument('--history', action='store_true', help='qualify archived logs/JSONL metrics across both attempts with source offline')
     p.add_argument('--instances', type=Path)
     p.add_argument('--image-cache', type=Path)
     a = p.parse_args()
@@ -130,18 +131,27 @@ else:
  (p/'ready.tmp').write_text(json.dumps(m));(p/'ready.tmp').rename(p/'fleet.json')
  print('initial-once',flush=True);time.sleep(500)
 ''')
+    if a.history:
+        text = trainer.read_text().replace("assert pathlib.Path('dataset').read_text() == 'durable original data'", """assert pathlib.Path('dataset').read_text() == 'durable original data'
+with open('metrics.jsonl', 'w') as metric:
+ for step in range(2000): metric.write(json.dumps({'step':step,'loss':1/(step+1),'phase':sys.argv[1]})+'\\n')
+if sys.argv[1]=='start': sys.stdout.write('x'*(9<<20)+'\\n')
+print('diagnostic-'+sys.argv[1], file=sys.stderr, flush=True)""")
+        trainer.write_text(text)
     trainer.chmod(0o700)
     (inputs / 'dataset').write_text('durable original data')
     job = dict(name='Portable qualification', argv=['bin/trainer', 'start'], inputs={'bin/trainer': str(trainer), 'dataset': str(inputs / 'dataset')},
                publish=['result.txt'], keep_awake=False, settle_seconds=0, max_seconds=600, threads=1 if a.fake else 2,
                vm=dict(image='macos', runtime=runtime, cpus=1 if a.fake else 2, memory_mb=4096 if a.fake else 6144, disk_gb=50, network='offline', gpu='exclusive'),
                checkpoint=dict(manifests='cp/*/fleet.json', resume_argv=['bin/trainer', 'resume', '{checkpoint}/state']))
+    if a.history:
+        job['metric_files'] = ['metrics.jsonl']
     try:
         start('control')
         for home in (source, destination):
             command('--home', client, 'enroll', home / 'enroll.json', '--request-id', 'enroll-' + home.name)
         command('--home', client, 'storage', 'enroll', storage / 'registration.json', '--request-id', 'enroll-backup')
-        command('--home', client, 'storage', 'policy', '--revision', 0, '--input', 'backup', '--checkpoint', 'backup', '--output', 'backup', '--request-id', 'policy')
+        command('--home', client, 'storage', 'policy', '--revision', 0, '--input', 'backup', '--checkpoint', 'backup', '--output', 'backup', *(['--history', 'backup'] if a.history else []), '--request-id', 'policy')
         request(op='drain', worker='destination', drain=True, request_id='drain-destination')
         # Enable portable execution on an already enrolled worker without a new identity/home.
         old_registration = json.loads((destination / 'worker.json').read_text())['registration']
@@ -173,6 +183,12 @@ else:
         request(op='suspend', id='portable', checkpoint=checkpoint['id'], expected_revision=initial['revision'], request_id='suspend')
         suspended = wait(lambda: request(op='job', id='portable'), lambda j: j['phase'] == 'suspended')
         assert all(json.loads(p.read_text())['state'] == 'deleted' for p in source.glob('backend/instances/*/observed.json'))
+        if a.history:
+            def backed(number):
+                h = request(op='history', id='portable')
+                streams = h['attempts'][number-1]['streams']
+                return all(s['progress'] and s['progress']['closed'] and s['progress']['published'] == s['progress']['observed'] and s['backed_up_bytes'] == s['retained_bytes'] and s['backed_up_bytes'] > 0 for s in streams)
+            wait(lambda: backed(1), bool)
         stop('source')
         source.rename(a.home / 'unavailable-source')
         client.rename(a.home / 'unavailable-client')
@@ -181,6 +197,24 @@ else:
         stop('control')
         start('control')
         wait(lambda: request(op='storage'), lambda s: any(r['report'] is not None for r in s['storage_reports']))
+        if a.history:
+            def read_stream(number, op, **extra):
+                offset, text = 0, []
+                while True:
+                    page = request(op=op, id='portable', attempt=number, **{'from':offset}, max=1<<20, **extra)
+                    if op == 'logs': page = page['Logs']
+                    assert page.get('gap') is None, page
+                    assert page.get('archived') is True or page['data'] == '', page
+                    text.append(page['data'])
+                    if page['done']: return ''.join(text)
+                    assert page['next'] > offset, page
+                    offset = page['next']
+            assert read_stream(1, 'logs').endswith('initial-once\n')
+            assert read_stream(1, 'logs', stderr=True) == 'diagnostic-start\n'
+            metrics = [json.loads(line) for line in read_stream(1, 'metrics').splitlines()]
+            records = [m for m in metrics if m['kind'] == 'jsonl']
+            assert len(records) == 2000 and [m['record']['step'] for m in records] == list(range(2000))
+            result.update(archived_logs_over_old_limit=True, declared_metrics_exactly_once=True, offline_worker_history_reads=True)
         request(op='drain', worker='destination', drain=False, request_id='enable-destination')
         command('--home', client, 'resume', 'portable', '--worker', 'destination', '--request-id', 'resume-on-destination', '--revision', suspended['revision'])
         request(op='retry', request_id='resume-on-destination')
@@ -190,6 +224,17 @@ else:
         request(op='fetch', id='portable', destination=str(a.home / 'outputs'))
         assert (a.home / 'outputs/result.txt').read_text() == '8'
         assert request(op='logs', id='portable')['Logs']['data'].count('resumed-once') == 1
+        if a.history:
+            wait(lambda: backed(2), bool)
+            assert read_stream(2, 'logs') == 'resumed-once\n'
+            assert read_stream(2, 'logs', stderr=True) == 'diagnostic-resume\n'
+            assert len([m for m in map(json.loads, read_stream(2, 'metrics').splitlines()) if m['kind'] == 'jsonl']) == 2000
+            h = request(op='history', id='portable')
+            assert h['attempts'][0]['worker'] == 'source' and h['attempts'][1]['worker'] == 'destination'
+            policy = h['retention']['policy']; policy['log_days'] = 7
+            updated = request(op='history_retention', id='portable', expected_revision=h['retention']['revision'], policy=policy, request_id='history-retention')
+            assert updated['reply'] == 'Recorded', updated
+            result['cross_attempt_history_and_retention_cli'] = True
         assert final['attempts'][0] == suspended['attempts'][0]
         result.update(cross_worker_resume=True, original_worker_and_client_unavailable=True, durable_executable_and_inputs=True,
                       cooperative_cleanup=True, controller_storage_restart=True, idempotent_resume=True, stable_job_identity=True)

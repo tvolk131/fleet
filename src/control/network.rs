@@ -30,7 +30,7 @@ use super::discovery::save_cache;
 use super::membership::{MembershipView, spawn_reconciler};
 use super::{Command, FORMAT, Raft, Reply, Request, State, Store, TypeConfig, store::MAX_SNAPSHOT};
 
-pub const ALPN: &[u8] = b"fleet/control/9";
+pub const ALPN: &[u8] = b"fleet/control/10";
 const MAX_FRAME: usize = 8 << 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -415,6 +415,7 @@ impl Handler {
             }
             Message::Write(request)
                 if is_admin
+                    || matches!(&request.mutation, super::Mutation::HistoryReport(r) if self.store.state().await.ok().is_some_and(|s| s.history_reporter(&peer.to_string(),r)))
                     || matches!(&request.mutation,
                 super::Mutation::WorkerReport(report) if self.store.state().await.ok().and_then(|s| s.workers.get(&report.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == report.incarnation))
                     || matches!(&request.mutation, super::Mutation::ArtifactReady(ready) if self.store.state().await.ok().and_then(|s| ready.manifest.worker().and_then(|id| s.workers.get(id)).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == ready.incarnation))
@@ -472,6 +473,18 @@ impl Handler {
                     .expect("presence")
                     .insert(worker.clone(), std::time::Instant::now());
                 Answer::WorkerRead(Ok(super::workload::WorkerView {
+                    history: state
+                        .history
+                        .attempts
+                        .iter()
+                        .filter(|(id, _)| {
+                            state
+                                .assignments
+                                .get(*id)
+                                .is_some_and(|a| a.worker == worker)
+                        })
+                        .map(|(id, s)| (id.clone(), s.clone()))
+                        .collect(),
                     artifacts: state
                         .storage
                         .artifacts

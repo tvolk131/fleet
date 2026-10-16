@@ -23,6 +23,19 @@ fn hello() -> proto::Hello {
         cpu_slots: 8,
     }
 }
+fn stdout(home: &std::path::Path, execution: &str) -> String {
+    String::from_utf8(
+        fleet::history::read(
+            &home.join("backend/jobs").join(execution),
+            fleet::history::Stream::Stdout,
+            0,
+            1 << 20,
+        )
+        .unwrap()
+        .data,
+    )
+    .unwrap()
+}
 fn job(script: &str) -> jobs::JobSpec {
     serde_json::from_value(serde_json::json!({"name":"control canary", "argv":["/bin/sh", "-c", script], "threads":1, "keep_awake":false, "max_seconds":30, "shutdown_grace_seconds":0, "settle_seconds":0, "publish":["result.txt"]})).unwrap()
 }
@@ -329,10 +342,7 @@ async fn native_worker_survives_lost_reply_restart_and_replica_replacement() {
         WorkPhase::Job(AttemptPhase::Cancelled),
     )
     .await;
-    assert_eq!(
-        std::fs::read_to_string(home.join("backend/jobs/exec-native/stdout.log")).unwrap(),
-        "started\n"
-    );
+    assert_eq!(stdout(&home, "exec-native"), "started\n");
     w.shutdown().await.unwrap();
     c.close().await;
 }
@@ -379,10 +389,7 @@ async fn worker_outage_keeps_work_and_journal_then_recovers_without_rerun() {
         WorkPhase::Job(AttemptPhase::Succeeded),
     )
     .await;
-    assert_eq!(
-        std::fs::read_to_string(home.join("backend/jobs/exec-outage/stdout.log")).unwrap(),
-        "once\n"
-    );
+    assert_eq!(stdout(&home, "exec-outage"), "once\n");
     w.shutdown().await.unwrap();
     c.close().await;
 }
@@ -723,10 +730,7 @@ async fn worker_process_sigkill_preserves_supervisor_and_durable_cancellation() 
         jobs::read_json::<jobs::Started>(&path).unwrap().unwrap(),
         before
     );
-    assert_eq!(
-        std::fs::read_to_string(home.join("backend/jobs/exec-process/stdout.log")).unwrap(),
-        "once\n"
-    );
+    assert_eq!(stdout(&home, "exec-process"), "once\n");
     drop(restarted);
     c.close().await;
 }
@@ -1058,11 +1062,7 @@ async fn queued_native_jobs_schedule_once_and_dependencies_wait_for_success() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     for id in ["first", "second"] {
-        assert_eq!(
-            std::fs::read_to_string(home.join(format!("backend/jobs/exec-{id}-a1/stdout.log")))
-                .unwrap(),
-            "started-once\n"
-        );
+        assert_eq!(stdout(&home, &format!("exec-{id}-a1")), "started-once\n");
     }
     w.shutdown().await.unwrap();
     c.close().await;
@@ -1085,3 +1085,6 @@ mod portable;
 
 #[path = "runtime_update.rs"]
 mod runtime_update;
+
+#[path = "history.rs"]
+mod history;

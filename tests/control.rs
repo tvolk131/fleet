@@ -386,7 +386,7 @@ impl Cluster {
     }
     async fn new(n: u64) -> Self {
         let home = Home::new();
-        let client_key = SecretKey::generate();
+        let client_key = fleet::keys::load_or_create(&home.0.join("app-client/node.key")).unwrap();
         let mut peers = BTreeMap::new();
         // Keep reservations alive until all addresses have been chosen.
         let sockets: Vec<_> = (0..n).map(|_| reserve_socket()).collect();
@@ -409,6 +409,7 @@ impl Cluster {
             administrators: BTreeSet::from([client_key.public()]),
             bootstrap_allowed: true,
         };
+        fleet::instances::write(&home.0.join("app-client/config.json"), &config).unwrap();
         let mut replicas = BTreeMap::new();
         for id in 1..=n {
             replicas.insert(
@@ -1534,3 +1535,6 @@ async fn simulation_place(client: &mut Client, job: &str) {
         assert!(!matches!(reply, Reply::Rejected { .. }), "{reply:?}");
     }
 }
+
+#[path = "control/history_state.rs"]
+mod history_state;

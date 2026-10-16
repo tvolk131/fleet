@@ -45,6 +45,7 @@ async fn portable_inputs_and_checkpoint_resume_on_another_worker_without_source_
             Mutation::StoragePolicy {
                 expected_revision: 0,
                 policy: artifact::Policy {
+                    history: Default::default(),
                     inputs: BTreeSet::from(["portable-store".into()]),
                     checkpoints: BTreeSet::from(["portable-store".into()]),
                     outputs: BTreeSet::new()

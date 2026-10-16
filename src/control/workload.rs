@@ -148,6 +148,7 @@ pub struct Report {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerView {
+    pub history: BTreeMap<String, BTreeMap<crate::history::Stream, super::history::Progress>>,
     pub artifacts: Vec<super::artifact::Artifact>,
     pub stores: BTreeMap<String, super::artifact::Registration>,
     pub cleanup_allowed: bool,

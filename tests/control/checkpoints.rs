@@ -221,15 +221,7 @@ async fn verified_checkpoint_survives_vm_deletion_worker_restart_and_leader_loss
     assert_ne!(resumed.execution, original.execution);
     assert_eq!(jobs::list(&home.join("backend")).unwrap().len(), 2);
     for (a, expected) in [(&original, "initial-once\n"), (resumed, "resumed-once\n")] {
-        assert_eq!(
-            std::fs::read_to_string(
-                home.join("backend/jobs")
-                    .join(&a.execution)
-                    .join("stdout.log")
-            )
-            .unwrap(),
-            expected
-        );
+        assert_eq!(stdout(&home, &a.execution), expected);
     }
     let store = fleet::blobs::open(&c.home.0.join("resumed-outputs"))
         .await
@@ -400,6 +392,7 @@ async fn checkpoint_backup_restores_without_worker_payloads_and_retention_preser
             Mutation::StoragePolicy {
                 expected_revision: 0,
                 policy: artifact::Policy {
+                    history: Default::default(),
                     inputs: Default::default(),
                     checkpoints: BTreeSet::from(["backup".into()]),
                     outputs: BTreeSet::from(["backup".into()]),
@@ -816,11 +809,32 @@ async fn upgrade_suspended(source_version: u32) {
     assert_eq!(after.checkpoints, before.checkpoints);
     assert_eq!(after.receipts, before.receipts);
     assert_eq!(after.assignments, before.assignments);
-    assert_eq!(after.storage.artifacts.len(), 1);
+    assert_eq!(
+        after
+            .storage
+            .artifacts
+            .values()
+            .filter(|a| matches!(
+                a.manifest.kind,
+                fleet::control::artifact::Kind::Checkpoint(_)
+            ))
+            .count(),
+        1
+    );
     assert_eq!(c.client.write(request, WAIT).await.unwrap(), reply);
     let mut w = Worker::start(&home, config.clone(), hello()).await.unwrap();
     w.tick().await.unwrap();
-    let artifact = after.storage.artifacts.values().next().unwrap();
+    let artifact = after
+        .storage
+        .artifacts
+        .values()
+        .find(|a| {
+            matches!(
+                a.manifest.kind,
+                fleet::control::artifact::Kind::Checkpoint(_)
+            )
+        })
+        .unwrap();
     let destination = c.home.0.join("upgraded-export");
     fleet::control::artifact_io::fetch_available(
         &c.client.endpoint,
@@ -946,7 +960,13 @@ time.sleep(150)
                 .storage
                 .artifacts
                 .values()
-                .filter(|a| !a.deleted)
+                .filter(|a| {
+                    !a.deleted
+                        && matches!(
+                            a.manifest.kind,
+                            fleet::control::artifact::Kind::Checkpoint(_)
+                        )
+                })
                 .count()
                 == 3
         {

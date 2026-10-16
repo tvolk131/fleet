@@ -65,7 +65,7 @@ async fn progress(
 ) -> u64 {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     loop {
-        let proto::Response::Events { events, last } = data(
+        let proto::Response::Events { events, last, .. } = data(
             c,
             config,
             DataRequest::Events {
@@ -352,7 +352,7 @@ async fn vm_failures_release_capacity_only_after_cleanup() {
                 &c,
                 &config,
                 DataRequest::Logs {
-                    execution: a.execution,
+                    execution: a.execution.clone(),
                     stderr: true,
                     from: 0,
                     max: 10000,
@@ -362,7 +362,19 @@ async fn vm_failures_release_capacity_only_after_cleanup() {
             else {
                 panic!()
             };
-            assert!(data.contains("regular file"), "{data}");
+            let diagnostic = fleet::history::state(
+                &home.join("backend/jobs").join(&a.execution),
+                fleet::history::Stream::Stderr,
+            )
+            .unwrap();
+            assert!(
+                diagnostic
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("regular file"),
+                "{diagnostic:?}; captured stderr: {data}"
+            );
         }
     }
     w.shutdown().await.unwrap();

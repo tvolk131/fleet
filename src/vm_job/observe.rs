@@ -5,7 +5,7 @@ use crate::probes::{self, Origin, Probe, ProbeValue, Reading};
 use std::collections::{BTreeMap, HashMap};
 
 const MAX_PROBES: usize = 32;
-const MAX_SNAPSHOT: u64 = 1 << 20;
+const MAX_SNAPSHOT: u64 = 2 << 20;
 const MAX_TRANSFERRED: u64 = 16 << 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +17,10 @@ enum Sample {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Snapshot {
+    #[serde(default)]
+    history_errors: Vec<String>,
+    #[serde(default)]
+    history: Vec<crate::history::jsonl::Batch>,
     files: Vec<Capture>,
     metrics: Vec<Option<Sample>>,
 }
@@ -101,6 +105,76 @@ fn readings(
 }
 
 impl Runner {
+    /// Cancellation/suspension skips normal output collection. Drain only declared diagnostics,
+    /// bounded to 16 batches and 30 seconds, before stopping the VM. Never replay application work.
+    pub(super) fn terminal_metrics(&mut self) -> Result<()> {
+        if self.job.spec.metric_files.is_empty() {
+            return Ok(());
+        }
+        let marker = self.dir.join("history-terminal.json");
+        if let Some(complete) = jobs::read_json::<bool>(&marker)? {
+            anyhow::ensure!(
+                complete,
+                "previous final metric drain was interrupted or incomplete"
+            );
+            return Ok(());
+        }
+        // A restarted cleanup must not postpone VM deletion indefinitely on unresponsive guest IO.
+        instances::write(&marker, &false)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        for batch_number in 0..16 {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "final metric drain time limit"
+            );
+            let vm = instances::info(&self.home, &self.status.instance)?;
+            anyhow::ensure!(
+                vm.observed.state == State::Running && vm.record.desired == Desired::Running,
+                "VM unavailable for final metrics"
+            );
+            let cursors =
+                crate::history::state(&self.dir, crate::history::Stream::Metrics)?.sources;
+            let mut helper = self.helper(serde_json::json!({"kind":"observe","root":self.guest_root(),"patterns":[],"probes":[],"settle_seconds":0,"final":true,"metric_files":self.job.spec.metric_files,"history_cursors":cursors}));
+            if let guest::Spec::Exec {
+                timeout_seconds, ..
+            } = &mut helper
+            {
+                *timeout_seconds = 5;
+            }
+            let id = format!("history-final-{batch_number}");
+            self.require(&id, helper, None)?;
+            let path = guest::operation_dir(&self.home, &self.status.instance, &id)?.join("stdout");
+            anyhow::ensure!(
+                fs::metadata(&path)?.len() <= MAX_SNAPSHOT,
+                "final metric response too large"
+            );
+            let snapshot: Snapshot = serde_json::from_slice(&fs::read(path)?)?;
+            anyhow::ensure!(
+                snapshot.history.len() <= self.job.spec.metric_files.len(),
+                "too many final metric sources"
+            );
+            anyhow::ensure!(
+                snapshot.history_errors.is_empty(),
+                "{}",
+                snapshot
+                    .history_errors
+                    .into_iter()
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+            let mut complete = true;
+            for batch in snapshot.history {
+                crate::history::jsonl::ingest(&self.dir, &self.job.spec.metric_files, &batch)?;
+                complete &= batch.next == batch.length;
+            }
+            if complete {
+                instances::write(&marker, &true)?;
+                return Ok(());
+            }
+        }
+        anyhow::bail!("final metric drain batch limit")
+    }
     /// Only completed private observation operations are reclaimed. Command/input
     /// operation identities remain for recovery and are never replayed/pruned here.
     fn prune_observations(&self, keep: Option<u64>) -> Result<()> {
@@ -122,11 +196,15 @@ impl Runner {
         Ok(())
     }
     pub(super) fn observe(&mut self, final_pass: bool) -> Result<()> {
-        if self.job.spec.publish.is_empty() && self.job.spec.probes.is_empty() {
+        if self.job.spec.publish.is_empty()
+            && self.job.spec.probes.is_empty()
+            && self.job.spec.metric_files.is_empty()
+        {
             return Ok(());
         }
         let path = self.dir.join("vm-observation.json");
         let mut state: Observation = jobs::read_json(&path)?.unwrap_or_default();
+        let mut final_history_batches = 0;
         // An interrupted live batch is completed before taking the final snapshot.
         loop {
             self.prune_observations(state.pending_final.map(|_| state.generation))?;
@@ -136,15 +214,55 @@ impl Runner {
             }
             let is_final = state.pending_final.unwrap();
             let sample_id = format!("sample-{}", state.generation);
+            let cursors =
+                crate::history::state(&self.dir, crate::history::Stream::Metrics)?.sources;
             let helper = self.helper(serde_json::json!({"kind":"observe", "root":self.guest_root(), "patterns":self.job.spec.publish,
-                "probes":self.job.spec.probes, "settle_seconds":self.job.spec.settle_seconds, "final":is_final}));
+                "probes":self.job.spec.probes, "settle_seconds":self.job.spec.settle_seconds, "final":is_final,
+                "metric_files":self.job.spec.metric_files,"history_cursors":cursors}));
             self.require(&sample_id, helper, None)?;
             let snapshot_path =
                 guest::operation_dir(&self.home, &self.status.instance, &sample_id)?.join("stdout");
             if fs::metadata(&snapshot_path)?.len() > MAX_SNAPSHOT {
-                bail!("guest observation exceeds 1 MiB");
+                bail!("guest observation exceeds 2 MiB");
             }
             let snapshot: Snapshot = serde_json::from_slice(&fs::read(snapshot_path)?)?;
+            let mut history_complete = true;
+            if snapshot.history.len() > self.job.spec.metric_files.len() {
+                let _ = crate::history::record_loss(
+                    &self.dir,
+                    crate::history::Stream::Metrics,
+                    0,
+                    "guest returned too many metric sources",
+                );
+            }
+            for batch in snapshot
+                .history
+                .iter()
+                .take(self.job.spec.metric_files.len())
+            {
+                match crate::history::jsonl::ingest(&self.dir, &self.job.spec.metric_files, batch) {
+                    Ok(()) => history_complete &= batch.next == batch.length,
+                    Err(error) => {
+                        let _ = crate::history::record_loss(
+                            &self.dir,
+                            crate::history::Stream::Metrics,
+                            0,
+                            &format!("JSONL capture: {error}"),
+                        );
+                    }
+                }
+            }
+            for error in snapshot.history_errors.iter().take(4) {
+                let _ = crate::history::record_loss(
+                    &self.dir,
+                    crate::history::Stream::Metrics,
+                    0,
+                    &format!("JSONL: {error}"),
+                );
+            }
+            if is_final {
+                final_history_batches += 1;
+            }
             validate_manifest(&snapshot.files, &self.job.spec.publish)?;
             if snapshot.files.iter().any(|f| {
                 f.version
@@ -248,7 +366,16 @@ impl Runner {
             state.charged.clear();
             instances::write(&path, &state)?;
             self.prune_observations(None)?;
-            if !final_pass || is_final {
+            // Bound finalization latency even if a guest continues modifying its metric files.
+            if is_final && !history_complete && final_history_batches >= 16 {
+                let _ = crate::history::record_loss(
+                    &self.dir,
+                    crate::history::Stream::Metrics,
+                    0,
+                    "JSONL tail not fully captured before bounded VM cleanup",
+                );
+            }
+            if !final_pass || (is_final && (history_complete || final_history_batches >= 16)) {
                 break;
             }
         }
@@ -316,6 +443,8 @@ mod tests {
             Sample::Count(1),
         ] {
             let snapshot = Snapshot {
+                history_errors: vec![],
+                history: vec![],
                 files: vec![],
                 metrics: vec![Some(sample)],
             };
@@ -331,6 +460,8 @@ mod tests {
         }
         assert!(validate(&vec![series; 33]).is_err());
         let snapshot = Snapshot {
+            history_errors: vec![],
+            history: vec![],
             files: vec![],
             metrics: vec![Some(Sample::Count(100001))],
         };

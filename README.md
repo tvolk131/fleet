@@ -74,3 +74,5 @@ Rolling checkpoint retention is opt-in; see [rolling storage](docs/ROLLING_STORA
 
 [Portable Tart jobs](docs/PORTABLE_JOBS.md) provide durable executable/input bundles, explicit runtime
 compatibility and cooperative resume on another worker after confirmed suspension.
+
+Job logs, metrics, attempt selection and their retention are documented in [Durable job history](docs/DURABLE_HISTORY.md). History uses the existing storage role; configure history destinations explicitly for worker-independent reads.

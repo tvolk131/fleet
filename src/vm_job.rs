@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     fs,
-    io::Write,
     os::unix::{
         fs::{OpenOptionsExt, PermissionsExt},
         process::CommandExt,
@@ -309,7 +308,11 @@ impl Runner {
         spec: guest::Spec,
         input: Option<&Path>,
     ) -> Result<guest::Operation> {
-        self.check()?;
+        if id.starts_with("history-final-") {
+            instances::storage::guard(&self.home)?;
+        } else {
+            self.check()?;
+        }
         let vm = instances::info(&self.home, &self.status.instance)?;
         let dir = guest::operation_dir(&self.home, &self.status.instance, id)?;
         if !dir.join("operation.json").exists()
@@ -331,7 +334,11 @@ impl Runner {
         )?;
         let mut last_observation = std::time::Instant::now() - Duration::from_secs(5);
         loop {
-            self.check()?;
+            if id.starts_with("history-final-") {
+                instances::storage::guard(&self.home)?;
+            } else {
+                self.check()?;
+            }
             let op = guest::inspect(&self.home, &self.status.instance, id)?;
             if id == "execute" {
                 self.link_logs(&dir)?;
@@ -490,6 +497,20 @@ impl Runner {
         })
     }
     fn cleanup(&mut self) -> Result<()> {
+        if self
+            .status
+            .outcome
+            .as_ref()
+            .is_some_and(|e| e.reason != EndReason::Exited)
+            && let Err(error) = self.terminal_metrics()
+        {
+            let _ = crate::history::record_loss(
+                &self.dir,
+                crate::history::Stream::Metrics,
+                0,
+                &format!("Final JSONL capture incomplete: {error:#}"),
+            );
+        }
         loop {
             let i = instances::info(&self.home, &self.status.instance)?;
             if i.observed.state == State::Deleted && i.record.desired == Desired::Deleted {
@@ -555,18 +576,18 @@ impl Runner {
             }
         }
         if let Some(error) = &self.status.error {
-            let diagnostic = format!("\nfleet: {error}\n");
-            let path = self.dir.join("stderr.log");
-            let previous = fs::read(&path).unwrap_or_default();
-            if !previous.ends_with(diagnostic.as_bytes()) {
-                let mut file = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .mode(0o600)
-                    .open(path)?;
-                file.write_all(diagnostic.as_bytes())?;
-                file.sync_all()?;
-            }
+            let _ = crate::history::record_loss(
+                &self.dir,
+                crate::history::Stream::Stderr,
+                0,
+                &format!("VM supervisor: {error}"),
+            );
+        }
+        for stream in [
+            crate::history::Stream::Stdout,
+            crate::history::Stream::Stderr,
+        ] {
+            let _ = crate::history::close(&self.dir, stream);
         }
         self.phase(Phase::Finished)?;
         let mut exit = self

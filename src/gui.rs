@@ -48,6 +48,14 @@ struct App {
     error: Option<String>,
     busy: bool,
     selected: Option<String>,
+    selected_attempt: Option<u32>,
+    history_epoch: u64,
+    history_visible: bool,
+    history: Value,
+    history_error: Option<String>,
+    metric_text: String,
+    metric_next: u64,
+    retention_fields: [String; 4],
     log: String,
     stderr: bool,
     log_next: u64,
@@ -67,8 +75,13 @@ enum Message {
     Appearance(Mode),
     DismissNotice,
     Tick,
-    Refreshed(Result<Refresh, String>),
+    Refreshed(Result<Box<Refresh>, String>),
+    HistoryVisible(bool),
     Select(String),
+    SelectAttempt(Option<u32>),
+    RetentionField(usize, String),
+    SaveRetention,
+    PinHistory(String, u64, bool, Option<u64>),
     Stderr(bool),
     JobFile(String),
     Worker(String),
@@ -87,6 +100,11 @@ enum Message {
 }
 #[derive(Debug, Clone)]
 struct Refresh {
+    history_epoch: u64,
+    selected_attempt: Option<u32>,
+    history: Option<Value>,
+    history_error: Option<String>,
+    metric: Option<Value>,
     jobs: Vec<Value>,
     workers: Vec<Value>,
     instances: Vec<Value>,
@@ -112,6 +130,14 @@ impl App {
             error: None,
             busy: false,
             selected: None,
+            selected_attempt: None,
+            history_epoch: 0,
+            history_visible: false,
+            history: Value::Null,
+            history_error: None,
+            metric_text: String::new(),
+            metric_next: 0,
+            retention_fields: ["30".into(), "90".into(), "1024".into(), "128".into()],
             log: String::new(),
             stderr: false,
             log_next: 0,
@@ -154,12 +180,16 @@ impl App {
     }
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::HistoryVisible(value) => self.history_visible = value,
             Message::Appearance(mode) => self.dark = mode == Mode::Dark,
             Message::DismissNotice => self.notice = None,
             Message::Tick if !self.busy => {
                 self.busy = true;
                 let home = self.home.clone();
                 let selected = self.selected.clone();
+                let selected_attempt = self.selected_attempt;
+                let history_epoch = self.history_epoch;
+                let metric_from = self.metric_next;
                 let from = self.log_next;
                 let stderr = self.stderr;
                 let cursors = self.cursors.clone();
@@ -188,12 +218,63 @@ impl App {
                             let storage = c.execute(ApiRequest::Storage).await?;
                             // Pin the log read to the attempt in this queue snapshot. A resume can
                             // commit between these requests; never mix its log with the old offset.
-                            let attempt = jobs
-                                .iter()
-                                .find(|j| j["id"].as_str() == selected.as_deref())
-                                .and_then(|j| j.pointer("/assignment/attempt/number"))
-                                .and_then(Value::as_u64)
-                                .and_then(|n| u32::try_from(n).ok());
+                            let attempt = selected_attempt.or_else(|| {
+                                jobs.iter()
+                                    .find(|j| j["id"].as_str() == selected.as_deref())
+                                    .and_then(|j| j.pointer("/assignment/attempt/number"))
+                                    .and_then(Value::as_u64)
+                                    .and_then(|n| u32::try_from(n).ok())
+                            });
+                            let mut history_error = None;
+                            let history = if let Some(id) = &selected {
+                                match c.execute(ApiRequest::History { id: id.clone() }).await {
+                                    Ok(v) => Some(v),
+                                    Err(e) => {
+                                        history_error = Some(e.to_string());
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            let metric_from = if metric_from == 0 {
+                                history
+                                    .as_ref()
+                                    .and_then(|h| h["attempts"].as_array())
+                                    .and_then(|aa| {
+                                        aa.iter().find(|a| {
+                                            a.pointer("/attempt/number").and_then(Value::as_u64)
+                                                == attempt.map(u64::from)
+                                        })
+                                    })
+                                    .and_then(|a| a["streams"].as_array())
+                                    .and_then(|ss| ss.iter().find(|s| s["stream"] == "metrics"))
+                                    .and_then(|s| s.pointer("/progress/observed"))
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0)
+                                    .saturating_sub(128 << 10)
+                            } else {
+                                metric_from
+                            };
+                            let metric = if let (Some(id), Some(attempt)) = (&selected, attempt) {
+                                match c
+                                    .execute(ApiRequest::Metrics {
+                                        id: id.clone(),
+                                        attempt: Some(attempt),
+                                        from: metric_from,
+                                        max: 65536,
+                                    })
+                                    .await
+                                {
+                                    Ok(v) => Some(v),
+                                    Err(e) => {
+                                        history_error = Some(e.to_string());
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
                             let log = if let (Some(id), Some(attempt)) = (&selected, attempt) {
                                 c.execute(ApiRequest::Logs {
                                     attempt: Some(attempt),
@@ -203,6 +284,9 @@ impl App {
                                     max: 65536,
                                 })
                                 .await
+                                .map_err(|e| {
+                                    history_error = Some(e.to_string());
+                                })
                                 .ok()
                             } else {
                                 None
@@ -228,7 +312,12 @@ impl App {
                                     events.push((worker.into(), v));
                                 }
                             }
-                            Ok::<_, anyhow::Error>(Refresh {
+                            Ok::<_, anyhow::Error>(Box::new(Refresh {
+                                history_epoch,
+                                selected_attempt,
+                                history,
+                                history_error,
+                                metric,
                                 jobs,
                                 workers,
                                 instances,
@@ -237,7 +326,7 @@ impl App {
                                 stderr,
                                 log,
                                 events,
-                            })
+                            }))
                         }
                         .await;
                         c.close().await;
@@ -255,7 +344,20 @@ impl App {
                         let selected_execution = |jobs: &[Value]| {
                             jobs.iter()
                                 .find(|j| j["id"].as_str() == self.selected.as_deref())
-                                .and_then(|j| j.pointer("/assignment/execution"))
+                                .and_then(|j| {
+                                    if let Some(n) = self.selected_attempt {
+                                        j["attempts"]
+                                            .as_array()?
+                                            .iter()
+                                            .find(|a| {
+                                                a.pointer("/attempt/number").and_then(Value::as_u64)
+                                                    == Some(n as u64)
+                                            })?
+                                            .get("execution")
+                                    } else {
+                                        j.pointer("/assignment/execution")
+                                    }
+                                })
                                 .cloned()
                         };
                         let attempt_changed =
@@ -263,6 +365,8 @@ impl App {
                         if attempt_changed {
                             self.log.clear();
                             self.log_next = 0;
+                            self.metric_text.clear();
+                            self.metric_next = 0;
                         }
                         self.jobs = r.jobs;
                         self.workers = r.workers;
@@ -271,8 +375,16 @@ impl App {
                         if !attempt_changed
                             && r.selected == self.selected
                             && r.stderr == self.stderr
+                            && r.selected_attempt == self.selected_attempt
+                            && r.history_epoch == self.history_epoch
                             && let Some(l) = r.log.and_then(|v| v.get("Logs").cloned())
                         {
+                            if let Some(gap) = l.get("gap").filter(|v| !v.is_null()) {
+                                self.log.push_str(&format!(
+                                    "\n[Fleet: history gap {}..{}]\n",
+                                    gap["start"], gap["end"]
+                                ));
+                            }
                             self.log.push_str(l["data"].as_str().unwrap_or(""));
                             self.log_next = l["next"].as_u64().unwrap_or(self.log_next);
                             if self.log.len() > 200000 {
@@ -281,6 +393,55 @@ impl App {
                                     n += 1;
                                 }
                                 self.log.drain(..n);
+                            }
+                        }
+                        if r.selected == self.selected
+                            && r.selected_attempt == self.selected_attempt
+                            && r.history_epoch == self.history_epoch
+                        {
+                            self.history_error = r.history_error;
+                            if let Some(h) = r.history {
+                                if self.history.is_null()
+                                    && let Some(p) = h.pointer("/retention/policy")
+                                {
+                                    self.retention_fields = [
+                                        p["log_days"]
+                                            .as_u64()
+                                            .map(|n| n.to_string())
+                                            .unwrap_or_default(),
+                                        p["metric_days"]
+                                            .as_u64()
+                                            .map(|n| n.to_string())
+                                            .unwrap_or_default(),
+                                        (p["log_bytes"].as_u64().unwrap_or(1 << 30) / (1 << 20))
+                                            .to_string(),
+                                        (p["metric_bytes"].as_u64().unwrap_or(128 << 20)
+                                            / (1 << 20))
+                                            .to_string(),
+                                    ];
+                                }
+                                self.history = h;
+                            }
+                            if !attempt_changed && let Some(m) = r.metric {
+                                if let Some(gap) = m.get("gap").filter(|g| !g.is_null()) {
+                                    self.metric_text.clear();
+                                    self.history_error = Some(format!(
+                                        "Metric history gap {}..{}",
+                                        gap["start"], gap["end"]
+                                    ));
+                                }
+                                self.metric_text.push_str(m["data"].as_str().unwrap_or(""));
+                                self.metric_next = m["next"].as_u64().unwrap_or(self.metric_next);
+                                if self.metric_text.len() > 200000 {
+                                    let mut n = self.metric_text.len() - 200000;
+                                    while !self.metric_text.is_char_boundary(n) {
+                                        n += 1;
+                                    }
+                                    let n = self.metric_text[n..]
+                                        .find('\n')
+                                        .map_or(self.metric_text.len(), |p| n + p + 1);
+                                    self.metric_text.drain(..n);
+                                }
                             }
                         }
                         for (worker, v) in r.events {
@@ -306,11 +467,77 @@ impl App {
                 }
             }
             Message::Select(id) => {
+                self.history_epoch += 1;
                 self.selected = Some(id);
+                self.selected_attempt = None;
+                self.history = Value::Null;
+                self.history_error = None;
+                self.metric_text.clear();
+                self.metric_next = 0;
                 self.log.clear();
                 self.log_next = 0;
             }
+            Message::SelectAttempt(attempt) => {
+                self.history_epoch += 1;
+                self.selected_attempt = attempt;
+                self.log.clear();
+                self.log_next = 0;
+                self.metric_text.clear();
+                self.metric_next = 0;
+            }
+            Message::RetentionField(index, value) => self.retention_fields[index] = value,
+            Message::SaveRetention => {
+                let parsed = (|| -> anyhow::Result<crate::history::Policy> {
+                    let days = |s: &str| -> anyhow::Result<Option<u32>> {
+                        if s.trim().is_empty() {
+                            Ok(None)
+                        } else {
+                            Ok(Some(s.parse()?))
+                        }
+                    };
+                    let bytes = |s: &str| -> anyhow::Result<u64> {
+                        s.parse::<u64>()?
+                            .checked_mul(1 << 20)
+                            .ok_or_else(|| anyhow::anyhow!("size overflow"))
+                    };
+                    let p = crate::history::Policy {
+                        log_days: days(&self.retention_fields[0])?,
+                        metric_days: days(&self.retention_fields[1])?,
+                        log_bytes: bytes(&self.retention_fields[2])?,
+                        metric_bytes: bytes(&self.retention_fields[3])?,
+                    };
+                    p.validate()?;
+                    Ok(p)
+                })();
+                match parsed {
+                    Ok(policy) => {
+                        if let Some(job) = self.selected.clone() {
+                            return self.act(ApiRequest::HistoryRetention {
+                                request_id: id(),
+                                id: job,
+                                expected_revision: self
+                                    .history
+                                    .pointer("/retention/revision")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0),
+                                policy,
+                            });
+                        }
+                    }
+                    Err(e) => self.notice = Some(format!("Invalid retention: {e}")),
+                }
+            }
+            Message::PinHistory(artifact, revision, pinned, expires_at) => {
+                return self.act(ApiRequest::ArtifactRetention {
+                    request_id: id(),
+                    id: artifact,
+                    expected_revision: revision,
+                    pinned,
+                    expires_at,
+                });
+            }
             Message::Stderr(v) => {
+                self.history_epoch += 1;
                 self.stderr = v;
                 self.log.clear();
                 self.log_next = 0;
@@ -382,7 +609,7 @@ impl App {
             Message::Fetch => {
                 if let Some(id) = &self.selected {
                     return self.act(ApiRequest::Fetch {
-                        attempt: None,
+                        attempt: self.selected_attempt,
                         id: id.clone(),
                         destination: PathBuf::from(&self.destination),
                     });
@@ -725,9 +952,158 @@ impl App {
         ]
         .spacing(20);
         if let Some(id) = &self.selected {
-            let logs = column![
-                typography("Job output", TypeScale::TitleLarge),
-                typography(id, TypeScale::BodySmall).style(muted),
+            let mut details = column![
+                typography("Attempt history", TypeScale::TitleMedium),
+                button("Latest attempt")
+                    .variant(ButtonVariant::Text)
+                    .on_press(Message::SelectAttempt(None))
+            ]
+            .spacing(6);
+            let attempts = self.history["attempts"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let chosen = self.selected_attempt.or_else(|| {
+                attempts
+                    .last()
+                    .and_then(|a| a.pointer("/attempt/number"))
+                    .and_then(Value::as_u64)
+                    .map(|n| n as u32)
+            });
+            for attempt in &attempts {
+                let n = attempt
+                    .pointer("/attempt/number")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32;
+                details = details.push(
+                    button(format!(
+                        "Attempt {n} · {}",
+                        attempt["worker"].as_str().unwrap_or("?")
+                    ))
+                    .variant(if chosen == Some(n) {
+                        ButtonVariant::Tonal
+                    } else {
+                        ButtonVariant::Text
+                    })
+                    .size(ButtonSize::Small)
+                    .on_press(Message::SelectAttempt(Some(n))),
+                );
+                if chosen == Some(n) {
+                    if let Some(cp) = attempt
+                        .pointer("/attempt/checkpoint")
+                        .and_then(Value::as_str)
+                    {
+                        details = details.push(typography(
+                            format!("Resumed from checkpoint {cp}"),
+                            TypeScale::BodySmall,
+                        ));
+                    }
+                    for stream in attempt["streams"].as_array().into_iter().flatten() {
+                        let captured = stream
+                            .pointer("/progress/observed")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let dropped = stream
+                            .pointer("/progress/dropped")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        details=details.push(typography(format!("{}: {} bytes retained · {} backed up · {captured} observed · {dropped} dropped",stream["stream"].as_str().unwrap_or("?"),stream["retained_bytes"],stream["backed_up_bytes"]),TypeScale::BodySmall));
+                        if let Some(error) =
+                            stream.pointer("/progress/error").and_then(Value::as_str)
+                        {
+                            details =
+                                details.push(typography(error.to_owned(), TypeScale::BodySmall));
+                        }
+                        for chunk in stream["chunks"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .rev()
+                            .filter(|c| c["deleted"] != true)
+                            .enumerate()
+                            .filter(|(n, c)| *n < 3 || c["pinned"] == true)
+                            .map(|(_, c)| c)
+                        {
+                            let pinned = chunk["pinned"] == true;
+                            details = details.push(
+                                button(format!(
+                                    "{} {}..{}",
+                                    if pinned { "Unpin" } else { "Pin" },
+                                    chunk
+                                        .pointer("/range/History/start")
+                                        .unwrap_or(&Value::Null),
+                                    chunk.pointer("/range/History/end").unwrap_or(&Value::Null)
+                                ))
+                                .variant(ButtonVariant::Text)
+                                .size(ButtonSize::Small)
+                                .disabled(self.acting)
+                                .on_press(Message::PinHistory(
+                                    chunk["id"].as_str().unwrap_or("").into(),
+                                    chunk["revision"].as_u64().unwrap_or(0),
+                                    !pinned,
+                                    chunk["expires_at"].as_u64(),
+                                )),
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some(error) = &self.history_error {
+                details = details.push(typography(
+                    format!("History unavailable: {error}"),
+                    TypeScale::BodySmall,
+                ));
+            }
+            details = details.push(typography(
+                "Recent metric window · use the CLI to page through all retained records",
+                TypeScale::BodySmall,
+            ));
+            for record in self
+                .metric_text
+                .lines()
+                .rev()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .filter(|r| r["kind"] == "jsonl_gap")
+                .take(3)
+            {
+                details = details.push(typography(
+                    format!(
+                        "Metric gap in {} at {}..{}: {}",
+                        record["file"], record["from"], record["next"], record["reason"]
+                    ),
+                    TypeScale::BodySmall,
+                ));
+            }
+            for (name, values) in history_series(&self.metric_text) {
+                details = details
+                    .push(typography(name, TypeScale::LabelLarge))
+                    .push(canvas(Spark(values)).width(Length::Fill).height(60));
+            }
+            details = details.push(typography(
+                "Retention · days after the job finishes; blank keeps indefinitely",
+                TypeScale::BodySmall,
+            ));
+            for (i, label) in [
+                "Log days",
+                "Metric days",
+                "Log limit (MiB)",
+                "Metric limit (MiB)",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                details = details.push(
+                    text_field(label, &self.retention_fields[i])
+                        .on_input(move |v| Message::RetentionField(i, v)),
+                );
+            }
+            details = details.push(
+                button("Save retention")
+                    .variant(ButtonVariant::Tonal)
+                    .disabled(self.acting || self.history.is_null())
+                    .on_press(Message::SaveRetention),
+            );
+            let output = column![
                 segmented_buttons(
                     [Segment::new(false, "stdout"), Segment::new(true, "stderr")],
                     SegmentSelection::Single(Some(self.stderr))
@@ -755,6 +1131,28 @@ impl App {
             ]
             .spacing(12)
             .height(Length::Fill);
+            let logs = column![
+                typography("Job output", TypeScale::TitleLarge),
+                typography(id, TypeScale::BodySmall).style(muted),
+                segmented_buttons(
+                    [
+                        Segment::new(false, "Logs"),
+                        Segment::new(true, "History & metrics")
+                    ],
+                    SegmentSelection::Single(Some(self.history_visible))
+                )
+                .on_change(|s| Message::HistoryVisible(matches!(
+                    s,
+                    SegmentSelection::Single(Some(true))
+                ))),
+            ]
+            .spacing(12)
+            .height(Length::Fill);
+            let logs = if self.history_visible {
+                logs.push(scrollable(details).height(Length::Fill))
+            } else {
+                logs.push(output)
+            };
             body = body.push(
                 surface(logs)
                     .variant(SurfaceVariant::Elevated)
@@ -852,6 +1250,59 @@ fn action_notice(value: &Value) -> String {
     "Outputs fetched and verified.".into()
 }
 
+fn history_series(text: &str) -> BTreeMap<String, Vec<f64>> {
+    let mut result = BTreeMap::<String, Vec<f64>>::new();
+    let mut segments = BTreeMap::<String, u64>::new();
+    for line in text.split_inclusive('\n').filter(|s| s.ends_with('\n')) {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if record["kind"] == "jsonl_gap" {
+            *segments
+                .entry(record["file"].as_str().unwrap_or("metrics").into())
+                .or_default() += 1;
+        }
+        if record["kind"] == "jsonl"
+            && let Some(values) = record["record"].as_object()
+        {
+            for (name, value) in values.iter().take(16) {
+                if let Some(value) = value.as_f64().filter(|v| v.is_finite()) {
+                    let name = format!(
+                        "{} · {} · generation {} · segment {}",
+                        record["file"].as_str().unwrap_or("metrics"),
+                        name,
+                        record["generation"],
+                        segments
+                            .get(record["file"].as_str().unwrap_or("metrics"))
+                            .unwrap_or(&0)
+                    );
+                    if result.contains_key(&name) || result.len() < 64 {
+                        result.entry(name).or_default().push(value);
+                    }
+                }
+            }
+        }
+        if let Ok(probes) =
+            serde_json::from_value::<Vec<crate::probes::ProbeValue>>(record["values"].clone())
+        {
+            for p in probes {
+                let value = match p.reading {
+                    crate::probes::Reading::Number { value, .. } => Some(value),
+                    crate::probes::Reading::Count { count } => Some(count as f64),
+                    crate::probes::Reading::Series { values } => values.last().copied(),
+                    _ => None,
+                };
+                if let Some(v) = value {
+                    result
+                        .entry(format!("{} · sampled", p.name))
+                        .or_default()
+                        .push(v);
+                }
+            }
+        }
+    }
+    result
+}
 fn reading(value: &crate::probes::Reading) -> String {
     use crate::probes::Reading;
     match value {
@@ -1127,7 +1578,12 @@ mod tests {
         app.log_next = 11;
         let mut jobs = app.jobs.clone();
         jobs[0]["assignment"]["execution"] = json!("exec-training-a2");
-        let _ = app.update(Message::Refreshed(Ok(Refresh {
+        let _ = app.update(Message::Refreshed(Ok(Box::new(Refresh {
+            history_epoch: 0,
+            selected_attempt: None,
+            history: None,
+            history_error: None,
+            metric: None,
             jobs,
             workers: vec![],
             instances: vec![],
@@ -1136,7 +1592,7 @@ mod tests {
             stderr: false,
             log: Some(json!({"Logs":{"data":"wrong-offset","next":20}})),
             events: vec![],
-        })));
+        }))));
         assert!(app.log.is_empty());
         assert_eq!(app.log_next, 0);
     }
@@ -1187,10 +1643,69 @@ mod tests {
         );
     }
     #[test]
+    fn attempt_history_renders_and_rejects_a_stale_same_job_response() {
+        let mut app = sample();
+        app.selected = Some("training".into());
+        app.history_visible = true;
+        app.selected_attempt = Some(1);
+        app.history_epoch = 2;
+        app.history = json!({"retention":{"revision":3,"policy":{"log_days":30,"metric_days":90,"log_bytes":1073741824,"metric_bytes":134217728}},"attempts":[
+            {"attempt":{"number":1},"worker":"source","streams":[{"stream":"stdout","retained_bytes":400,"backed_up_bytes":400,"progress":{"observed":400,"dropped":0},"chunks":[{"id":"chunk","revision":1,"range":{"History":{"start":0,"end":400}},"pinned":false,"deleted":false}]}]},
+            {"attempt":{"number":2,"checkpoint":"saved-point"},"worker":"destination","streams":[]} ]});
+        app.metric_text = "{\"kind\":\"jsonl\",\"file\":\"metrics.jsonl\",\"generation\":0,\"record\":{\"loss\":0.5}}\n".into();
+        let mut ui = simulator(&app);
+        ui.click("Attempt 2 · destination").unwrap();
+        assert!(
+            ui.into_messages()
+                .any(|m| matches!(m, Message::SelectAttempt(Some(2))))
+        );
+        for dark in [false, true] {
+            app.dark = dark;
+            let snapshot = simulator(&app).snapshot(&app.theme()).unwrap();
+            if let Some(dir) = std::env::var_os("FLEET_GUI_PREVIEW") {
+                assert!(
+                    snapshot
+                        .matches_image(PathBuf::from(dir).join(if dark {
+                            "history-dark"
+                        } else {
+                            "history-light"
+                        }))
+                        .unwrap()
+                );
+            }
+        }
+        let _ = app.update(Message::Refreshed(Ok(Box::new(Refresh {
+            history_epoch: 1,
+            selected_attempt: Some(1),
+            history: None,
+            history_error: None,
+            metric: Some(json!({"data":"stale-metric","next":1})),
+            jobs: app.jobs.clone(),
+            workers: vec![],
+            instances: vec![],
+            storage: Value::Null,
+            selected: Some("training".into()),
+            stderr: false,
+            log: Some(json!({"Logs":{"data":"stale","next":1}})),
+            events: vec![],
+        }))));
+        assert!(app.log.is_empty());
+        assert!(!app.metric_text.contains("stale"));
+        assert_eq!(
+            history_series(&app.metric_text).values().next().unwrap(),
+            &vec![0.5]
+        );
+    }
+    #[test]
     fn stale_refresh_never_appends_to_a_different_jobs_log() {
         let mut app = sample();
         app.selected = Some("new-job".into());
-        let _ = app.update(Message::Refreshed(Ok(Refresh {
+        let _ = app.update(Message::Refreshed(Ok(Box::new(Refresh {
+            history_epoch: 0,
+            selected_attempt: None,
+            history: None,
+            history_error: None,
+            metric: None,
             jobs: vec![],
             workers: vec![],
             instances: vec![],
@@ -1199,7 +1714,7 @@ mod tests {
             stderr: false,
             log: Some(json!({"Logs":{"data":"wrong job","next":9}})),
             events: vec![],
-        })));
+        }))));
         assert!(app.log.is_empty());
         assert_eq!(app.log_next, 0);
     }

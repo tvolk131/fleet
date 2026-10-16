@@ -278,10 +278,29 @@ pub fn evaluate(
                     pattern, stderr, ..
                 } => {
                     let re = regex::Regex::new(pattern).ok()?;
-                    let text = tail(
-                        &job_dir.join(if *stderr { "stderr.log" } else { "stdout.log" }),
-                        64 * 1024,
-                    )?;
+                    let stream = crate::history::Stream::log(*stderr);
+                    let text = if crate::history::root(job_dir, stream)
+                        .join("state.json")
+                        .exists()
+                    {
+                        let state = crate::history::state(job_dir, stream).ok()?;
+                        let start = state
+                            .blocks
+                            .last()?
+                            .start
+                            .max(state.observed.saturating_sub(64 * 1024));
+                        String::from_utf8_lossy(
+                            &crate::history::read(job_dir, stream, start, 64 * 1024)
+                                .ok()?
+                                .data,
+                        )
+                        .into_owned()
+                    } else {
+                        tail(
+                            &job_dir.join(if *stderr { "stderr.log" } else { "stdout.log" }),
+                            64 * 1024,
+                        )?
+                    };
                     let caps = re.captures_iter(&text).last()?;
                     let m = caps.get(1).or_else(|| caps.get(0))?;
                     Reading::Text {

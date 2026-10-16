@@ -401,6 +401,20 @@ pub fn spawn(raft: Raft, store: Store, presence: Presence) -> tokio::task::JoinH
             let attempt = async {
                 raft.ensure_linearizable().await?;
                 let state = store.state().await?;
+                let now = crate::jobs::now();
+                if !state.history.attempts.is_empty()
+                    && now.saturating_sub(state.history.swept_at) >= 60
+                {
+                    raft.client_write(Command {
+                        principal: "history-maintenance".into(),
+                        request: Request {
+                            origin: state.cluster.clone(),
+                            id: format!("history-sweep-{now}"),
+                            mutation: Mutation::SweepHistory { as_of: now },
+                        },
+                    })
+                    .await?;
+                }
                 let live: BTreeSet<_> = presence
                     .lock()
                     .expect("presence")

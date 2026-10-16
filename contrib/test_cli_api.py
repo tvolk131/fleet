@@ -146,7 +146,16 @@ class ReplicatedFleet(unittest.TestCase):
             tail = self.request(op='logs', id=job, **{'from': first['next']})['Logs']
             self.assertEqual(tail['data'], 'after-restart\n')
             self.assertTrue(tail['done'])
-            self.assertEqual(self.request(op='logs', id=job)['Logs']['data'], 'before-restart\nafter-restart\n')
+            offset, text = 0, ''
+            while True:
+                page = self.request(op='logs', id=job, **{'from': offset})['Logs']
+                self.assertIsNone(page.get('gap'))
+                text += page['data']
+                if page['done']:
+                    break
+                self.assertGreater(page['next'], offset)
+                offset = page['next']
+            self.assertEqual(text, 'before-restart\nafter-restart\n')
             self.assertEqual(len(self.request(op='attempts', id=job)), 1)
         finally:
             gate.write_text('go\n')

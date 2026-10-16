@@ -232,12 +232,16 @@ pub enum Response {
         data: String,
         next: u64,
         done: bool,
+        #[serde(default)]
+        gap: Option<crate::history::Block>,
     },
+    History(crate::history::ReadResult),
     Cancelled,
     Outputs(#[serde(deserialize_with = "lenient")] Vec<OutputFile>),
     Events {
         events: Vec<Event>,
         last: u64,
+        first: u64,
     },
     Plan(crate::suspend::Plan),
     Checkpoint(crate::suspend::Recorded),

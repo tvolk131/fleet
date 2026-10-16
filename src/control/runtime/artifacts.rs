@@ -6,7 +6,7 @@ use crate::control::{
 };
 
 impl Worker {
-    fn artifact_root(&self, manifest: &Manifest) -> Result<PathBuf> {
+    pub(super) fn artifact_root(&self, manifest: &Manifest) -> Result<PathBuf> {
         let restored = self.home.join("restored").join(&manifest.id);
         if restored.exists() || manifest.worker() != Some(self.config.registration.id.as_str()) {
             return Ok(restored);
@@ -18,6 +18,7 @@ impl Worker {
             .context("artifact attempt missing")?;
         let dir = jobs::jobs_dir(&self.home.join("backend")).join(&a.execution);
         Ok(match &manifest.kind {
+            Kind::History { .. } => dir.join("history-archive").join(&manifest.id),
             Kind::FinalOutputs => dir.join("work"),
             Kind::Inputs => anyhow::bail!("input bundle cannot be attempt-owned"),
             Kind::Checkpoint(id) => {
@@ -146,6 +147,7 @@ impl Worker {
                         artifact_io::remove_owned_file(root, &file.path)?;
                     }
                     let tag = match &m.kind {
+                        Kind::History { .. } => format!("artifact/{}/{}", m.id, file.path),
                         Kind::Inputs => format!("artifact/{}/{}", m.id, file.path),
                         Kind::Checkpoint(id) => format!("checkpoint/{id}/{}", file.path),
                         Kind::FinalOutputs => format!(
@@ -195,11 +197,16 @@ impl Worker {
                 .collect(),
             objects: BTreeMap::new(),
         };
-        for m in saved
+        let mut publications: Vec<_> = saved
             .artifacts
             .values()
             .filter(|m| !saved.deleted_artifacts.contains(&m.id))
-        {
+            .collect();
+        publications.sort_by_key(|m| match m.kind {
+            Kind::History { stream, start, .. } => (m.attempt().unwrap_or(""), Some(stream), start),
+            _ => ("", None, 0),
+        });
+        for m in publications {
             let root = self.artifact_root(m)?;
             // Contents are checked again at transfer time; a missing source is immediately visible.
             let present = m.files.iter().all(|f| root.join(&f.path).is_file());
@@ -228,7 +235,7 @@ impl Worker {
                     )
                     .await?;
                 }
-            } else if present && matches!(m.kind, Kind::FinalOutputs) {
+            } else if present && matches!(m.kind, Kind::FinalOutputs | Kind::History { .. }) {
                 let reply = self
                     .client
                     .write(
@@ -243,6 +250,21 @@ impl Worker {
                         Duration::from_secs(2),
                     )
                     .await?;
+                if let Kind::History { stream, .. } = m.kind {
+                    let job_dir = jobs::jobs_dir(&self.home.join("backend")).join(
+                        &saved.assignments[m.attempt().context("history attempt")?].execution,
+                    );
+                    if let Reply::Rejected { reason } = &reply {
+                        crate::history::record_loss(
+                            &job_dir,
+                            stream,
+                            0,
+                            &format!("Archive: {reason}"),
+                        )?;
+                    } else if reply == Reply::Recorded {
+                        crate::history::clear_archive_error(&job_dir, stream)?;
+                    }
+                }
                 ensure!(
                     reply == Reply::Recorded,
                     "artifact source rejected: {reply:?}"
@@ -301,7 +323,12 @@ impl Worker {
             detail,
         };
         let id = format!(
-            "artifact-{}",
+            "{}-{}",
+            if matches!(a.manifest.kind, Kind::History { .. }) {
+                "history-copy"
+            } else {
+                "artifact"
+            },
             blake3::hash(&serde_json::to_vec(&report)?).to_hex()
         );
         self.client

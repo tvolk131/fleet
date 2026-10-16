@@ -36,7 +36,7 @@ fn edit(path: &std::path::Path, table: TableDefinition<&str, &[u8]>, f: impl FnO
         if table.name() == "meta" {
             let mut identity: Value =
                 serde_json::from_slice(t.get("identity").unwrap().unwrap().value()).unwrap();
-            identity[0] = json!(5);
+            identity[0] = value["format"].clone();
             t.insert(
                 "identity",
                 serde_json::to_vec(&identity).unwrap().as_slice(),
@@ -223,5 +223,64 @@ async fn offline_upgrade_preserves_jobs_receipts_backend_ids_and_restarts_from_n
     assert_eq!(old["format"], 5);
     assert!(old["queue"]["old-job"].is_object());
     w.shutdown().await.unwrap();
+    c.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn format_nine_upgrade_preserves_receipts_and_adds_history_defaults_without_inventing_archive()
+ {
+    let mut c = Cluster::new(1).await;
+    let submitted = super::super::submit("legacy-submit", "legacy");
+    let accepted = c.client.write(submitted.clone(), WAIT).await.unwrap();
+    let cancelled = Request {
+        origin: "cluster".into(),
+        id: "legacy-cancel".into(),
+        mutation: Mutation::CancelQueued {
+            id: "legacy".into(),
+            expected_revision: 1,
+        },
+    };
+    c.client.write(cancelled, WAIT).await.unwrap();
+    let before = c.client.read(WAIT).await.unwrap();
+    c.replicas.remove(&1).unwrap().shutdown().await.unwrap();
+    let controller = c.home.0.join("1");
+    edit(
+        &controller.join("control.redb"),
+        TableDefinition::new("meta"),
+        |v| {
+            fn strip(v: &mut Value) {
+                match v {
+                    Value::Object(o) => {
+                        o.remove("history");
+                        o.remove("metric_files");
+                        for v in o.values_mut() {
+                            strip(v);
+                        }
+                    }
+                    Value::Array(a) => {
+                        for v in a {
+                            strip(v);
+                        }
+                    }
+                    _ => (),
+                }
+            }
+            strip(v);
+            v["format"] = json!(9);
+        },
+    );
+    fleet::control::upgrade::run(&controller, &[], &[]).unwrap();
+    assert!(controller.join("control.redb.v9-backup").exists());
+    c.start(1).await;
+    let after = c.client.read(WAIT).await.unwrap();
+    assert_eq!(after.format, fleet::control::FORMAT);
+    assert_eq!(after.jobs, before.jobs);
+    assert!(after.history.attempts.is_empty());
+    assert!(after.storage.artifacts.is_empty());
+    assert_eq!(c.client.write(submitted, WAIT).await.unwrap(), accepted);
+    assert_eq!(
+        after.history_settings("legacy").unwrap().policy,
+        fleet::history::Policy::default()
+    );
     c.close().await;
 }

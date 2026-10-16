@@ -10,6 +10,10 @@ use std::{
     os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -83,16 +87,19 @@ pub fn run(dir: &Path) -> Result<()> {
         .env("FLEET_THREADS", job.spec.threads.to_string())
         .envs(&job.spec.env)
         .stdin(Stdio::null())
-        .stdout(fs::File::create(dir.join("stdout.log"))?)
-        .stderr(fs::File::create(dir.join("stderr.log"))?)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .process_group(0);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
-            fs::write(
-                dir.join("stderr.log"),
-                format!("fleet: could not start {}: {e}\n", program.display()),
-            )?;
+            let _ = crate::history::append(
+                dir,
+                crate::history::Stream::Stderr,
+                format!("fleet: could not start {}: {e}\n", program.display()).as_bytes(),
+            );
+            let _ = crate::history::close(dir, crate::history::Stream::Stderr);
+            let _ = crate::history::close(dir, crate::history::Stream::Stdout);
             return write_json(
                 &dir.join("exit.json"),
                 &Exit {
@@ -103,6 +110,23 @@ pub fn run(dir: &Path) -> Result<()> {
                 },
             );
         }
+    };
+    let capture_stopped = Arc::new(AtomicBool::new(false));
+    let out = child.stdout.take().context("missing child stdout")?;
+    let err = child.stderr.take().context("missing child stderr")?;
+    let capture_out = {
+        let dir = dir.to_owned();
+        let stop = capture_stopped.clone();
+        std::thread::spawn(move || {
+            crate::history::collect(out, &dir, crate::history::Stream::Stdout, stop)
+        })
+    };
+    let capture_err = {
+        let dir = dir.to_owned();
+        let stop = capture_stopped.clone();
+        std::thread::spawn(move || {
+            crate::history::collect(err, &dir, crate::history::Stream::Stderr, stop)
+        })
     };
     let pid = child.id();
     let hold_awake = |pid: u32| {
@@ -207,6 +231,13 @@ pub fn run(dir: &Path) -> Result<()> {
     if let Some(mut c) = awake {
         let _ = c.kill();
         let _ = c.wait();
+    }
+    capture_stopped.store(true, Ordering::Relaxed);
+    for reader in [capture_out, capture_err] {
+        match reader.join() {
+            Ok(Ok(())) => {}
+            other => tracing::warn!(?other, "job log capture incomplete"),
+        }
     }
     let _ = fs::remove_file(dir.join("paused"));
     use std::os::unix::process::ExitStatusExt;

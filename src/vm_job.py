@@ -56,6 +56,42 @@ def values(path, field, points):
         return []
 
 
+def history_batch(path, old, final_pass):
+    absolute = os.path.join(root, path)
+    try:
+        fd = os.open(absolute, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        if final_pass:
+            raise
+        return None
+    with os.fdopen(fd, 'rb') as source:
+        meta = os.fstat(source.fileno())
+        if not stat.S_ISREG(meta.st_mode):
+            raise ValueError('metric source is not a regular file')
+        identity = str(meta.st_dev) + ':' + str(meta.st_ino)
+        reset = identity != old.get('identity', '') or meta.st_size < old.get('offset', 0)
+        start = 0 if reset else old.get('offset', 0)
+        generation = old.get('generation', 0) + int(reset and bool(old.get('identity')))
+        source.seek(start)
+        data = source.read(65536)
+        if not data:
+            return None
+        discarding = old.get('discarding', False) and not reset
+        ends = [i+1 for i, byte in enumerate(data) if byte == 10][:1 if discarding else 256]
+        end = ends[-1] if ends else None
+        skipped = discarding or (end is None and (len(data) == 65536 or final_pass))
+        if end is None and not skipped:
+            return None
+        count = end if end is not None else len(data)
+        try:
+            text = '' if skipped else data[:count].decode('utf-8')
+        except UnicodeDecodeError:
+            skipped, text = True, ''
+        return dict(path=path, identity=identity, generation=generation, **{'from':start},
+                    next=start+count, length=meta.st_size, text=text, skipped=skipped,
+                    discarding=end is None)
+
+
 if spec['kind'] == 'prepare':
     if spec.get('platform'):
         import platform
@@ -106,6 +142,15 @@ elif spec['kind'] in ('manifest', 'observe'):
                 metrics.append({'count': sum(matches(settings['pattern'], path, True) for path, _ in paths)})
             else:
                 metrics.append(None)  # log regex is evaluated on the host's retained logs
-        print(json.dumps({'files': result, 'metrics': metrics}, allow_nan=False))
+        history = []
+        history_errors = []
+        for path in spec.get('metric_files', []):
+            try:
+                batch = history_batch(path, spec.get('history_cursors', {}).get(path, {}), spec.get('final', False))
+                if batch is not None:
+                    history.append(batch)
+            except (OSError, ValueError) as error:
+                history_errors.append((path + ': ' + str(error))[:512])
+        print(json.dumps({'files': result, 'metrics': metrics, 'history': history, 'history_errors': history_errors}, allow_nan=False))
 else:
     raise RuntimeError('unknown job helper operation')

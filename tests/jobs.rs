@@ -91,6 +91,8 @@ async fn setup(name: &str) -> Setup {
 impl Setup {
     fn job(&self, name: &str, argv: &[&str]) -> JobFile {
         JobFile {
+            metric_files: vec![],
+            history: Default::default(),
             checkpoint: None,
             vm: None,
             name: name.into(),
