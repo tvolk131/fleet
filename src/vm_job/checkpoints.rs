@@ -7,13 +7,103 @@ use std::collections::BTreeMap;
 struct Ledger {
     generation: u64,
     transferred: u64,
+    #[serde(default)]
+    window_start: u64,
     charged: BTreeSet<String>,
     captured: BTreeMap<String, Captured>,
 }
 
+impl Ledger {
+    fn renew(&mut self, now: u64) -> bool {
+        if self.charged.is_empty()
+            && (self.window_start == 0 || now.saturating_sub(self.window_start) >= 3600)
+        {
+            self.window_start = now;
+            self.transferred = 0;
+            true
+        } else {
+            false
+        }
+    }
+    fn charge(&mut self, id: &str, size: u64, limit: u64) -> Result<()> {
+        if self.charged.contains(id) {
+            return Ok(());
+        }
+        let transferred = self
+            .transferred
+            .checked_add(size)
+            .context("checkpoint transfer overflow")?;
+        anyhow::ensure!(
+            transferred <= limit,
+            "checkpoint transfer budget exhausted; waiting for the next budget window (non-rolling attempts have a lifetime limit)"
+        );
+        self.transferred = transferred;
+        self.charged.insert(id.into());
+        Ok(())
+    }
+}
+
+struct PendingCapture(PathBuf);
+impl Drop for PendingCapture {
+    fn drop(&mut self) {
+        if self.0.exists() {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
 pub fn captured(dir: &Path) -> Result<Vec<Captured>> {
     let ledger: Ledger = jobs::read_json(&dir.join("vm-checkpoints.json"))?.unwrap_or_default();
-    Ok(ledger.captured.into_values().collect())
+    let mut captures: Vec<_> = ledger.captured.into_values().collect();
+    captures.sort_by_key(|c| (c.captured_at, c.source.clone(), c.id.clone()));
+    Ok(captures)
+}
+
+/// Acknowledged only after authoritative deletion and local payload reclamation. The supervisor
+/// never rewrites this marker; capture identity and path tombstones remain in its own ledger.
+pub fn reclaimed(dir: &Path, id: &str) -> Result<()> {
+    let root = files_dir(dir, id)?
+        .parent()
+        .context("capture parent")?
+        .to_owned();
+    instances::write(&root.join("reclaimed.json"), &true)
+}
+
+fn live<'a>(dir: &Path, ledger: &'a Ledger) -> impl Iterator<Item = &'a Captured> {
+    let root = dir.join("checkpoints");
+    ledger
+        .captured
+        .values()
+        .filter(move |c| !root.join(&c.id).join("reclaimed.json").is_file())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Usage {
+    pub retention: Option<crate::checkpoint::Rolling>,
+    pub live_checkpoints: usize,
+    pub payload_bytes: u64,
+    pub transfer_bytes: u64,
+    pub window_start: u64,
+    pub captures_total: usize,
+    pub blocked: Option<String>,
+}
+
+pub fn usage(dir: &Path) -> Result<Usage> {
+    let ledger: Ledger = jobs::read_json(&dir.join("vm-checkpoints.json"))?.unwrap_or_default();
+    Ok(Usage {
+        retention: jobs::read_json::<jobs::Job>(&dir.join("job.json"))?
+            .and_then(|j| j.spec.checkpoint)
+            .and_then(|p| p.retention),
+        live_checkpoints: live(dir, &ledger).count(),
+        payload_bytes: live(dir, &ledger)
+            .flat_map(|c| &c.files)
+            .map(|f| f.size)
+            .sum(),
+        transfer_bytes: ledger.transferred,
+        window_start: ledger.window_start,
+        captures_total: ledger.captured.len(),
+        blocked: jobs::read_json(&dir.join("checkpoint-error.json"))?,
+    })
 }
 
 pub fn files_dir(dir: &Path, id: &str) -> Result<PathBuf> {
@@ -33,17 +123,15 @@ impl Runner {
         version: Option<String>,
         ledger: &mut Ledger,
     ) -> Result<PathBuf> {
-        if ledger.charged.insert(id.into()) {
-            ledger.transferred = ledger
-                .transferred
-                .checked_add(size)
-                .context("checkpoint transfer overflow")?;
-            anyhow::ensure!(
-                ledger.transferred <= MAX_RETAINED_BYTES,
-                "checkpoint transfer budget exhausted (16 GiB per attempt)"
-            );
-            instances::write(&self.dir.join("vm-checkpoints.json"), ledger)?;
-        }
+        let limit = self
+            .job
+            .spec
+            .checkpoint
+            .as_ref()
+            .and_then(|p| p.retention.as_ref())
+            .map_or(MAX_RETAINED_BYTES, |r| r.transfer_bytes_per_hour);
+        ledger.charge(id, size, limit)?;
+        instances::write(&self.dir.join("vm-checkpoints.json"), ledger)?;
         let op = self.run_operation(
             id,
             guest::Spec::Download {
@@ -70,9 +158,17 @@ impl Runner {
         let Some(policy) = self.job.spec.checkpoint.clone() else {
             return Ok(());
         };
+        let limit = policy
+            .retention
+            .as_ref()
+            .map_or(MAX_CHECKPOINTS, |r| r.max_live_checkpoints);
         anyhow::ensure!(
-            ledger.captured.len() < MAX_CHECKPOINTS,
-            "checkpoint retention limit reached (16 per attempt)"
+            (if policy.retention.is_some() {
+                live(&self.dir, ledger).count()
+            } else {
+                ledger.captured.len()
+            }) < limit,
+            "checkpoint capture slots full; waiting for controller-authorized reclamation (check pins, resume dependencies and backup health)"
         );
         let scan = format!("cp-scan-{}", ledger.generation);
         self.require(&scan, self.helper(serde_json::json!({"kind":"manifest", "root":self.guest_root(), "patterns":[policy.manifests], "final":true})), None)?;
@@ -92,15 +188,18 @@ impl Runner {
                 continue;
             }
             anyhow::ensure!(
-                ledger.captured.len() < MAX_CHECKPOINTS,
-                "checkpoint retention limit reached (16 per attempt)"
+                (if policy.retention.is_some() {
+                    live(&self.dir, ledger).count()
+                } else {
+                    ledger.captured.len()
+                }) < limit,
+                "checkpoint capture slots full; waiting for controller-authorized reclamation (check pins, resume dependencies and backup health)"
             );
             let prefix = format!("cp-{}-{n}", ledger.generation);
             if let Err(e) = self.capture_one(file, &policy, &prefix, ledger) {
                 last_error = Some(e);
-            } else {
-                self.prune_checkpoint_operations(Some(&prefix))?;
             }
+            self.prune_checkpoint_operations(Some(&prefix))?;
         }
         if let Some(e) = last_error {
             return Err(e);
@@ -133,6 +232,29 @@ impl Runner {
         )?;
         let manifest: Manifest = serde_json::from_slice(&fs::read(&manifest_file)?)?;
         manifest.validate()?;
+        let next: u64 = manifest.files.values().map(|f| f.size).sum();
+        let floor = u64::from(instances::Config::load(&self.home)?.min_free_disk_gb) * (1 << 30);
+        anyhow::ensure!(
+            instances::storage::free_bytes(&self.home)?
+                >= floor.saturating_add(next.saturating_mul(3)),
+            "checkpoint capture blocked by worker free disk guard; reclaim storage before retrying"
+        );
+        if let Some(rolling) = &policy.retention {
+            let current: u64 = live(&self.dir, ledger)
+                .flat_map(|c| &c.files)
+                .map(|f| f.size)
+                .sum();
+            // Sealed source + content-addressed cache + transfer/staging headroom. Conservative
+            // even with deduplication/APFS clones; metadata and application-owned guest files are separate.
+            anyhow::ensure!(
+                current
+                    .saturating_add(next)
+                    .saturating_mul(3)
+                    .saturating_add(MAX_MANIFEST)
+                    <= rolling.max_live_bytes,
+                "checkpoint disk budget full; enlarge max_live_bytes or release protected checkpoints; the next checkpoint needs replacement headroom"
+            );
+        }
         let id = manifest.id(&file.path)?;
         let root = self.dir.join("checkpoints");
         let sealed = root.join(&id);
@@ -143,6 +265,7 @@ impl Runner {
             return Ok(());
         }
         let staging = root.join(format!("pending-{id}"));
+        let _staging = PendingCapture(staging.clone());
         fs::create_dir_all(staging.join("files"))?;
         let guest_parent = Path::new(&file.path)
             .parent()
@@ -202,15 +325,16 @@ impl Runner {
         }
         let path = self.dir.join("vm-checkpoints.json");
         let mut ledger: Ledger = jobs::read_json(&path)?.unwrap_or_default();
-        let result = self.checkpoint_batch(&mut ledger);
-        // Read-only captures may retry in a new batch. A sealed checkpoint never changes or replays training.
-        ledger.generation = ledger
-            .generation
-            .checked_add(1)
-            .context("checkpoint generation overflow")?;
-        ledger.charged.clear();
-        instances::write(&path, &ledger)?;
-        self.prune_checkpoint_operations(None)?;
+        if self
+            .job
+            .spec
+            .checkpoint
+            .as_ref()
+            .is_some_and(|p| p.retention.is_some())
+            && ledger.renew(jobs::now())
+        {
+            instances::write(&path, &ledger)?;
+        }
         let root = self.dir.join("checkpoints");
         if root.exists() {
             for entry in fs::read_dir(&root)? {
@@ -222,6 +346,15 @@ impl Runner {
                 }
             }
         }
+        let result = self.checkpoint_batch(&mut ledger);
+        // Read-only captures may retry in a new batch. A sealed checkpoint never changes or replays training.
+        ledger.generation = ledger
+            .generation
+            .checked_add(1)
+            .context("checkpoint generation overflow")?;
+        ledger.charged.clear();
+        instances::write(&path, &ledger)?;
+        self.prune_checkpoint_operations(None)?;
         if let Err(e) = result {
             // An invalid/incomplete checkpoint is never advertised, but need not abort useful training.
             instances::write(
@@ -246,5 +379,35 @@ impl Runner {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn transfer_budget_survives_restart_failed_charges_and_clock_rollback() {
+        let mut ledger = Ledger::default();
+        assert!(ledger.renew(100));
+        ledger.charge("download", 80, 100).unwrap();
+        let mut ledger: Ledger =
+            serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
+        assert!(
+            !ledger.renew(4000),
+            "an interrupted batch retains its original charges"
+        );
+        ledger.charge("download", 80, 100).unwrap();
+        assert_eq!(ledger.transferred, 80);
+        assert!(ledger.charge("too-large", 30, 100).is_err());
+        assert!(!ledger.charged.contains("too-large"));
+        ledger.charged.clear();
+        assert!(
+            !ledger.renew(1),
+            "backward clock steps do not refund budget"
+        );
+        assert!(!ledger.renew(3699));
+        assert!(ledger.renew(3700));
+        ledger.charge("new-window", 100, 100).unwrap();
+        assert!(ledger.charge("over-budget", 1, 100).is_err());
     }
 }

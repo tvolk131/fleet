@@ -30,7 +30,7 @@ use super::discovery::save_cache;
 use super::membership::{MembershipView, spawn_reconciler};
 use super::{Command, FORMAT, Raft, Reply, Request, State, Store, TypeConfig, store::MAX_SNAPSHOT};
 
-pub const ALPN: &[u8] = b"fleet/control/7";
+pub const ALPN: &[u8] = b"fleet/control/8";
 const MAX_FRAME: usize = 8 << 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

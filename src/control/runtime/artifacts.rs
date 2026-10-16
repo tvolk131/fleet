@@ -215,6 +215,7 @@ impl Worker {
             }
         }
         *self.artifact_access.write().expect("artifact access") = access;
+        self.reclaim_and_report_storage().await?;
         Ok(())
     }
     async fn capture_final_outputs(&self, a: &Assignment) -> Result<Option<Manifest>> {
@@ -313,16 +314,13 @@ impl Worker {
         if artifact_io::verify(&local, &manifest).is_ok() {
             for file in &cp.content.files {
                 cp.content.verify_file(&local, file)?;
-                let imported = self
-                    .store
-                    .blobs()
-                    .add_path(local.join(&file.path))
-                    .with_named_tag(format!("checkpoint/{id}/{}", file.path))
-                    .await?;
-                ensure!(
-                    imported.hash == file.hash,
-                    "local checkpoint import mismatch"
-                );
+                blobs::import_named(
+                    &self.store,
+                    &local.join(&file.path),
+                    file.hash,
+                    format!("checkpoint/{id}/{}", file.path),
+                )
+                .await?;
             }
             self.store.sync_db().await?;
             return Ok(());
@@ -393,13 +391,13 @@ impl Worker {
         }
         for file in &cp.content.files {
             cp.content.verify_file(&destination, file)?;
-            let tag = self
-                .store
-                .blobs()
-                .add_path(destination.join(&file.path))
-                .with_named_tag(format!("checkpoint/{id}/{}", file.path))
-                .await?;
-            ensure!(tag.hash == file.hash, "restored checkpoint import mismatch");
+            blobs::import_named(
+                &self.store,
+                &destination.join(&file.path),
+                file.hash,
+                format!("checkpoint/{id}/{}", file.path),
+            )
+            .await?;
         }
         self.store.sync_db().await?;
         Ok(())

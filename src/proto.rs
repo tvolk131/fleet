@@ -216,6 +216,7 @@ pub const MAX_LOG_CHUNK: u32 = 512 * 1024;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum Response {
+    StorageReport(Value),
     InstanceGuest(crate::instances::guest::Response),
     Instances(Vec<crate::instances::Info>),
     Instance(crate::instances::Info),

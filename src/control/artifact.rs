@@ -147,6 +147,8 @@ impl Default for Copy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Artifact {
+    #[serde(default)]
+    pub ordinal: u64,
     pub manifest: Manifest,
     pub revision: u64,
     pub pinned: bool,
@@ -163,6 +165,8 @@ pub struct Policy {
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Catalog {
+    #[serde(default)]
+    pub next_ordinal: u64,
     #[serde(default)]
     pub cleanup_reviewed: Option<String>,
     #[serde(default)]
@@ -353,6 +357,10 @@ impl State {
         Reply::Recorded
     }
     pub(crate) fn register_artifact(&mut self, manifest: Manifest) {
+        if self.storage.artifacts.contains_key(&manifest.id) {
+            return;
+        }
+        self.storage.next_ordinal += 1;
         let targets = match manifest.kind {
             Kind::Checkpoint(_) => self.storage.policy.checkpoints.clone(),
             Kind::FinalOutputs => self.storage.policy.outputs.clone(),
@@ -376,6 +384,7 @@ impl State {
             .artifacts
             .entry(manifest.id.clone())
             .or_insert(Artifact {
+                ordinal: self.storage.next_ordinal,
                 manifest,
                 revision: 1,
                 pinned: false,
@@ -463,17 +472,7 @@ impl State {
         let Some(a) = self.storage.artifacts.get(id) else {
             return false;
         };
-        if a.pinned {
-            return true;
-        }
-        let Kind::Checkpoint(checkpoint) = &a.manifest.kind else {
-            return false;
-        };
-        self.jobs.values().filter(|j| !j.phase.terminal()).any(|j| {
-            j.resume_from.as_ref() == Some(checkpoint)
-                || super::client::latest_checkpoint(self, &j.id)
-                    .is_some_and(|c| c.id == *checkpoint)
-        })
+        !self.artifact_protection(a).is_empty()
     }
     pub fn artifact_retention(
         &mut self,

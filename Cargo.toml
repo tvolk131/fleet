@@ -7,6 +7,7 @@ default-run = "fleet"
 [dependencies]
 anyhow = "1.0.104"
 blake3 = "1.8.7"
+futures-lite = "2.6.1"
 clap = { version = "4.6.7", features = ["derive"] }
 # The GUI draws on the GPU (wgpu: Metal on macOS, Vulkan on Linux), and on the CPU (tiny-skia) where no GPU adapter
 # is usable; `ICED_BACKEND=tiny-skia` forces the CPU.

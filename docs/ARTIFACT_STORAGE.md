@@ -109,7 +109,7 @@ VM disks, live logs, and metric streams are not backed up by this artifact polic
 
 ## Retention and cleanup
 
-Artifacts are retained indefinitely until explicitly deleted or given an expiry. A pin protects an
+By default artifacts are retained indefinitely until explicitly deleted or given an expiry. Jobs can opt into [rolling checkpoint retention](ROLLING_STORAGE.md); final outputs retain their separate policy. A pin protects an
 artifact regardless of expiry. The selected resume checkpoint and latest checkpoint of an unfinished
 logical job are also protected. Unpinning cannot bypass those dependencies.
 
@@ -129,11 +129,12 @@ pending until they return. Deletion is irreversible through Fleet. Source report
 artifact. Job/attempt histories, checkpoint descriptors, request receipts, and deletion records remain.
 
 Cleanup removes retained storage objects, registered source checkpoint/final-output files, restored
-checkpoint files, and their named blob tags. It does **not** erase job directories, logs, initial-input
-spools, VM image caches, or the worker's shared content-addressed cache. Unreferenced blob-cache bytes
-are not automatically vacuumed in this milestone; account for that cache separately. Deleting an
-artifact is not a promise to erase every historical copy of its bytes from the host or external exports.
-The cumulative per-attempt checkpoint capture limit is not reset by deletion.
+checkpoint files, and their named blob tags. The worker then collects only eligible cache hashes from
+committed artifact tombstones. Other retained artifacts, active resume inputs, original input reservations
+and in-flight imports protect shared hashes. Unknown cache entries are retained. Cleanup does **not**
+erase job directories, logs, initial-input spools or VM image caches. Artifact deletion is not a promise
+to erase every historical copy from the host or external exports. Rolling jobs release capture slots
+after local reclamation; the default cumulative per-attempt limit is not reset by deletion.
 
 ## Emergency control-plane recovery
 
@@ -166,15 +167,15 @@ The normal `fleet api` interface exposes `storage`, `artifacts`, `enroll_storage
 `review_storage_recovery`. Mutations require an explicit request ID and applicable revision/fingerprint.
 Use `retry` after an unknown mutation outcome; do not invent a new request ID to bypass uncertainty.
 
-The protocol/metadata format is 7. Mixed versions are refused. The explicit offline singleton upgrade
-accepts idle format 5 or 6; format 6 may include suspended jobs. It preserves checkpoint metadata and
+The protocol/metadata format is 8. Mixed versions are refused. The explicit offline singleton upgrade
+accepts idle format 5, 6 or 7; formats 6 and 7 may include suspended jobs. It preserves checkpoint metadata and
 receipts, registers existing checkpoints as source artifacts, and creates versioned backups. It refuses
 recovery-bound old-format installations pending a separately reviewed migration. See
-[the upgrade procedure](CHECKPOINT_JOBS.md#explicit-format-56-upgrade).
+[the upgrade procedure](CHECKPOINT_JOBS.md#explicit-format-567-upgrade).
 
 Rust qualification covers three-replica checkpoint backup/export/resume with the original worker payloads
 and blob cache unavailable, leader loss, immutable attempt history, pins/expiry/cleanup, quotas,
-authentication, interrupted staging, corruption/peer repair, signed recovery/review, and format-6 upgrade.
+authentication, interrupted staging, corruption/peer repair, signed recovery/review, and format-6/7 upgrade.
 The JSON CLI/service scenario is also run in CI on Linux and macOS:
 
 ```sh
@@ -186,3 +187,5 @@ Omit `--fake` and supply `--instances` and `--image-cache` to qualify with real 
 backup fixture uses the built-in input-free canary. It checks installed work is idle and verifies its
 records are unchanged. Separate homes/processes on one M4 qualify the recovery protocol, **not survival
 of physical M4 loss**. That final failure domain still requires a second machine.
+
+See [rolling checkpoint storage](ROLLING_STORAGE.md) for opt-in automatic retention, cache reclamation and timestamped storage visibility.

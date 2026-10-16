@@ -78,10 +78,12 @@ and atomically rename the manifest. Never modify a published directory or reuse 
 Fleet verifies the exact declared bytes; it cannot determine whether the application saved enough state.
 
 Each manifest permits 1–128 files, at most 1 GiB per file and 4 GiB total, with a 64 KiB manifest limit.
-Capture is bounded to 16 checkpoints and 16 GiB of cumulative transfer per attempt. Failed captures also
+Opt in to [rolling retention](ROLLING_STORAGE.md) for renewable capture budgets, automatic retirement of older checkpoints, pins and storage visibility.
+
+By default, capture is bounded to 16 checkpoints and 16 GiB of cumulative transfer per attempt. Failed captures also
 consume transfer budget; publish only complete points, at a useful cadence. Invalid/incomplete manifests
 are not advertised and do not abort training or block a later valid manifest. Capture errors appear in
-the assignment observation. Retained captures stop growing at the limit; automatic rotation is future work.
+the worker storage report (`fleet storage status`). Without a rolling policy, retained captures stop growing at the limit.
 The combined original and checkpoint inputs must also fit the existing VM job input limits.
 
 ## Client workflow
@@ -135,12 +137,12 @@ after confirmed deletion; host checkpoint storage is retained separately and is 
 with explicit artifact retention/pinning and safe cleanup available through the storage catalog.
 Tart networking and VM isolation are unchanged.
 
-## Explicit format-5/6 upgrade
+## Explicit format-5/6/7 upgrade
 
-The model uses control-plane/worker format 7. Mixed-version operation is rejected. Fresh homes need no
-migration. For an existing format-5 or format-6 installation:
+The model uses control-plane/worker format 8. Mixed-version operation is rejected. Fresh homes need no
+migration. For an existing format-5, format-6 or format-7 installation:
 
-1. Finish or cancel queued/active jobs and stop or delete persistent VMs. Format 6 can also retain suspended jobs. Do not upgrade under training.
+1. Finish or cancel queued/active jobs and stop or delete persistent VMs. Formats 6 and 7 can also retain suspended jobs. Do not upgrade under training.
 2. If needed, cooperatively shrink to a single voter using the old binary and let it settle.
 3. Stop controller, worker, and client-staging services. Preserve old binaries and service definitions.
 4. Run the new binary offline, listing all applicable worker and client homes:
@@ -154,14 +156,14 @@ migration. For an existing format-5 or format-6 installation:
    replicas to grow back to three. Never start an old replica against the upgraded cluster.
 
 The command locks and validates every selected database before writing, backs up each changed file with
-`.v5-backup` or `.v6-backup` (a unique suffix prevents overwriting an earlier backup), and converts it transactionally.
+`.v5-backup`, `.v6-backup` or `.v7-backup` (a unique suffix prevents overwriting an earlier backup), and converts it transactionally.
 It preserves cluster identity, applied log boundary, votes/membership, receipts, backend execution IDs,
 and completed job history. Each old job's existing assignment becomes its first attempt. A current-format snapshot
 replaces the compacted historical log; original raw log bytes remain in the backup. Repeating the command
 skips already-converted databases, allowing recovery from interruption between database commits.
 
 It refuses active/uncertain work, unapplied log suffixes, mixed cluster identities, nonempty prototype
-job databases, pending membership operations, and format-5/6 installations bound to emergency recovery
+job databases, pending membership operations, and format-5/6/7 installations bound to emergency recovery
 history. Those need a separately reviewed migration, not an override. Historical released receipt
 tombstones remain non-executable; a transformed old request may report a fingerprint conflict rather
 than an expired receipt. Full retained receipts and saved requests are rehashed for the typed commands.

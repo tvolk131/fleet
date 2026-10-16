@@ -63,6 +63,21 @@ class ReplicatedFleet(unittest.TestCase):
         cls.start('worker')
         cls.request = staticmethod(partial(api_result, BIN, cls.home))
 
+    def test_storage_reports_are_timestamped_and_offline_is_explicit(self):
+        status = wait_for(lambda: self.request(op='storage'), lambda s: any(
+            w['worker'] == 'canary' and w['report'] for w in s['workers']))
+        report = next(w['report'] for w in status['workers'] if w['worker'] == 'canary')
+        self.assertGreater(report['observed_at'], 0)
+        self.assertIn('blob_payload_bytes', report)
+        self.assertIn('retention', status)
+        self.stop('worker')
+        try:
+            offline = self.request(op='storage')['workers'][0]
+            self.assertIsNone(offline['report'])
+            self.assertTrue(offline['error'])
+        finally:
+            self.start('worker')
+
     @classmethod
     def tearDownClass(cls):
         try:

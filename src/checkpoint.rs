@@ -19,10 +19,51 @@ pub struct Policy {
     pub manifests: String,
     /// No shell expansion. {checkpoint} is the staged directory; {attempt} is the new attempt number.
     pub resume_argv: Vec<String>,
+    /// Explicit opt-in. Without this, the original bounded, non-deleting capture policy applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<Rolling>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Rolling {
+    /// Newest committed checkpoints per logical job. Pins and resume dependencies are additional.
+    pub keep_last: usize,
+    /// Sealed captures per attempt, including uncommitted and protected captures.
+    pub max_live_checkpoints: usize,
+    /// Payload bytes in sealed captures plus the next capture, per attempt.
+    pub max_live_bytes: u64,
+    /// All downloaded checkpoint bytes, including failed captures, in a durable one-hour window.
+    pub transfer_bytes_per_hour: u64,
+}
+
+impl Rolling {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=128).contains(&self.keep_last),
+            "keep_last must be 1 to 128"
+        );
+        ensure!(
+            self.max_live_checkpoints > self.keep_last && self.max_live_checkpoints <= 256,
+            "max_live_checkpoints must exceed keep_last and be at most 256 (replacement headroom)"
+        );
+        ensure!(
+            self.max_live_bytes >= MAX_MANIFEST && self.max_live_bytes <= 1 << 40,
+            "max_live_bytes must be 64 KiB to 1 TiB"
+        );
+        ensure!(
+            self.transfer_bytes_per_hour >= MAX_MANIFEST && self.transfer_bytes_per_hour <= 1 << 40,
+            "transfer_bytes_per_hour must be 64 KiB to 1 TiB"
+        );
+        Ok(())
+    }
 }
 
 impl Policy {
     pub fn validate(&self) -> Result<()> {
+        if let Some(retention) = &self.retention {
+            retention.validate()?;
+        }
         canonical(&self.manifests.replace('*', "x"))?;
         ensure!(
             !self.manifests.starts_with(&format!("{INPUT_ROOT}/")),

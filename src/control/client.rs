@@ -532,8 +532,42 @@ impl AppClient {
         match &api {
             ApiRequest::Storage => {
                 let state = self.read().await?;
+                let mut workers = Vec::new();
+                for w in state.workers.values() {
+                    let report = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        super::runtime::data_call(
+                            &self.transport.endpoint,
+                            &state.cluster,
+                            &w.peer,
+                            DataRequest::Storage,
+                        ),
+                    )
+                    .await;
+                    workers.push(match report {
+                        Ok(Ok(crate::proto::Response::StorageReport(report))) => {
+                            json!({"worker":w.id,"report":report,"error":null})
+                        }
+                        other => json!({"worker":w.id,"report":null,"error":format!("{other:?}")}),
+                    });
+                }
+                let mut storage_reports = Vec::new();
+                for store in state.storage.stores.values() {
+                    let report = super::storage_status::read(
+                        &self.transport.endpoint,
+                        &store.peer,
+                        &state.cluster,
+                    )
+                    .await;
+                    storage_reports.push(match report {
+                        Ok(report) => json!({"storage":store.id,"report":report,"error":null}),
+                        Err(error) => {
+                            json!({"storage":store.id,"report":null,"error":error.to_string()})
+                        }
+                    });
+                }
                 Ok(
-                    json!({"stores":state.storage.stores,"policy":state.storage.policy,"revision":state.storage.policy_revision,"catalog_fingerprint":state.artifact_catalog_fingerprint(),"cleanup_allowed":state.artifact_cleanup_allowed(None),"quarantined_locations":state.storage.quarantined_locations}),
+                    json!({"storage_reports":storage_reports,"workers":workers,"retention":state.retention_plan(),"stores":state.storage.stores,"policy":state.storage.policy,"revision":state.storage.policy_revision,"catalog_fingerprint":state.artifact_catalog_fingerprint(),"cleanup_allowed":state.artifact_cleanup_allowed(None),"quarantined_locations":state.storage.quarantined_locations}),
                 )
             }
             ApiRequest::Artifacts { attempt } => {
@@ -839,15 +873,23 @@ pub fn latest_checkpoint<'a>(
 ) -> Option<&'a super::checkpoint::Checkpoint> {
     let a = state.current_attempt(job)?;
     state
-        .checkpoints
+        .storage
+        .artifacts
         .values()
-        .filter(|c| c.attempt.as_ref() == a.id && !state.checkpoint_deleted(&c.id))
-        .max_by_key(|c| {
+        .filter(|artifact| !artifact.deleted && artifact.manifest.attempt == a.id)
+        .filter_map(|artifact| match &artifact.manifest.kind {
+            super::artifact::Kind::Checkpoint(id) => {
+                state.checkpoints.get(id).map(|c| (artifact.ordinal, c))
+            }
+            _ => None,
+        })
+        .max_by_key(|(ordinal, c)| {
             (
+                *ordinal,
                 c.content.captured_at,
-                c.content.manifest.position,
-                c.content.source.clone(),
-                c.id.clone(),
+                c.content.source.as_str(),
+                c.id.as_str(),
             )
         })
+        .map(|(_, c)| c)
 }

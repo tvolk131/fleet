@@ -44,6 +44,7 @@ struct App {
     jobs: Vec<Value>,
     workers: Vec<Value>,
     instances: Vec<Value>,
+    storage: Value,
     error: Option<String>,
     busy: bool,
     selected: Option<String>,
@@ -89,6 +90,7 @@ struct Refresh {
     jobs: Vec<Value>,
     workers: Vec<Value>,
     instances: Vec<Value>,
+    storage: Value,
     selected: Option<String>,
     stderr: bool,
     log: Option<Value>,
@@ -106,6 +108,7 @@ impl App {
             jobs: vec![],
             workers: vec![],
             instances: vec![],
+            storage: Value::Null,
             error: None,
             busy: false,
             selected: None,
@@ -182,6 +185,7 @@ impl App {
                                 .as_array()
                                 .cloned()
                                 .unwrap_or_default();
+                            let storage = c.execute(ApiRequest::Storage).await?;
                             // Pin the log read to the attempt in this queue snapshot. A resume can
                             // commit between these requests; never mix its log with the old offset.
                             let attempt = jobs
@@ -228,6 +232,7 @@ impl App {
                                 jobs,
                                 workers,
                                 instances,
+                                storage,
                                 selected,
                                 stderr,
                                 log,
@@ -262,6 +267,7 @@ impl App {
                         self.jobs = r.jobs;
                         self.workers = r.workers;
                         self.instances = r.instances;
+                        self.storage = r.storage;
                         if !attempt_changed
                             && r.selected == self.selected
                             && r.stderr == self.stderr
@@ -717,6 +723,17 @@ impl App {
             );
         }
         page = page.push(body.height(Length::Fill));
+        if !self.storage.is_null() {
+            let mut storage = column![typography("Storage", TypeScale::TitleMedium)].spacing(6);
+            for line in storage_lines(&self.storage) {
+                storage = storage.push(typography(line, TypeScale::BodySmall));
+            }
+            page = page.push(
+                surface(scrollable(storage).height(150))
+                    .variant(SurfaceVariant::Outlined)
+                    .padding(12),
+            );
+        }
         if !self.instances.is_empty() {
             let mut vms = column![typography("Persistent VMs", TypeScale::TitleLarge)].spacing(8);
             for vm in &self.instances {
@@ -862,6 +879,77 @@ impl<Message> canvas::Program<Message, Theme> for Spark {
     }
 }
 
+fn storage_lines(storage: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    for location in storage["storage_reports"].as_array().into_iter().flatten() {
+        let id = location["storage"].as_str().unwrap_or("unknown");
+        let r = &location["report"];
+        if r.is_null() {
+            lines.push(format!("Backup {id}: storage report unavailable"));
+            continue;
+        }
+        lines.push(format!("Backup {id}: {} file bytes · {} physically allocated · {} capacity · {} staging bytes · observed {}s ago",
+            r["objects"]["file_bytes"],r["objects"]["allocated_bytes"],r["capacity_bytes"],r["staging"]["file_bytes"],
+            crate::jobs::now().saturating_sub(r["observed_at"].as_u64().unwrap_or(0))));
+    }
+    if storage["cleanup_allowed"] == false {
+        lines.push("Cleanup held: recovery review required".into());
+    }
+    for worker in storage["workers"].as_array().into_iter().flatten() {
+        let name = worker["worker"].as_str().unwrap_or("unknown");
+        let r = &worker["report"];
+        if r.is_null() {
+            lines.push(format!("{name}: storage report unavailable"));
+            continue;
+        }
+        let age = crate::jobs::now().saturating_sub(r["observed_at"].as_u64().unwrap_or(0));
+        lines.push(format!(
+            "{name}: cache {} bytes · eligible for reclamation {} bytes · observed {age}s ago",
+            r["blob_payload_bytes"], r["reclaimable_blob_bytes"]
+        ));
+        for (id, capture) in r["checkpoints"].as_object().into_iter().flatten() {
+            lines.push(format!("{id}: {} retained checkpoints / {} captured · {} payload bytes · {} transfer bytes in budget window{}",
+                capture["live_checkpoints"], capture["captures_total"], capture["payload_bytes"], capture["transfer_bytes"],
+                capture["blocked"].as_str().map(|s| format!(" · Blocked: {s}")).unwrap_or_default()));
+            if let Some(policy) = capture.get("retention").filter(|p| !p.is_null()) {
+                lines.push(format!("Keep latest {} plus protected checkpoints · {} capture slots · {} bytes capture budget · {} bytes/hour transfer budget",
+                    policy["keep_last"],policy["max_live_checkpoints"],policy["max_live_bytes"],policy["transfer_bytes_per_hour"]));
+            }
+        }
+    }
+    for decision in storage["retention"].as_array().into_iter().flatten() {
+        if decision["deleted"] == true
+            && decision["copy_problems"]
+                .as_array()
+                .is_some_and(|p| p.is_empty())
+        {
+            continue;
+        }
+        let artifact = decision["artifact"].as_str().unwrap_or("");
+        let reasons = decision["reasons"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!(
+            "{} · {} bytes · {reasons}",
+            &artifact[..artifact.len().min(12)],
+            decision["bytes"]
+        ));
+        for problem in decision["copy_problems"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            lines.push(problem.to_owned());
+        }
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -971,6 +1059,7 @@ mod tests {
             jobs,
             workers: vec![],
             instances: vec![],
+            storage: Value::Null,
             selected: Some("training".into()),
             stderr: false,
             log: Some(json!({"Logs":{"data":"wrong-offset","next":20}})),
@@ -978,6 +1067,30 @@ mod tests {
         })));
         assert!(app.log.is_empty());
         assert_eq!(app.log_next, 0);
+    }
+    #[test]
+    fn storage_dashboard_renders_budgets_and_unavailable_locations() {
+        let mut app = sample();
+        app.storage = json!({"cleanup_allowed":true,"workers":[
+            {"worker":"m4","report":{"observed_at":crate::jobs::now(),"blob_payload_bytes":131072,
+            "reclaimable_blob_bytes":65536,"checkpoints":{"training-a1":{"live_checkpoints":2,
+            "captures_total":24,"payload_bytes":131072,"transfer_bytes":1576335,"blocked":null}}}},
+            {"worker":"remote","report":null}],"retention":[{"artifact":"research-checkpoint","bytes":65536,"reasons":["pinned"]}]});
+        for dark in [false, true] {
+            app.dark = dark;
+            let snapshot = simulator(&app).snapshot(&app.theme()).unwrap();
+            if let Some(dir) = std::env::var_os("FLEET_GUI_PREVIEW") {
+                assert!(
+                    snapshot
+                        .matches_image(PathBuf::from(dir).join(if dark {
+                            "storage-dark"
+                        } else {
+                            "storage-light"
+                        }))
+                        .unwrap()
+                );
+            }
+        }
     }
     fn simulator(app: &App) -> iced_test::Simulator<'_, Message, Theme> {
         iced_test::Simulator::with_size(
@@ -1009,6 +1122,7 @@ mod tests {
             jobs: vec![],
             workers: vec![],
             instances: vec![],
+            storage: Value::Null,
             selected: Some("old-job".into()),
             stderr: false,
             log: Some(json!({"Logs":{"data":"wrong job","next":9}})),
@@ -1016,5 +1130,34 @@ mod tests {
         })));
         assert!(app.log.is_empty());
         assert_eq!(app.log_next, 0);
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn storage_shows_unavailability_blockage_retention_and_report_age() {
+        let lines = storage_lines(&json!({"cleanup_allowed":false,"workers":[
+            {"worker":"offline","report":null},
+            {"worker":"worker","report":{"observed_at":0,"blob_payload_bytes":123,
+            "reclaimable_blob_bytes":12,"checkpoints":{"attempt":{"live_checkpoints":3,
+            "captures_total":29,"payload_bytes":90,"transfer_bytes":300,"blocked":"pin pressure"}}}}
+        ],"retention":[{"artifact":"abc","bytes":30,"reasons":["pinned"]}]}))
+        .join("\n");
+        for label in [
+            "recovery review",
+            "offline: storage report unavailable",
+            "123 bytes",
+            "12 bytes",
+            "observed",
+            "3 retained",
+            "29 captured",
+            "Blocked: pin pressure",
+            "pinned",
+        ] {
+            assert!(lines.contains(label), "missing {label}: {lines}");
+        }
     }
 }

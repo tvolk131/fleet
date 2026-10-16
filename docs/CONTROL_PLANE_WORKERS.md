@@ -182,7 +182,7 @@ VM jobs, captures live metrics/files, kills a replica leader and worker, cancels
 deletes a persistent instance. It cleans up only its own resources. It does not reserve capacity through a
 second coordinator; run it only with the physical machine idle and no legacy queue waiting to start.
 
-The normal queue uses storage/protocol format **7** (`fleet/control/7`); the read-only data ALPN is
-`fleet/worker-data/1`. Use fresh homes or the [explicit idle format-5/6 upgrade](CHECKPOINT_JOBS.md#explicit-format-56-upgrade).
+The normal queue uses storage/protocol format **8** (`fleet/control/8`); the read-only data ALPN is
+`fleet/worker-data/1`. Use fresh homes or the [explicit idle format-5/6/7 upgrade](CHECKPOINT_JOBS.md#explicit-format-567-upgrade).
 There is no format-1/2/3 importer, automatic worker adoption, or mixed-release rollout. Physical
 power-failure qualification remains separate from the process-failure tests.

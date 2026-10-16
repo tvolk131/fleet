@@ -12,9 +12,11 @@ pub mod model;
 pub mod network;
 pub mod queue;
 pub mod recovery;
+mod retention;
 pub mod runtime;
 pub mod service;
 pub mod storage;
+mod storage_status;
 pub mod store;
 pub mod upgrade;
 pub mod workload;
@@ -34,4 +36,4 @@ openraft::declare_raft_types!(
 
 pub type Raft = openraft::Raft<TypeConfig>;
 pub type Entry = openraft::Entry<TypeConfig>;
-pub const FORMAT: u32 = 7;
+pub const FORMAT: u32 = 8;
