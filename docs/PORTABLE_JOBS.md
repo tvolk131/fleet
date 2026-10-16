@@ -146,8 +146,9 @@ rejected even when it might happen to work. Approved image availability remains 
 
 ## Upgrade and qualification
 
-Protocol/storage format is 9. Use the explicit offline [metadata upgrade](CHECKPOINT_JOBS.md#explicit-format-5678-upgrade)
-from formats 5–8; mixed binaries are rejected. Migration preserves old artifact IDs, suspended jobs and
+Portable jobs introduced format 9; [durable history](DURABLE_HISTORY.md) advances the current
+protocol/storage format to 10. Use the explicit offline [metadata upgrade](CHECKPOINT_JOBS.md#explicit-format-56789-upgrade)
+from formats 5–9; mixed binaries are rejected. Migration preserves old artifact IDs, suspended jobs and
 retained request receipts. It does not retroactively turn old jobs into portable jobs.
 
 CI runs the Rust protocol/state-machine and headless GUI tests plus the JSON CLI scenario:
