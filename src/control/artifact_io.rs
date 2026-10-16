@@ -284,7 +284,11 @@ pub async fn fetch_available(
             sources.push(&store.peer);
         }
     }
-    if let Some(worker) = state.workers.get(&artifact.manifest.worker) {
+    if let Some(worker) = artifact
+        .manifest
+        .worker()
+        .and_then(|id| state.workers.get(id))
+    {
         sources.push(&worker.peer);
     }
     let mut errors = Vec::new();

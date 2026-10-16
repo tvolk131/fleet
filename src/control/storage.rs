@@ -82,7 +82,33 @@ fn free_bytes(path: &Path) -> Result<u64> {
     Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
 }
 
+pub(super) fn reserve(home: &Path, capacity: u64, m: &Manifest) -> Result<()> {
+    let used = usage(&home.join("objects"))?.file_bytes + usage(&home.join("staging"))?.file_bytes;
+    // Conservative allowance for file blocks and nested directories, in addition to payload bytes.
+    let entries: u64 = m
+        .files
+        .iter()
+        .map(|f| f.path.split('/').count() as u64 + 1)
+        .sum();
+    let overhead = (entries * 65536).max(1 << 20);
+    let reservation = m
+        .bytes()
+        .checked_add(serde_json::to_vec(m)?.len() as u64 + overhead)
+        .context("reservation overflow")?;
+    ensure!(
+        used.checked_add(reservation).is_some_and(|n| n <= capacity),
+        "storage capacity exhausted: used {used}, reservation {reservation}"
+    );
+    ensure!(
+        free_bytes(home)? >= reservation,
+        "insufficient filesystem space for artifact"
+    );
+    Ok(())
+}
+
 pub struct Agent {
+    upload_allowed: Arc<RwLock<BTreeMap<String, Manifest>>>,
+    gate: Arc<tokio::sync::Mutex<()>>,
     status: Arc<RwLock<serde_json::Value>>,
     pub config: Config,
     pub home: PathBuf,
@@ -140,7 +166,21 @@ impl Agent {
             super::network::connect_endpoint(key, config.registration.peer.address).await?;
         let access = Arc::new(RwLock::new(artifact_io::Access::default()));
         let status = Arc::new(RwLock::new(serde_json::Value::Null));
+        let upload_allowed = Arc::new(RwLock::new(BTreeMap::new()));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
         let router = Router::builder(endpoint.clone())
+            .accept(
+                super::input_upload::ALPN,
+                super::input_upload::Handler {
+                    cluster: config.cluster.clone(),
+                    administrators: config.administrators.clone(),
+                    allowed: upload_allowed.clone(),
+                    gate: gate.clone(),
+                    home: home.into(),
+                    capacity: config.registration.capacity_bytes,
+                    slots: Arc::new(tokio::sync::Semaphore::new(4)),
+                },
+            )
             .accept(
                 super::storage_status::ALPN,
                 super::storage_status::Handler {
@@ -165,6 +205,8 @@ impl Agent {
             &config.cluster,
         ))?;
         Ok(Self {
+            upload_allowed,
+            gate,
             status,
             config,
             home: home.into(),
@@ -195,6 +237,14 @@ impl Agent {
             anyhow::bail!("unexpected storage view")
         };
         ensure!(view.registration == r, "storage enrollment changed");
+        let gate = self.gate.clone();
+        let _gate = gate.lock().await;
+        *self.upload_allowed.write().expect("input uploads") = view
+            .artifacts
+            .iter()
+            .filter(|a| !a.deleted && a.manifest.kind == Kind::Inputs)
+            .map(|a| (a.manifest.id.clone(), a.manifest.clone()))
+            .collect();
         let readers = self
             .config
             .administrators
@@ -292,8 +342,7 @@ impl Agent {
             "local deletion tombstone conflicts with controller; operator reconciliation required"
         );
         if root.exists() {
-            let saved: Manifest =
-                serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+            let saved: Manifest = super::artifact::read_manifest(&root.join("manifest.json"))?;
             ensure!(saved == *m, "stored manifest mismatch");
             if self
                 .audited
@@ -325,33 +374,12 @@ impl Agent {
             std::fs::remove_dir_all(&root)?;
             self.audited.remove(&m.id);
         }
-        let used = usage(&self.home.join("objects"))?.file_bytes
-            + usage(&self.home.join("staging"))?.file_bytes;
-        // Conservative allowance for file blocks and nested directories, in addition to payload bytes.
-        let entries: u64 = m
-            .files
-            .iter()
-            .map(|f| f.path.split('/').count() as u64 + 1)
-            .sum();
-        let overhead = (entries * 65536).max(1 << 20);
-        let reservation = m
-            .bytes()
-            .checked_add(serde_json::to_vec(m)?.len() as u64 + overhead)
-            .context("reservation overflow")?;
-        ensure!(
-            used.checked_add(reservation)
-                .is_some_and(|n| n <= self.config.registration.capacity_bytes),
-            "storage capacity exhausted: used {used}, reservation {reservation}"
-        );
-        ensure!(
-            free_bytes(&self.home)? >= reservation,
-            "insufficient filesystem space for artifact"
-        );
+        reserve(&self.home, self.config.registration.capacity_bytes, m)?;
         let stage = self.home.join("staging").join(&m.id);
         std::fs::create_dir(&stage)?;
         let result = async {
             let mut sources = vec![];
-            if let Some(worker) = view.workers.get(&m.worker) {
+            if let Some(worker) = m.worker().and_then(|id| view.workers.get(id)) {
                 sources.push(worker.peer.clone());
             }
             for id in &artifact.targets {

@@ -415,7 +415,7 @@ impl Runner {
         let root = self.guest_root();
         self.require(
             "prepare",
-            self.helper(serde_json::json!({"kind":"prepare", "root":root})),
+            self.helper(serde_json::json!({"kind":"prepare", "root":root, "platform":self.job.spec.vm.as_ref().and_then(|v| v.runtime.as_ref()).map(|r| &r.platform)})),
             None,
         )?;
         let mut total = 0u64;

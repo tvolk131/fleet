@@ -4,6 +4,50 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::path::Path;
 
+/// Migrate only persisted artifact metadata; content identities and file bytes do not change.
+pub(crate) fn artifact_origins(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            if fields.contains_key("id")
+                && fields.contains_key("kind")
+                && fields.contains_key("files")
+                && fields.contains_key("worker")
+                && fields.contains_key("attempt")
+                && !fields.contains_key("origin")
+            {
+                let worker = fields.remove("worker").unwrap();
+                let attempt = fields.remove("attempt").unwrap();
+                fields.insert(
+                    "origin".into(),
+                    json!({"Attempt":{"worker":worker,"attempt":attempt}}),
+                );
+            }
+            for v in fields.values_mut() {
+                artifact_origins(v);
+            }
+        }
+        Value::Array(values) => {
+            for v in values {
+                artifact_origins(v);
+            }
+        }
+        _ => {}
+    }
+}
+fn rehash_receipts(state: &mut State) -> Result<()> {
+    for receipt in state.receipts.values_mut() {
+        if let Some(command) = &mut receipt.command {
+            artifact_origins(command);
+            let mutation: Mutation = serde_json::from_value(command.clone())?;
+            *command = serde_json::to_value(&mutation)?;
+            receipt.fingerprint = blake3::hash(&serde_json::to_vec(&mutation)?)
+                .to_hex()
+                .to_string();
+        }
+    }
+    Ok(())
+}
+
 fn job_kind(a: &Value) -> bool {
     a["workload"].get("Job").is_some()
 }
@@ -39,6 +83,7 @@ fn assignment(id: &str, a: &mut Value) -> Result<()> {
 }
 
 pub(crate) fn mutation(value: &mut Value, assignments: &Value) -> Result<()> {
+    artifact_origins(value);
     if let Some(desire) = value.get_mut("Desire") {
         let id = desire["id"].as_str().context("missing assignment ID")?;
         let job = match desire["desired"].as_str() {
@@ -65,11 +110,12 @@ pub(crate) fn mutation(value: &mut Value, assignments: &Value) -> Result<()> {
 }
 
 pub(crate) fn state(mut value: Value) -> Result<State> {
-    if value["format"] == 6 || value["format"] == 7 {
+    artifact_origins(&mut value);
+    if matches!(value["format"].as_u64(), Some(6..=8)) {
         let mut state: State = serde_json::from_value(value)?;
         ensure!(
             state.recovery.is_none(),
-            "format-6/7 recovery-bound state requires a separate migration"
+            "format-6/7/8 recovery-bound state requires a separate migration"
         );
         ensure!(
             state.membership.voter_ids().count() == 1
@@ -101,6 +147,7 @@ pub(crate) fn state(mut value: Value) -> Result<State> {
                 .all(|j| j.phase.terminal() || j.phase == super::queue::JobPhase::Suspended),
             "finish or suspend all logical jobs before upgrade"
         );
+        rehash_receipts(&mut state)?;
         state.format = super::FORMAT;
         for cp in state.checkpoints.clone().into_values() {
             state.register_artifact(super::artifact::Manifest::new(
@@ -196,13 +243,14 @@ pub(crate) fn state(mut value: Value) -> Result<State> {
 }
 
 pub(crate) fn journal(mut value: Value) -> Result<Value> {
+    artifact_origins(&mut value);
     if value["format"] == super::FORMAT {
         return Ok(value);
     }
-    if value["format"] == 6 || value["format"] == 7 {
+    if matches!(value["format"].as_u64(), Some(6..=8)) {
         ensure!(
             value["recovery_inventory"].is_null() && value["recovery_binding"].is_null(),
-            "format-6/7 recovery-bound worker requires a separate migration"
+            "format-6/7/8 recovery-bound worker requires a separate migration"
         );
         for (_, item) in value["observations"]
             .as_object()

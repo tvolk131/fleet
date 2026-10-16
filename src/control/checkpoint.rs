@@ -209,6 +209,9 @@ impl State {
     }
 
     pub fn resume_job(&mut self, id: &str, revision: u64) -> Reply {
+        self.resume_job_on(id, revision, None)
+    }
+    pub fn resume_job_on(&mut self, id: &str, revision: u64, worker: Option<&str>) -> Reply {
         let check =
             || -> Result<()> {
                 let job = self.jobs.get(id).context("unknown job")?;
@@ -242,6 +245,23 @@ impl State {
                     "recovery reconciliation required"
                 );
                 self.attempt_workload(job)?;
+                if let Some(target) = worker {
+                    ensure!(
+                        job.worker.as_deref().is_none_or(|pin| pin == target),
+                        "resume target violates job worker restriction"
+                    );
+                    let registration = self.workers.get(target).context("unknown resume target")?;
+                    ensure!(
+                        job.requires.is_subset(&registration.tags),
+                        "resume target lacks required tags"
+                    );
+                    job.workload.validate(registration)?;
+                    ensure!(
+                        super::portable::runtime(&job.workload).is_some() || target == c.worker,
+                        "cross-worker resume requires a portable execution bundle"
+                    );
+                }
+                self.portable_ready(job)?;
                 Ok(())
             };
         if let Err(e) = check() {
@@ -249,6 +269,7 @@ impl State {
         }
         let job = self.jobs.get_mut(id).expect("validated job");
         job.phase = JobPhase::Queued;
+        job.resume_worker = worker.map(str::to_owned);
         job.revision += 1;
         Reply::Accepted {
             job: id.into(),

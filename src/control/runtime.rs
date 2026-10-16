@@ -178,6 +178,14 @@ impl Journal {
                 s.assignments.insert(a.id.clone(), a);
             }
             ensure!(!view.recovery_required, "worker recovery has not committed");
+            for (id, cp) in view.resume_checkpoints {
+                cp.content.validate()?;
+                ensure!(
+                    s.checkpoints.get(&id).is_none_or(|old| old == &cp),
+                    "resume checkpoint changed"
+                );
+                s.checkpoints.insert(id, cp);
+            }
             s.known_checkpoints = view.checkpoints;
             s.held = view.held;
             s.starts_allowed = view.starts_allowed;
@@ -450,7 +458,12 @@ impl Worker {
                     }
                 }
                 s.recovery_inventory = Some(super::recovery::Inventory {
-                    checkpoints: s.checkpoints.clone(),
+                    checkpoints: s
+                        .checkpoints
+                        .iter()
+                        .filter(|(_, c)| c.worker == s.registration.id)
+                        .map(|(id, c)| (id.clone(), c.clone()))
+                        .collect(),
                     held: s.held.clone(),
                     registration: s.registration.clone(),
                     sequence: s.sequence,
@@ -616,7 +629,12 @@ impl Worker {
                                 }
                             }
                             s.recovery_inventory = Some(super::recovery::Inventory {
-                                checkpoints: s.checkpoints.clone(),
+                                checkpoints: s
+                                    .checkpoints
+                                    .iter()
+                                    .filter(|(_, c)| c.worker == s.registration.id)
+                                    .map(|(id, c)| (id.clone(), c.clone()))
+                                    .collect(),
                                 held: s.held.clone(),
                                 registration: s.registration.clone(),
                                 sequence: s.sequence,
@@ -859,6 +877,7 @@ impl Worker {
                     }
                 } else {
                     if !attempted {
+                        self.restore_inputs(a).await?;
                         self.restore_checkpoint(a).await?;
                         let hashes = spec.inputs.values().map(|i| i.hash).collect();
                         if let proto::Response::Missing(missing) = self

@@ -52,6 +52,10 @@ pub struct Job {
     pub phase: JobPhase,
     pub attempts: Vec<AttemptId>,
     pub resume_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_bundle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_worker: Option<String>,
 }
 impl Job {
     pub fn current<'a>(&self, state: &'a State) -> Option<&'a Assignment> {
@@ -63,6 +67,8 @@ impl Job {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Submission {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<super::artifact::Manifest>,
     pub id: String,
     pub workload: Workload,
     pub worker: Option<String>,
@@ -88,6 +94,8 @@ impl Submission {
             phase: JobPhase::Queued,
             attempts: vec![],
             resume_from: None,
+            input_bundle: self.inputs.as_ref().map(|m| m.id.clone()),
+            resume_worker: None,
         }
     }
 }
@@ -109,6 +117,13 @@ impl State {
                 anyhow::bail!("queue accepts jobs only")
             };
             spec.validate()?;
+            super::portable::validate_inputs(&s.id, &s.workload, s.inputs.as_ref())?;
+            if s.inputs.is_some() {
+                ensure!(
+                    !self.storage.policy.inputs.is_empty(),
+                    "configure input storage targets before submitting portable jobs"
+                );
+            }
             ensure!(
                 !spec
                     .inputs
@@ -136,6 +151,9 @@ impl State {
         };
         if let Err(e) = check() {
             return Reply::rejected(&e.to_string());
+        }
+        if let Some(m) = &s.inputs {
+            self.register_artifact(m.clone());
         }
         self.jobs.insert(s.id.clone(), s.job(index));
         Reply::Accepted {
@@ -245,9 +263,16 @@ impl State {
             job.requires.is_subset(&registration.tags),
             "worker does not match required tags"
         );
+        ensure!(
+            job.resume_worker.as_ref().is_none_or(|w| w == worker),
+            "different resume target worker"
+        );
+        self.portable_ready(job)?;
         let workload = self.attempt_workload(job)?;
         workload.validate(registration)?;
-        if let Some(checkpoint) = job.resume_from.as_ref() {
+        if super::portable::runtime(&job.workload).is_none()
+            && let Some(checkpoint) = job.resume_from.as_ref()
+        {
             ensure!(
                 self.checkpoints
                     .get(checkpoint)
@@ -257,7 +282,9 @@ impl State {
         }
         if let Workload::Job { spec, .. } = &job.workload {
             ensure!(
-                spec.inputs.is_empty() || job.staged.contains(worker),
+                super::portable::runtime(&job.workload).is_some()
+                    || spec.inputs.is_empty()
+                    || job.staged.contains(worker),
                 "waiting for verified inputs on worker"
             );
         }
@@ -297,6 +324,22 @@ impl State {
             Ok(a) => a,
             Err(e) => return Reply::rejected(&e.to_string()),
         };
+        let job = &self.jobs[id];
+        let bundle = job.input_bundle.clone();
+        let checkpoint = job.resume_from.clone();
+        let location = format!("worker/{worker}");
+        for artifact in self.storage.artifacts.values_mut().filter(|a| {
+            bundle.as_ref() == Some(&a.manifest.id)
+                || matches!(&a.manifest.kind, super::artifact::Kind::Checkpoint(id)
+                    if Some(id) == checkpoint.as_ref())
+        }) {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                artifact.copies.entry(location.clone())
+            {
+                entry.insert(Default::default());
+                artifact.revision += 1;
+            }
+        }
         let attempt_id = a.id.clone();
         self.assignments.insert(attempt_id.clone(), a);
         let job = self.jobs.get_mut(id).expect("job");

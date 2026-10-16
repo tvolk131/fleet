@@ -7,9 +7,11 @@ pub mod checkpoint;
 pub mod client;
 pub mod discovery;
 pub mod ids;
+pub mod input_upload;
 pub mod membership;
 pub mod model;
 pub mod network;
+pub mod portable;
 pub mod queue;
 pub mod recovery;
 mod retention;
@@ -36,4 +38,4 @@ openraft::declare_raft_types!(
 
 pub type Raft = openraft::Raft<TypeConfig>;
 pub type Entry = openraft::Entry<TypeConfig>;
-pub const FORMAT: u32 = 8;
+pub const FORMAT: u32 = 9;

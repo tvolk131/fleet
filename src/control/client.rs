@@ -98,6 +98,8 @@ pub enum ApiRequest {
         checkpoint: String,
     },
     Resume {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker: Option<String>,
         request_id: String,
         id: String,
         expected_revision: u64,
@@ -351,13 +353,36 @@ impl AppClient {
                     self.transport.endpoint.clone(),
                     store.clone(),
                 );
-                let prepared = c.prepare(job).await;
+                let prepared = async {
+                    let spec = c.prepare(job).await?;
+                    let inputs = if spec.vm.as_ref().and_then(|v| v.runtime.as_ref()).is_some() {
+                        let mut files = Vec::new();
+                        for (path, input) in &spec.inputs {
+                            let iroh_blobs::api::blobs::BlobStatus::Complete { size } =
+                                store.blobs().status(input.hash).await?
+                            else {
+                                bail!("input bytes missing from client spool");
+                            };
+                            files.push(crate::jobs::OutputFile {
+                                path: path.clone(),
+                                hash: input.hash,
+                                size,
+                            });
+                        }
+                        Some(super::artifact::Manifest::inputs(id.clone(), files)?)
+                    } else {
+                        None
+                    };
+                    Ok::<_, anyhow::Error>((spec, inputs))
+                }
+                .await;
                 let synced = store.sync_db().await;
                 let closed = store.shutdown().await;
-                let spec = prepared?;
+                let (spec, inputs) = prepared?;
                 synced?;
                 closed?;
                 Mutation::Enqueue(Submission {
+                    inputs,
                     id: id.clone(),
                     workload: Workload::Job {
                         spec: Box::new(spec),
@@ -400,10 +425,12 @@ impl AppClient {
                 }
             }
             ApiRequest::Resume {
+                worker,
                 id,
                 expected_revision,
                 ..
             } => Mutation::ResumeJob {
+                worker: worker.clone(),
                 id: id.clone(),
                 expected_revision: *expected_revision,
             },
@@ -475,6 +502,56 @@ impl AppClient {
                 let Workload::Job { spec, .. } = &job.workload else {
                     continue;
                 };
+                if let Some(bundle) = state.input_bundle(job) {
+                    let result = async {
+                        if state.durable_artifact(bundle) {
+                            return Ok::<_, anyhow::Error>("verified storage copies ready");
+                        }
+                        let root = self.home.join("input-uploads").join(&bundle.manifest.id);
+                        if root.exists()
+                            && super::artifact_io::verify(&root, &bundle.manifest).is_err()
+                        {
+                            std::fs::remove_dir_all(&root)?;
+                        }
+                        if !root.exists() {
+                            std::fs::create_dir_all(&root)?;
+                            for f in &bundle.manifest.files {
+                                let path = root.join(&f.path);
+                                std::fs::create_dir_all(path.parent().context("input parent")?)?;
+                                store.blobs().export(f.hash, &path).await?;
+                            }
+                            super::artifact_io::verify(&root, &bundle.manifest)?;
+                        }
+                        for target in &bundle.targets {
+                            if bundle
+                                .copies
+                                .get(&format!("storage/{target}"))
+                                .is_some_and(|c| {
+                                    c.authority == state.cluster
+                                        && c.phase == super::artifact::CopyPhase::Ready
+                                })
+                            {
+                                continue;
+                            }
+                            let peer = &state.storage.stores[target].peer;
+                            super::input_upload::upload(
+                                &self.transport.endpoint,
+                                peer,
+                                &state.cluster,
+                                &bundle.manifest,
+                                &root,
+                            )
+                            .await?;
+                        }
+                        Ok("uploaded; awaiting storage verification report")
+                    }
+                    .await;
+                    results.push(match result {
+                        Ok(message) => json!({"job":job.id,"inputs":message}),
+                        Err(e) => json!({"job":job.id,"waiting":format!("{e:#}")}),
+                    });
+                    continue;
+                }
                 if spec.inputs.is_empty() {
                     continue;
                 }
@@ -572,7 +649,7 @@ impl AppClient {
             }
             ApiRequest::Artifacts { attempt } => {
                 let state = self.read().await?;
-                Ok(json!(state.storage.artifacts.values().filter(|a| attempt.as_ref().is_none_or(|id| a.manifest.attempt == *id)).map(|a| json!({"artifact":a,"protected":state.artifact_protected(&a.manifest.id)})).collect::<Vec<_>>()))
+                Ok(json!(state.storage.artifacts.values().filter(|a| attempt.as_ref().is_none_or(|id| a.manifest.attempt() == Some(id.as_str()))).map(|a| json!({"artifact":a,"protected":state.artifact_protected(&a.manifest.id)})).collect::<Vec<_>>()))
             }
             ApiRequest::FetchArtifact { id, destination } => {
                 let state = self.read().await?;
@@ -786,7 +863,7 @@ impl AppClient {
                     },
                     ApiRequest::Outputs { .. } => {
                         if let Some(artifact) = state.storage.artifacts.values().find(|m| {
-                            m.manifest.attempt == a.id
+                            m.manifest.attempt() == Some(a.id.as_str())
                                 && m.manifest.kind == super::artifact::Kind::FinalOutputs
                         }) {
                             ensure!(!artifact.deleted, "final outputs were deleted");
@@ -798,7 +875,7 @@ impl AppClient {
                     }
                     ApiRequest::Fetch { destination, .. } => {
                         if let Some(artifact) = state.storage.artifacts.values().find(|m| {
-                            m.manifest.attempt == a.id
+                            m.manifest.attempt() == Some(a.id.as_str())
                                 && m.manifest.kind == super::artifact::Kind::FinalOutputs
                         }) {
                             super::artifact_io::fetch_available(
@@ -855,8 +932,17 @@ pub fn job_views(state: &State) -> Vec<Value> {
         let phase = if j.phase == JobPhase::Active { a.and_then(|a|a.observed.as_ref()).map(|(_,o)|o.phase.label()).unwrap_or_else(|| "pending".into()) } else { format!("{:?}",j.phase).to_lowercase() };
         let reasons = if j.phase == JobPhase::Queued { state.workers.keys().map(|w|(w.clone(),state.placement_candidate(&j.id,w).err().map(|e|e.to_string()).unwrap_or_else(||"waiting for worker poll and scheduler".into()))).collect::<BTreeMap<_,_>>() } else { BTreeMap::new() };
         let attempts: Vec<_> = j.attempts.iter().filter_map(|id| state.assignments.get(id.as_ref())).collect();
-        let artifacts: Vec<_> = state.storage.artifacts.values().filter(|a| j.attempts.iter().any(|id| id.as_ref() == a.manifest.attempt)).collect();
-        json!({"artifacts":artifacts,"id":j.id,"revision":j.revision,"phase":phase,"cancel_requested":matches!(j.phase,JobPhase::Cancelling|JobPhase::Cancelled),"priority":j.priority,"after":j.after,"workload":j.workload,"assignment":a,"attempts":attempts,"latest_checkpoint":latest_checkpoint(state,&j.id),"resume_from":j.resume_from,"waiting":reasons})
+        let artifacts: Vec<_> = state.storage.artifacts.values().filter(|a| a.manifest.job() == Some(j.id.as_ref()) || j.attempts.iter().any(|id| Some(id.as_ref()) == a.manifest.attempt())).collect();
+        let resume_targets: BTreeMap<_,_> = if j.phase == JobPhase::Suspended && super::portable::runtime(&j.workload).is_some() { state.workers.keys().map(|worker| {
+            let mut probe=state.clone();
+            let error=match probe.resume_job_on(&j.id,j.revision,Some(worker)) {
+                Reply::Accepted {..} => probe.placement_candidate(&j.id,worker).err().map(|e| e.to_string()),
+                Reply::Rejected {reason} => Some(reason),
+                _ => Some("resume unavailable".into()),
+            };
+            (worker.clone(),error)
+        }).collect() } else { BTreeMap::new() };
+        json!({"resume_targets":resume_targets,"portable":super::portable::runtime(&j.workload),"input_bundle":j.input_bundle,"portable_ready":state.portable_ready(j).is_ok(),"portability_waiting":state.portable_ready(j).err().map(|e| e.to_string()),"resume_worker":j.resume_worker,"artifacts":artifacts,"id":j.id,"revision":j.revision,"phase":phase,"cancel_requested":matches!(j.phase,JobPhase::Cancelling|JobPhase::Cancelled),"priority":j.priority,"after":j.after,"workload":j.workload,"assignment":a,"attempts":attempts,"latest_checkpoint":latest_checkpoint(state,&j.id),"resume_from":j.resume_from,"waiting":reasons})
     }).collect()
 }
 
@@ -876,7 +962,7 @@ pub fn latest_checkpoint<'a>(
         .storage
         .artifacts
         .values()
-        .filter(|artifact| !artifact.deleted && artifact.manifest.attempt == a.id)
+        .filter(|artifact| !artifact.deleted && artifact.manifest.attempt() == Some(a.id.as_str()))
         .filter_map(|artifact| match &artifact.manifest.kind {
             super::artifact::Kind::Checkpoint(id) => {
                 state.checkpoints.get(id).map(|c| (artifact.ordinal, c))

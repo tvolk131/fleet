@@ -3,6 +3,7 @@ use fleet::control::{queue::Submission, workload::*};
 fn state() -> State {
     let mut s = State::new("cluster".into());
     s.enroll(&Registration {
+        runtimes: Default::default(),
         tags: BTreeSet::new(),
         id: "w".into(),
         peer: Peer {
@@ -22,6 +23,7 @@ fn state() -> State {
 }
 fn queued(id: &str) -> Submission {
     Submission {
+        inputs: Default::default(),
         id: id.into(),
         workload: Workload::Job {
             spec: Box::new(

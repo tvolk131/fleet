@@ -1,7 +1,7 @@
 //! Committed placement and worker observations. Bulk logs and files stay off the Raft log.
 use super::{Reply, State, network::Peer};
 use crate::{instances, jobs};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,6 +21,8 @@ pub struct Registration {
     pub incarnation: String,
     pub budget: Budget,
     pub images: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub runtimes: BTreeMap<String, super::portable::Runtime>,
     pub tags: BTreeSet<String>,
 }
 
@@ -151,6 +153,7 @@ pub struct WorkerView {
     pub cleanup_allowed: bool,
     pub starts_allowed: bool,
     pub checkpoints: BTreeSet<String>,
+    pub resume_checkpoints: BTreeMap<String, super::checkpoint::Checkpoint>,
     pub recovery_required: bool,
     pub held: BTreeSet<String>,
     pub registration: Registration,
@@ -161,6 +164,10 @@ pub struct WorkerView {
 impl Registration {
     pub fn validate(&self) -> Result<()> {
         self.peer.validate()?;
+        for (image, runtime) in &self.runtimes {
+            ensure!(self.images.contains(image), "runtime image not advertised");
+            runtime.validate()?;
+        }
         instances::valid_id(&self.id)?;
         ensure!(
             !self.incarnation.is_empty() && self.incarnation.len() <= 128,
@@ -235,6 +242,14 @@ impl Workload {
             );
         }
         if let Some(vm) = self.vm() {
+            if let Some(required) = &vm.runtime {
+                required.accepts(
+                    worker
+                        .runtimes
+                        .get(&vm.image)
+                        .context("image platform is not advertised")?,
+                )?;
+            }
             ensure!(
                 vm.cpus > 0 && vm.memory_mb >= 4096 && vm.disk_gb >= 50,
                 "invalid VM resources"
@@ -401,6 +416,7 @@ impl State {
         }
         if matches!(workload, Workload::Job { .. }) {
             let mut job = super::queue::Submission {
+                inputs: None,
                 id: id.into(),
                 workload: workload.clone(),
                 worker: Some(worker.into()),

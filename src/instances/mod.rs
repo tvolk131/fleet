@@ -30,6 +30,8 @@ pub const MACOS_VM_LIMIT: usize = 2;
 pub struct Spec {
     /// Alias from the worker's trusted image catalog.
     pub image: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<crate::control::portable::Runtime>,
     pub cpus: u32,
     pub memory_mb: u32,
     pub disk_gb: u32,
@@ -135,6 +137,9 @@ pub struct Config {
     pub softnet: PathBuf,
     /// Only immutable OCI references (name@sha256:...) are accepted.
     pub images: BTreeMap<String, String>,
+    /// Explicit guest platform/capabilities for each approved image. Absent entries cannot run portable jobs.
+    #[serde(default)]
+    pub platforms: BTreeMap<String, crate::control::portable::Platform>,
     pub memory_budget_mb: u32,
     pub disk_budget_gb: u32,
     pub min_free_disk_gb: u32,
@@ -143,6 +148,37 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn runtimes(&self) -> Result<BTreeMap<String, crate::control::portable::Runtime>> {
+        self.platforms
+            .iter()
+            .map(|(alias, platform)| {
+                platform.validate()?;
+                let image = self
+                    .images
+                    .get(alias)
+                    .context("platform references unknown image")?;
+                let (_, digest) = image.rsplit_once('@').context("image must be pinned")?;
+                let runtime = crate::control::portable::Runtime {
+                    platform: platform.clone(),
+                    image_digest: digest.into(),
+                };
+                runtime.validate()?;
+                Ok((alias.clone(), runtime))
+            })
+            .collect()
+    }
+    pub fn check_runtime(&self, spec: &Spec) -> Result<()> {
+        if let Some(required) = &spec.runtime {
+            let runtimes = self.runtimes()?;
+            required.accepts(
+                runtimes
+                    .get(&spec.image)
+                    .context("image has no explicit guest platform")?,
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn load(home: &Path) -> Result<Self> {
         let config: Self = jobs::read_json(&home.join("instances.json"))?
             .context("VM backend disabled: configure the worker's instances.json first")?;
@@ -169,6 +205,7 @@ impl Config {
                 bail!("invalid pinned OCI image reference");
             }
         }
+        config.runtimes()?;
         for subnet in &config.block_cidrs {
             network::cidr(subnet)?;
         }
@@ -271,6 +308,7 @@ fn create_inner(
         bail!("instance {id} already exists with a different specification or owner");
     }
     let config = Config::load(home)?;
+    config.check_runtime(&spec)?;
     if !config.images.contains_key(&spec.image) {
         bail!("image is not in this worker's trusted catalog");
     }
@@ -598,6 +636,7 @@ pub fn reserve_job(home: &Path, job: &str, spec: Spec, owner: &str, hello: &Hell
             .filter(|i| i.observed.state != State::Deleted)
             .map(|i| u64::from(i.record.spec.disk_gb))
             .sum();
+        config.check_runtime(&spec)?;
         if !config.images.contains_key(&spec.image)
             || disk + u64::from(spec.disk_gb) > u64::from(config.disk_budget_gb)
         {

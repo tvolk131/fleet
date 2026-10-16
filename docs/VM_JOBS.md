@@ -76,7 +76,9 @@ terminal observation releases capacity. Cancellation during image cloning does n
 download. A supervisor restart reconciles existing guest operations; an uncertain execution is never
 replayed. Committed outputs survive cancellation. Checkpoints use the explicit
 [checkpoint and resume contract](CHECKPOINT_JOBS.md), with a new attempt after confirmed cleanup.
-Native pause, automatic checkpoint selection/preemption, and cross-worker resume are not public job operations.
+[Portable Tart jobs](PORTABLE_JOBS.md) support cooperative cross-worker resume with durable inputs and
+explicit compatibility. Native pause, lost-worker takeover and automatic checkpoint selection/preemption
+are not public job operations.
 
 The current control-plane integration tests cover metrics/output updates across worker restart,
 timeout versus exit-code failure, unsafe-output cleanup, cancellation during cloning, and checkpoint

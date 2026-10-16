@@ -47,6 +47,7 @@ impl Fixture {
         instances::write(
             &home.join("instances.json"),
             &Config {
+                platforms: Default::default(),
                 tart,
                 softnet,
                 images: BTreeMap::from([(
@@ -125,6 +126,7 @@ impl Drop for Fixture {
 }
 fn spec() -> Spec {
     Spec {
+        runtime: Default::default(),
         image: "macos".into(),
         cpus: 4,
         memory_mb: 4096,

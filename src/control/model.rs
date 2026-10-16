@@ -91,6 +91,8 @@ pub enum Mutation {
         checkpoint: String,
     },
     ResumeJob {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker: Option<String>,
         id: String,
         expected_revision: u64,
     },
@@ -300,9 +302,10 @@ impl State {
                 checkpoint,
             } => self.suspend_job(id, *expected_revision, checkpoint),
             Mutation::ResumeJob {
+                worker,
                 id,
                 expected_revision,
-            } => self.resume_job(id, *expected_revision),
+            } => self.resume_job_on(id, *expected_revision, worker.as_deref()),
             Mutation::ChangeMembership {
                 expected_revision,
                 voters,

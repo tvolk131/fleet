@@ -132,8 +132,10 @@ enum Command {
         #[arg(long)]
         revision: Option<u64>,
     },
-    /// Queue another attempt on the checkpoint's worker, after confirmed VM cleanup.
+    /// Queue another attempt after confirmed VM cleanup; portable jobs may select another eligible worker.
     Resume {
+        #[arg(long)]
+        worker: Option<String>,
         id: String,
         #[arg(long)]
         request_id: Option<String>,
@@ -244,6 +246,8 @@ enum StorageCommand {
         request_id: Option<String>,
     },
     Policy {
+        #[arg(long)]
+        input: Vec<String>,
         #[arg(long)]
         revision: u64,
         #[arg(long)]
@@ -456,6 +460,7 @@ async fn run(args: Args) -> Result<()> {
                 registration: serde_json::from_slice(&std::fs::read(registration)?)?,
             },
             StorageCommand::Policy {
+                input,
                 revision,
                 checkpoint,
                 output,
@@ -464,6 +469,7 @@ async fn run(args: Args) -> Result<()> {
                 request_id: request_id(rid),
                 expected_revision: revision,
                 policy: fleet::control::artifact::Policy {
+                    inputs: input.into_iter().collect(),
                     checkpoints: checkpoint.into_iter().collect(),
                     outputs: output.into_iter().collect(),
                 },
@@ -611,12 +617,14 @@ async fn run(args: Args) -> Result<()> {
             }
         }
         Command::Resume {
+            worker,
             id,
             request_id: rid,
             revision,
         } => {
             let revision = match revision { Some(v) => v, None => client::call(&client_home, ApiRequest::Job { id: id.clone() }).await?["revision"].as_u64().context("job revision missing")? };
             ApiRequest::Resume {
+                worker,
                 request_id: request_id(rid),
                 id,
                 expected_revision: revision,

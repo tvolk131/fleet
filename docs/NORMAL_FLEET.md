@@ -121,8 +121,9 @@ Metadata can be accepted while inputs await delivery. Submission attempts stagin
 `fleet stage [JOB]` retries it and `fleet stage --watch` keeps retrying. A configured client-staging service
 provides the same behavior after the submitting CLI exits. If that source machine is offline before any
 eligible worker has the bytes, the job waits. Controllers do not replicate file bytes. Configure separate [storage agents](ARTIFACT_STORAGE.md)
-for verified checkpoint/final-output backups; original input spools are still client-owned. Retain the
-client spool until staging is complete.
+for verified artifact backups. [Portable Tart jobs](PORTABLE_JOBS.md) require durable executable/input
+bundles on storage before execution and can resume on compatible workers after confirmed suspension.
+Other jobs stage inputs directly to workers. Retain the client spool until staging is complete.
 
 `fleet logs JOB --follow`, `fleet outputs JOB`, and `fleet fetch JOB /absolute/new-directory` read directly
 from the assigned worker after resolving it through the cluster. Fetch verifies hashes and requires a

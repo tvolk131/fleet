@@ -35,6 +35,7 @@ pub(super) fn workload(script: &str) -> Workload {
 }
 fn vm_spec() -> instances::Spec {
     instances::Spec {
+        runtime: Default::default(),
         image: "macos".into(),
         cpus: 2,
         memory_mb: 4096,
@@ -52,14 +53,32 @@ async fn prepare_with_resources(
     cpu_slots: u32,
     memory_mb: u32,
 ) -> (PathBuf, WorkerConfig) {
-    let home = c.home.0.join("worker");
+    prepare_named(c, tart, cpu_slots, memory_mb, "worker-real", false).await
+}
+async fn prepare_named(
+    c: &mut Cluster,
+    tart: bool,
+    cpu_slots: u32,
+    memory_mb: u32,
+    id: &str,
+    portable: bool,
+) -> (PathBuf, WorkerConfig) {
+    let home = c
+        .home
+        .0
+        .join(if id == "worker-real" { "worker" } else { id });
     let key = fleet::keys::load_or_create(&home.join("node.key")).unwrap();
     let socket = reserve_socket();
     let config = WorkerConfig {
         cluster: c.config.cluster.clone(),
         registration: Registration {
+            runtimes: if portable {
+                BTreeMap::from([("macos".into(), portable::runtime())])
+            } else {
+                BTreeMap::new()
+            },
             tags: BTreeSet::from(["os:macos".into(), "gpu:metal".into()]),
-            id: "worker-real".into(),
+            id: id.into(),
             peer: Peer {
                 identity: key.public(),
                 address: socket.local_addr().unwrap(),
@@ -95,6 +114,11 @@ async fn prepare_with_resources(
         instances::write(
             &backend.join("instances.json"),
             &instances::Config {
+                platforms: if portable {
+                    BTreeMap::from([("macos".into(), portable::runtime().platform)])
+                } else {
+                    BTreeMap::new()
+                },
                 tart: fake,
                 softnet,
                 images: BTreeMap::from([(
@@ -115,7 +139,7 @@ async fn prepare_with_resources(
             .write(
                 Request {
                     origin: "cluster".into(),
-                    id: "enroll".into(),
+                    id: format!("enroll-{id}"),
                     mutation: Mutation::Enroll {
                         worker: config.registration.clone()
                     }
@@ -999,6 +1023,7 @@ async fn queued_native_jobs_schedule_once_and_dependencies_wait_for_success() {
         ("second", BTreeSet::from(["first".into()])),
     ] {
         let s = fleet::control::queue::Submission {
+            inputs: Default::default(),
             id: id.into(),
             workload: workload("echo started-once; echo result > result.txt"),
             worker: None,
@@ -1054,3 +1079,6 @@ mod storage;
 
 #[path = "vm_lifecycle.rs"]
 mod vm_lifecycle;
+
+#[path = "portable.rs"]
+mod portable;

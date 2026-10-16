@@ -20,6 +20,19 @@ pub struct Decision {
 impl State {
     pub fn artifact_protection(&self, a: &Artifact) -> Vec<String> {
         let mut reasons = Vec::new();
+        if let Some(id) = a.manifest.job() {
+            if self.jobs.get(id).is_some_and(|j| !j.phase.terminal()) {
+                reasons.push(format!("execution inputs for unfinished job: {id}"));
+            }
+            let retained_checkpoint = self.storage.artifacts.values().any(|cp| {
+                !cp.deleted
+                    && matches!(&cp.manifest.kind, Kind::Checkpoint(c)
+                    if self.checkpoints.get(c).is_some_and(|c| c.job.as_ref() == id))
+            });
+            if retained_checkpoint {
+                reasons.push(format!("execution inputs for retained checkpoints: {id}"));
+            }
+        }
         if a.pinned {
             reasons.push("pinned".into());
         }
@@ -44,6 +57,7 @@ impl State {
                 let job = match &a.manifest.kind {
                     Kind::Checkpoint(id) => self.checkpoints.get(id).map(|c| c.job.to_string()),
                     Kind::FinalOutputs => None,
+                    Kind::Inputs => a.manifest.job().map(str::to_owned),
                 };
                 let mut d = Decision {
                     artifact: a.manifest.id.clone(),
@@ -86,6 +100,11 @@ impl State {
                     return d;
                 }
                 d.reasons = self.artifact_protection(a);
+                if a.manifest.kind == Kind::Inputs {
+                    d.reasons
+                        .push("job input bundle; explicit retention".into());
+                    return d;
+                }
                 let policy =
                     job.as_ref()
                         .and_then(|id| self.jobs.get(id))
@@ -168,6 +187,7 @@ mod tests {
             "checkpoint":{"manifests":"cp/*/fleet.json","resume_argv":["train","{checkpoint}"],
             "retention":{"keep_last":2,"max_live_checkpoints":6,"max_live_bytes":1048576,"transfer_bytes_per_hour":1048576}}})).unwrap();
         let mut job = Submission {
+            inputs: None,
             id: "job".into(),
             workload: Workload::Job {
                 spec: Box::new(spec),

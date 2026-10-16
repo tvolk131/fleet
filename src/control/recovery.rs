@@ -354,6 +354,7 @@ impl State {
             );
             let job = jobs.entry(attempt.job.to_string()).or_insert_with(|| {
                 let mut job = super::queue::Submission {
+                    inputs: None,
                     id: attempt.job.to_string(),
                     workload: a.workload.clone(),
                     worker: Some(a.worker.clone()),
@@ -410,7 +411,7 @@ impl State {
             let count = counts.entry(checkpoint.attempt.as_ref()).or_default();
             *count += 1;
             ensure!(
-                *count <= crate::checkpoint::MAX_CHECKPOINTS,
+                assignments.get(checkpoint.attempt.as_ref()).is_some_and(|a| matches!(&a.workload, Workload::Job {spec,..} if spec.checkpoint.as_ref().is_some_and(|p| p.retention.is_some()))) || *count <= crate::checkpoint::MAX_CHECKPOINTS,
                 "checkpoint inventory exceeds per-attempt limit"
             );
         }

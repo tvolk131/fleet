@@ -457,6 +457,11 @@ pub async fn run(command: Command) -> Result<()> {
             }
             let hello = tokio::task::spawn_blocking(crate::system::hello).await?;
             let registration = Registration {
+                runtimes: vm
+                    .as_ref()
+                    .map(|v| v.runtimes())
+                    .transpose()?
+                    .unwrap_or_default(),
                 tags: hello.tags.into_iter().collect(),
                 id,
                 peer: Peer {
@@ -793,6 +798,7 @@ pub async fn run(command: Command) -> Result<()> {
                 origin: base.cluster.clone(),
                 id: "example-submit".into(),
                 mutation: Mutation::Enqueue(super::queue::Submission {
+                    inputs: None,
                     id: "example".into(),
                     workload: super::workload::Workload::Job {
                         spec: Box::new(serde_json::from_value(
@@ -880,7 +886,7 @@ pub async fn run(command: Command) -> Result<()> {
                 match client
                     .call_replica(
                         id,
-                        crate::control::network::Message::Write(request),
+                        crate::control::network::Message::Write(Box::new(request)),
                         Duration::from_secs(10),
                     )
                     .await?

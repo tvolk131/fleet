@@ -4,7 +4,7 @@ use fleet::control::{
     queue::{JobPhase, Submission},
 };
 
-fn resumable() -> Workload {
+pub(super) fn resumable() -> Workload {
     let mut spec = job("unused");
     spec.vm = Some(vm_spec());
     spec.shutdown_grace_seconds = None;
@@ -38,6 +38,7 @@ async fn queued(c: &mut Cluster, workload: Workload) {
                 origin: c.config.cluster.clone(),
                 id: "submit-resumable".into(),
                 mutation: Mutation::Enqueue(Submission {
+                    inputs: Default::default(),
                     id: "logical".into(),
                     workload,
                     worker: Some("worker-real".into()),
@@ -183,6 +184,7 @@ async fn verified_checkpoint_survives_vm_deletion_worker_restart_and_leader_loss
         origin: c.config.cluster.clone(),
         id: "resume-logical".into(),
         mutation: Mutation::ResumeJob {
+            worker: Default::default(),
             id: "logical".into(),
             expected_revision: state.jobs["logical"].revision,
         },
@@ -398,6 +400,7 @@ async fn checkpoint_backup_restores_without_worker_payloads_and_retention_preser
             Mutation::StoragePolicy {
                 expected_revision: 0,
                 policy: artifact::Policy {
+                    inputs: Default::default(),
                     checkpoints: BTreeSet::from(["backup".into()]),
                     outputs: BTreeSet::from(["backup".into()]),
                 },
@@ -541,6 +544,7 @@ async fn checkpoint_backup_restores_without_worker_payloads_and_retention_preser
                 origin: c.config.cluster.clone(),
                 id: "backup-resume".into(),
                 mutation: Mutation::ResumeJob {
+                    worker: Default::default(),
                     id: "logical".into(),
                     expected_revision: state.jobs["logical"].revision,
                 },
@@ -685,7 +689,33 @@ async fn format_six_upgrade_preserves_suspended_checkpoint_and_request_receipts(
 async fn format_seven_upgrade_preserves_suspended_checkpoint_and_request_receipts() {
     upgrade_suspended(7).await;
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn format_eight_upgrade_preserves_artifact_identity_and_suspended_checkpoint() {
+    upgrade_suspended(8).await;
+}
 async fn upgrade_suspended(source_version: u32) {
+    fn old_artifact_shape(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if object.contains_key("files")
+                    && object.contains_key("kind")
+                    && let Some(origin) = object.remove("origin")
+                {
+                    object.insert("worker".into(), origin["Attempt"]["worker"].clone());
+                    object.insert("attempt".into(), origin["Attempt"]["attempt"].clone());
+                }
+                for child in object.values_mut() {
+                    old_artifact_shape(child);
+                }
+            }
+            serde_json::Value::Array(array) => {
+                for child in array {
+                    old_artifact_shape(child);
+                }
+            }
+            _ => {}
+        }
+    }
     use redb::{Database, ReadableTable, TableDefinition};
     let mut c = Cluster::new(1).await;
     let (home, config) = prepare(&mut c, true).await;
@@ -740,12 +770,15 @@ async fn upgrade_suspended(source_version: u32) {
                 for field in ["storage", "artifacts", "deleted_artifacts"] {
                     value.as_object_mut().unwrap().remove(field);
                 }
-            } else if let Some(catalog) = value.get_mut("storage") {
+            } else if source_version == 7
+                && let Some(catalog) = value.get_mut("storage")
+            {
                 catalog.as_object_mut().unwrap().remove("next_ordinal");
                 for artifact in catalog["artifacts"].as_object_mut().unwrap().values_mut() {
                     artifact.as_object_mut().unwrap().remove("ordinal");
                 }
             }
+            old_artifact_shape(&mut value);
             table
                 .insert("state", serde_json::to_vec(&value).unwrap().as_slice())
                 .unwrap();
@@ -813,6 +846,7 @@ async fn upgrade_suspended(source_version: u32) {
                 origin: "cluster".into(),
                 id: "resume-with-local-sealed-copy".into(),
                 mutation: Mutation::ResumeJob {
+                    worker: Default::default(),
                     id: "logical".into(),
                     expected_revision: after.jobs["logical"].revision,
                 },
@@ -976,6 +1010,7 @@ time.sleep(150)
                 origin: c.config.cluster.clone(),
                 id: "rolling-resume".into(),
                 mutation: Mutation::ResumeJob {
+                    worker: Default::default(),
                     id: "logical".into(),
                     expected_revision: state.jobs["logical"].revision,
                 },
