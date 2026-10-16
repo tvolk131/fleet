@@ -2,6 +2,7 @@
 
 pub mod guest;
 pub mod network;
+pub mod runtime;
 pub mod storage;
 mod tart;
 
@@ -31,7 +32,7 @@ pub struct Spec {
     /// Alias from the worker's trusted image catalog.
     pub image: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime: Option<crate::control::portable::Runtime>,
+    pub runtime: Option<runtime::Runtime>,
     pub cpus: u32,
     pub memory_mb: u32,
     pub disk_gb: u32,
@@ -139,7 +140,7 @@ pub struct Config {
     pub images: BTreeMap<String, String>,
     /// Explicit guest platform/capabilities for each approved image. Absent entries cannot run portable jobs.
     #[serde(default)]
-    pub platforms: BTreeMap<String, crate::control::portable::Platform>,
+    pub platforms: BTreeMap<String, runtime::Platform>,
     pub memory_budget_mb: u32,
     pub disk_budget_gb: u32,
     pub min_free_disk_gb: u32,
@@ -148,7 +149,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn runtimes(&self) -> Result<BTreeMap<String, crate::control::portable::Runtime>> {
+    pub fn runtimes(&self) -> Result<BTreeMap<String, runtime::Runtime>> {
         self.platforms
             .iter()
             .map(|(alias, platform)| {
@@ -158,7 +159,7 @@ impl Config {
                     .get(alias)
                     .context("platform references unknown image")?;
                 let (_, digest) = image.rsplit_once('@').context("image must be pinned")?;
-                let runtime = crate::control::portable::Runtime {
+                let runtime = runtime::Runtime {
                     platform: platform.clone(),
                     image_digest: digest.into(),
                 };
