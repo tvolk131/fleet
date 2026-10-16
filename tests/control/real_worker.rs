@@ -1082,3 +1082,6 @@ mod vm_lifecycle;
 
 #[path = "portable.rs"]
 mod portable;
+
+#[path = "runtime_update.rs"]
+mod runtime_update;

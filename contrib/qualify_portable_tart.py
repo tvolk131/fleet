@@ -102,8 +102,9 @@ def main():
     settings.update(platforms={'macos': platform}, memory_budget_mb=4096 if a.fake else 8192, disk_budget_gb=100, min_free_disk_gb=5)
     runtime = dict(platform=platform, image_digest=settings['images']['macos'].split('@')[1])
     for name, home in [('source', source), ('destination', destination)]:
+        initial_settings = {**settings, 'platforms': {} if name == 'destination' else settings['platforms']}
         command('cluster', 'prepare-worker', '--home', home, '--config', client / 'config.json', '--id', name,
-                '--cpu-slots', 1 if a.fake else 4, '--memory-mb', settings['memory_budget_mb'], '--instances', save('instances.json', settings))
+                '--cpu-slots', 1 if a.fake else 4, '--memory-mb', settings['memory_budget_mb'], '--instances', save('instances.json', initial_settings))
         if not a.fake:
             cache = home / 'backend/instance-tart/cache'
             cache.parent.mkdir(parents=True, exist_ok=True)
@@ -142,6 +143,19 @@ else:
         command('--home', client, 'storage', 'enroll', storage / 'registration.json', '--request-id', 'enroll-backup')
         command('--home', client, 'storage', 'policy', '--revision', 0, '--input', 'backup', '--checkpoint', 'backup', '--output', 'backup', '--request-id', 'policy')
         request(op='drain', worker='destination', drain=True, request_id='drain-destination')
+        # Enable portable execution on an already enrolled worker without a new identity/home.
+        old_registration = json.loads((destination / 'worker.json').read_text())['registration']
+        (destination / 'backend/instances.json').write_text(json.dumps(settings))
+        prepared = command('cluster', 'prepare-worker-runtimes', '--home', destination)
+        assert command('cluster', 'prepare-worker-runtimes', '--home', destination) == prepared
+        for _ in range(2):
+            assert command('cluster', 'request', '--key', client / 'node.key', '--config', client / 'config.json',
+                           '--request', destination / 'runtimes-request.json') == 'Recorded'
+        updated = json.loads((destination / 'worker.json').read_text())['registration']
+        assert updated.pop('runtimes') == {'macos': runtime}
+        old_registration.pop('runtimes', None)
+        assert updated == old_registration
+        result['existing_worker_runtime_update'] = True
         start('source')
         start('destination')
         request(op='submit', id='portable', request_id='portable-submit', memory_mb=0, job=job)

@@ -72,6 +72,12 @@ pub enum Mutation {
     Enroll {
         worker: super::workload::Registration,
     },
+    /// Add pinned runtime declarations without replacing a worker's identity or history.
+    AddWorkerRuntimes {
+        worker: String,
+        incarnation: String,
+        runtimes: BTreeMap<String, super::portable::Runtime>,
+    },
     Assign {
         id: String,
         execution: String,
@@ -283,6 +289,11 @@ impl State {
                 unavailable_workers,
             } => self.resume_recovery(unavailable_workers),
             Mutation::Enroll { worker } => self.enroll(worker),
+            Mutation::AddWorkerRuntimes {
+                worker,
+                incarnation,
+                runtimes,
+            } => self.add_worker_runtimes(worker, incarnation, runtimes),
             Mutation::Assign {
                 id,
                 execution,

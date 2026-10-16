@@ -1,4 +1,4 @@
-//! Explicit offline conversion of idle format-5/6 metadata. No rolling mixed-version protocol.
+//! Explicit offline conversion of idle format-5 through 8 metadata. No rolling mixed-version protocol.
 use super::{Mutation, State};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};

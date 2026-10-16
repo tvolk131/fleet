@@ -53,7 +53,7 @@ pub enum Command {
         #[arg(long)]
         manifest: PathBuf,
     },
-    /// Offline format-5/6 upgrade: idle singleton, stopped workers, and paused client staging. Keeps backups.
+    /// Offline format-5 through 8 upgrade: idle singleton, stopped workers, and paused client staging. Keeps backups.
     Upgrade {
         #[arg(long)]
         controller_home: PathBuf,
@@ -123,6 +123,11 @@ pub enum Command {
         instances: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:0")]
         bind: std::net::SocketAddr,
+    },
+    /// Add runtime capabilities to a stopped idle worker from its local Tart config; emit a consensus request.
+    PrepareWorkerRuntimes {
+        #[arg(long)]
+        home: PathBuf,
     },
     /// Run a worker; its detached supervisors survive worker shutdown.
     Worker {
@@ -277,6 +282,13 @@ pub enum Command {
 
 pub async fn run(command: Command) -> Result<()> {
     match command {
+        Command::PrepareWorkerRuntimes { home } => {
+            let request = tokio::task::spawn_blocking(move || {
+                super::runtime::Worker::prepare_runtimes(&home)
+            })
+            .await??;
+            println!("{}", serde_json::to_string_pretty(&request)?);
+        }
         Command::Upgrade {
             controller_home,
             worker_home,

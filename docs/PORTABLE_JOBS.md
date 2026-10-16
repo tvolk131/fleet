@@ -19,11 +19,37 @@ Workers opt approved image aliases into portable execution in their instance con
 
 This fragment accompanies the existing Tart paths and resource budgets. Use the real pinned digest of
 your approved image. `prepare-worker` advertises these runtimes; the worker checks its local catalog
-again at launch. Worker enrollment is immutable: changing the runtime catalog requires a new worker
-registration/home. A job requires its image alias on the destination, with the same digest and platform;
+again at launch. Worker identity, budgets and image aliases remain immutable. Runtime declarations and
+capabilities can be added to an existing idle worker using the procedure below. A job requires its image alias on the destination, with the same digest and platform;
 required capabilities must be a subset of those declared for that image. Capability names are trusted
 operator declarations, not hardware attestation or minimum performance guarantees. The guest helper
 also verifies macOS/ARM before executing the application.
+
+### Enable runtimes on an existing worker
+
+1. Drain the worker (`fleet drain WORKER`) and let accepted work finish or cooperatively suspend.
+   Delete persistent VMs and wait until all worker reports are acknowledged. Draining prevents new
+   placements; it does not stop running work.
+2. Stop the worker role, then add `platforms` entries to its `backend/instances.json`. Preserve its
+   image aliases, pinned digests and resource budgets. Upgrade old-format metadata before this step.
+3. Run `fleet cluster prepare-worker-runtimes --home WORKER_HOME`. This exclusively locks the idle
+   worker journal, keeps backups, and updates its local catalog without replacing its identity,
+   assignments, artifacts or execution history. It writes `WORKER_HOME/runtimes-request.json`.
+4. With the control plane running, submit that file through `fleet cluster request --key ADMIN_KEY
+   --config CLUSTER_CONFIG --request WORKER_HOME/runtimes-request.json`. Require a `Recorded` reply.
+   The administrator-authenticated mutation goes through consensus and requires the same worker
+   incarnation, draining, confirmed idle assignments and completed recovery reconciliation. It works
+   with a singleton or replicated control plane.
+5. Restart the worker, verify its advertised runtime, and undrain it (`fleet drain WORKER --resume`).
+
+Existing runtime digests and OS/architecture cannot change, and existing capability names cannot be
+removed. New declarations/capabilities are additive so historical jobs remain compatible. To change
+budgets, aliases or replace an image, prepare a new worker registration instead.
+
+If local preparation is interrupted, rerun it with the same instance configuration; startup fails
+closed on a partial journal/config update. The generated request ID is deterministic: retry the same
+file after a timeout or lost reply. A local catalog not yet committed by the controller cannot accept
+new assignments. Keep the worker drained until the update is confirmed; do not discard its home.
 
 Enroll storage as described in [artifact storage](ARTIFACT_STORAGE.md), then set the complete policy:
 

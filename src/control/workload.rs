@@ -162,6 +162,23 @@ pub struct WorkerView {
 }
 
 impl Registration {
+    /// Monotonic catalog updates keep every previously accepted workload compatible.
+    pub fn with_added_runtimes(
+        &self,
+        runtimes: &BTreeMap<String, super::portable::Runtime>,
+    ) -> Result<Self> {
+        for (image, old) in &self.runtimes {
+            old.accepts(
+                runtimes
+                    .get(image)
+                    .ok_or_else(|| anyhow::anyhow!("cannot remove an advertised runtime"))?,
+            )?;
+        }
+        let mut next = self.clone();
+        next.runtimes = runtimes.clone();
+        next.validate()?;
+        Ok(next)
+    }
     pub fn validate(&self) -> Result<()> {
         self.peer.validate()?;
         for (image, runtime) in &self.runtimes {
@@ -332,6 +349,47 @@ impl Assignment {
 }
 
 impl State {
+    pub fn add_worker_runtimes(
+        &mut self,
+        worker: &str,
+        incarnation: &str,
+        runtimes: &BTreeMap<String, super::portable::Runtime>,
+    ) -> Reply {
+        let validate = || -> Result<Registration> {
+            let old = self
+                .workers
+                .get(worker)
+                .ok_or_else(|| anyhow::anyhow!("unknown worker"))?;
+            ensure!(old.incarnation == incarnation, "worker incarnation differs");
+            ensure!(
+                self.drained.contains(worker),
+                "drain worker before updating runtimes"
+            );
+            ensure!(
+                self.recovery_allows_work(worker),
+                "worker recovery is not reconciled"
+            );
+            ensure!(
+                self.assignments
+                    .values()
+                    .filter(|a| a.worker == worker)
+                    .all(|a| a
+                        .observed
+                        .as_ref()
+                        .is_some_and(|(r, o)| *r == a.revision && o.phase.terminal())),
+                "worker has unfinished or unconfirmed assignments"
+            );
+            old.with_added_runtimes(runtimes)
+        };
+        match validate() {
+            Ok(next) => {
+                self.workers.insert(worker.into(), next);
+                Reply::Recorded
+            }
+            Err(e) => Reply::rejected(&e.to_string()),
+        }
+    }
+
     pub fn enroll(&mut self, worker: &Registration) -> Reply {
         if let Err(e) = worker.validate() {
             return Reply::rejected(&e.to_string());
