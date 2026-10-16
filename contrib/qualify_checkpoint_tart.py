@@ -20,6 +20,17 @@ from cli_fixture import api_result
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def rolling_reclaimed(status):
+    # Checkpoint ownership and asynchronous cache GC can become visible in different reports.
+    # Wait for both, and never treat an unavailable/empty report as successful reclamation.
+    reports = [row['report'] for row in status['workers']]
+    return bool(reports) and all(
+        report and report['checkpoints']
+        and all(usage['live_checkpoints'] == 2 for usage in report['checkpoints'].values())
+        and report['blob_payload_bytes'] <= 2 * 65536
+        for report in reports)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
@@ -159,11 +170,7 @@ time.sleep(500)
         request(op='submit', id='resumable', request_id='submit', worker='checkpoint-worker', memory_mb=vm_memory, job=job)
         if a.rolling:
             captures = wait(lambda: request(op='checkpoints', id='resumable'), lambda rows: len(rows) == 24, seconds=480)
-            def bounded(status):
-                reports = [r['report'] for r in status['workers'] if r['report']]
-                return bool(reports) and all(
-                    u['live_checkpoints'] == 2 for r in reports for u in r['checkpoints'].values())
-            status = wait(lambda: request(op='storage'), bounded)
+            status = wait(lambda: request(op='storage'), rolling_reclaimed)
             save('rolling-storage.json', status)
             assert all(r['report']['blob_payload_bytes'] <= 2*65536 for r in status['workers'])
             artifacts = request(op='artifacts')
