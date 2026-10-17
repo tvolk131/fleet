@@ -150,6 +150,9 @@ pub async fn recover(
     state.membership = StoredMembership::default();
     state.configuration = MembershipState::default();
     state.membership_operations.clear();
+    // The new authority preserves activated behavior, but old-cohort preparation is obsolete.
+    state.version.pending = None;
+    state.version.revision += 1;
     let held = state
         .recovery
         .as_ref()

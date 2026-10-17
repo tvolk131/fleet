@@ -28,9 +28,9 @@ use serde::{Deserialize, Serialize};
 
 use super::discovery::save_cache;
 use super::membership::{MembershipView, spawn_reconciler};
-use super::{Command, FORMAT, Raft, Reply, Request, State, Store, TypeConfig, store::MAX_SNAPSHOT};
+use super::{Command, Raft, Reply, Request, State, Store, TypeConfig, store::MAX_SNAPSHOT};
 
-pub const ALPN: &[u8] = b"fleet/control/10";
+pub const ALPN: &[u8] = b"fleet/control/rolling/1";
 const MAX_FRAME: usize = 8 << 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,10 +101,14 @@ pub enum Message {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReplicaStatus {
+    pub software: super::version::Software,
+    pub version: super::version::ClusterVersion,
     pub id: u64,
     pub leader: Option<u64>,
     pub term: u64,
     pub last_log_index: Option<u64>,
+    pub snapshot: Option<openraft::LogId<u64>>,
+    pub purged: Option<openraft::LogId<u64>>,
     pub last_applied: Option<openraft::LogId<u64>>,
     pub membership: MembershipView,
     pub blocked_peers: BTreeSet<EndpointId>,
@@ -133,6 +137,8 @@ pub enum Answer {
 #[derive(Debug, Serialize, Deserialize)]
 struct Frame {
     format: u32,
+    replica_generation: Option<u32>,
+    software: super::version::Software,
     cluster: String,
     message: Message,
 }
@@ -166,8 +172,19 @@ async fn exchange_with_view(
     cluster: &str,
     message: Message,
 ) -> Result<WireAnswer> {
+    exchange_generation(connection, cluster, message, None).await
+}
+
+async fn exchange_generation(
+    connection: &Connection,
+    cluster: &str,
+    message: Message,
+    replica_generation: Option<u32>,
+) -> Result<WireAnswer> {
     let bytes = serde_json::to_vec(&Frame {
-        format: FORMAT,
+        replica_generation,
+        format: super::version::WIRE,
+        software: super::version::Software::current(),
         cluster: cluster.into(),
         message,
     })?;
@@ -183,6 +200,7 @@ pub type Blocked = Arc<RwLock<BTreeSet<EndpointId>>>;
 
 #[derive(Clone)]
 struct Factory {
+    store: Store,
     endpoint: Endpoint,
     cluster: String,
     blocked: Blocked,
@@ -286,12 +304,15 @@ impl Network {
                         .await?,
                 );
             }
-            exchange(
+            let generation = self.factory.store.state().await?.version.active;
+            Ok(exchange_generation(
                 self.connection.as_ref().expect("connected"),
                 &self.factory.cluster,
                 message,
+                Some(generation),
             )
-            .await
+            .await?
+            .answer)
         })
         .await
         .context("raft RPC timeout")?;
@@ -391,8 +412,11 @@ impl Handler {
     }
 
     async fn answer(&self, peer: EndpointId, frame: Frame) -> Answer {
-        if frame.format != FORMAT || frame.cluster != self.config.cluster {
-            return Answer::Refused("cluster or protocol mismatch".into());
+        if frame.format != super::version::WIRE
+            || frame.cluster != self.config.cluster
+            || !frame.software.overlaps(super::version::Software::current())
+        {
+            return Answer::Refused("cluster or protocol compatibility mismatch".into());
         }
         let peers = match self.peers().await {
             Ok(peers) => peers,
@@ -408,6 +432,31 @@ impl Handler {
             .and_then(|id| peers.get(&id))
             .is_some_and(|p| p.identity == peer);
         let is_admin = self.config.administrators.contains(&peer);
+        if sender.is_some() {
+            if frame.replica_generation.is_none_or(|g| {
+                !frame.software.supports(g) || !super::version::Software::current().supports(g)
+            }) {
+                return Answer::Refused(
+                    "replica traffic requires an unsupported cluster generation".into(),
+                );
+            }
+            let state = match self.store.state().await {
+                Ok(s) => s,
+                Err(e) => return Answer::Refused(e.to_string()),
+            };
+            if !frame.software.supports(state.version.active) {
+                return Answer::Refused(
+                    "replica does not support the active cluster generation".into(),
+                );
+            }
+        }
+        // A readiness report is only accepted from that replica after its local durable promise.
+        if let Message::Write(request) = &frame.message
+            && let super::Mutation::ReplicaPrepared { node, .. } = &request.mutation
+            && !peers.get(node).is_some_and(|p| p.identity == peer)
+        {
+            return Answer::Refused("only the replica can acknowledge its preparation".into());
+        }
         match frame.message {
             Message::Append(rpc) if is_replica => {
                 Answer::Append(self.raft.append_entries(rpc).await)
@@ -421,6 +470,7 @@ impl Handler {
             }
             Message::Write(request)
                 if is_admin
+                    || matches!(&request.mutation, super::Mutation::ReplicaPrepared {node, ..} if peers.get(node).is_some_and(|p|p.identity==peer))
                     || matches!(&request.mutation, super::Mutation::HistoryReport(r) if self.store.state().await.ok().is_some_and(|s| s.history_reporter(&peer.to_string(),r)))
                     || matches!(&request.mutation,
                 super::Mutation::WorkerReport(report) if self.store.state().await.ok().and_then(|s| s.workers.get(&report.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == report.incarnation))
@@ -431,6 +481,13 @@ impl Handler {
             {
                 if request.id.is_empty() || request.id.len() > 512 {
                     return Answer::Refused("request ID must contain 1 to 512 bytes".into());
+                }
+                let state = match self.store.state().await {
+                    Ok(s) => s,
+                    Err(e) => return Answer::Refused(e.to_string()),
+                };
+                if request.mutation.minimum_generation() > state.version.active {
+                    return Answer::Refused("operation requires an inactive cluster generation; request was not accepted".into());
                 }
                 Answer::Write(
                     self.raft
@@ -658,10 +715,14 @@ impl Handler {
                     Err(error) => return Answer::Refused(error.to_string()),
                 };
                 Answer::Inspect(ReplicaStatus {
+                    software: super::version::Software::current(),
+                    version: state.version.clone(),
                     id: self.config.id,
                     leader: metrics.current_leader,
                     term: metrics.current_term,
                     last_log_index: metrics.last_log_index,
+                    snapshot: metrics.snapshot,
+                    purged: metrics.purged,
                     last_applied: state.last_applied,
                     membership: state.membership_view(),
                     blocked_peers: self.blocked.read().expect("blocked").clone(),
@@ -740,6 +801,7 @@ pub struct Replica {
     pub membership_paused: Arc<AtomicBool>,
     pub membership_task: tokio::task::JoinHandle<()>,
     scheduler_task: tokio::task::JoinHandle<()>,
+    version_task: tokio::task::JoinHandle<()>,
     bootstrap_peers: Option<BTreeMap<u64, Peer>>,
 }
 
@@ -771,6 +833,7 @@ impl Replica {
                 == config.peers.len(),
             "duplicate replica identity"
         );
+        Store::preflight(&home.join("control.redb"), &config.cluster, config.id)?;
         let endpoint = connect_endpoint(key, peer.address).await?;
         let store = Store::open(&home.join("control.redb"), &config.cluster, config.id)?;
         if let Some(recorded) = store.state().await?.configuration.catalog.get(&config.id) {
@@ -796,6 +859,7 @@ impl Replica {
         }
         .validate()?;
         let factory = Factory {
+            store: store.clone(),
             endpoint: endpoint.clone(),
             cluster: config.cluster.clone(),
             blocked: blocked.clone(),
@@ -811,6 +875,16 @@ impl Replica {
         .await?;
         let presence = super::queue::Presence::default();
         let scheduler_task = super::queue::spawn(raft.clone(), store.clone(), presence.clone());
+        let version_task = super::version::spawn(
+            raft.clone(),
+            store.clone(),
+            Client::from_endpoint(
+                endpoint.clone(),
+                config.cluster.clone(),
+                config.peers.clone(),
+            )?,
+            config.id,
+        );
         let router = Router::builder(endpoint)
             .accept(
                 ALPN,
@@ -836,6 +910,7 @@ impl Replica {
             membership_paused,
             membership_task,
             scheduler_task,
+            version_task,
             bootstrap_peers,
         })
     }
@@ -863,6 +938,8 @@ impl Replica {
         Ok(())
     }
     pub async fn shutdown(self) -> Result<()> {
+        self.version_task.abort();
+        let _ = self.version_task.await;
         self.scheduler_task.abort();
         let _ = self.scheduler_task.await;
         self.membership_task.abort();

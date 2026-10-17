@@ -1,4 +1,4 @@
-//! Explicit offline conversion of idle format-5 through 10 metadata. No rolling mixed-version protocol.
+//! Explicit offline conversion of idle format-5 through 11 metadata. No rolling mixed-version protocol.
 use super::{Mutation, State};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -111,11 +111,11 @@ pub(crate) fn mutation(value: &mut Value, assignments: &Value) -> Result<()> {
 
 pub(crate) fn state(mut value: Value) -> Result<State> {
     artifact_origins(&mut value);
-    if matches!(value["format"].as_u64(), Some(6..=10)) {
+    if matches!(value["format"].as_u64(), Some(6..=11)) {
         let mut state: State = serde_json::from_value(value)?;
         ensure!(
             state.recovery.is_none(),
-            "format-6/7/8/9/10 recovery-bound state requires a separate migration"
+            "format-6/7/8/9/10/11 recovery-bound state requires a separate migration"
         );
         ensure!(
             state.membership.voter_ids().count() == 1
@@ -247,10 +247,10 @@ pub(crate) fn journal(mut value: Value) -> Result<Value> {
     if value["format"] == super::FORMAT {
         return Ok(value);
     }
-    if matches!(value["format"].as_u64(), Some(6..=10)) {
+    if matches!(value["format"].as_u64(), Some(6..=11)) {
         ensure!(
             value["recovery_inventory"].is_null() && value["recovery_binding"].is_null(),
-            "format-6/7/8/9/10 recovery-bound worker requires a separate migration"
+            "format-6/7/8/9/10/11 recovery-bound worker requires a separate migration"
         );
         for (_, item) in value["observations"]
             .as_object()
@@ -342,6 +342,26 @@ pub fn run(
     clients: &[std::path::PathBuf],
 ) -> Result<()> {
     let controller_path = controller.join("control.redb");
+    // Even an explicitly requested offline migration must reject incompatible source metadata
+    // before redb can repair or mutate the real file.
+    let raw = super::version::preflight(&controller_path, "meta")?
+        .context("missing controller database")?;
+    let source_format = raw["identity"][0]
+        .as_u64()
+        .context("missing source format")?;
+    if source_format == super::FORMAT as u64 {
+        let cluster = raw["identity"][1]
+            .as_str()
+            .context("missing source cluster")?;
+        let node = raw["identity"][2].as_u64().context("missing source node")?;
+        super::Store::preflight(&controller_path, cluster, node)?;
+    } else {
+        ensure!(
+            (5..=11).contains(&source_format),
+            "unsupported source format"
+        );
+        super::version::Software::current().require(1)?;
+    }
     let controller_db =
         redb::Database::open(&controller_path).context("stop the controller before upgrading")?;
     let worker_dbs = workers

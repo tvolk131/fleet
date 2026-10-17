@@ -21,6 +21,20 @@ const WAIT: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ApiRequest {
+    Versions,
+    PrepareVersion {
+        request_id: String,
+        expected_revision: u64,
+        target: u32,
+    },
+    ActivateVersion {
+        request_id: String,
+        expected_revision: u64,
+    },
+    AbortVersion {
+        request_id: String,
+        expected_revision: u64,
+    },
     History {
         id: String,
     },
@@ -232,7 +246,10 @@ fn log_size() -> u32 {
 impl ApiRequest {
     pub fn request_id(&self) -> Option<&str> {
         match self {
-            Self::HistoryRetention { request_id, .. } => Some(request_id),
+            Self::PrepareVersion { request_id, .. }
+            | Self::ActivateVersion { request_id, .. }
+            | Self::AbortVersion { request_id, .. }
+            | Self::HistoryRetention { request_id, .. } => Some(request_id),
             Self::ReviewStorageRecovery { request_id, .. }
             | Self::ReplaceStorage { request_id, .. }
             | Self::RetireStorage { request_id, .. }
@@ -345,6 +362,24 @@ impl AppClient {
             return self.send(prepared).await;
         }
         let mutation = match api {
+            ApiRequest::PrepareVersion {
+                expected_revision,
+                target,
+                ..
+            } => Mutation::PrepareVersion {
+                expected_revision: *expected_revision,
+                target: *target,
+            },
+            ApiRequest::ActivateVersion {
+                expected_revision, ..
+            } => Mutation::ActivateVersion {
+                expected_revision: *expected_revision,
+            },
+            ApiRequest::AbortVersion {
+                expected_revision, ..
+            } => Mutation::AbortVersion {
+                expected_revision: *expected_revision,
+            },
             ApiRequest::ReplaceStorage {
                 storage,
                 replacement,
@@ -793,7 +828,10 @@ impl AppClient {
                 }
                 Ok(answer)
             }
-            ApiRequest::ReviewStorageRecovery { .. }
+            ApiRequest::PrepareVersion { .. }
+            | ApiRequest::ActivateVersion { .. }
+            | ApiRequest::AbortVersion { .. }
+            | ApiRequest::ReviewStorageRecovery { .. }
             | ApiRequest::ReplaceStorage { .. }
             | ApiRequest::RetireStorage { .. }
             | ApiRequest::FinishStorageRetirement { .. }
@@ -839,7 +877,7 @@ impl AppClient {
                 Ok(json!(requests))
             }
             ApiRequest::Stage { id } => self.stage(id.as_deref()).await,
-            ApiRequest::Status => {
+            ApiRequest::Versions | ApiRequest::Status => {
                 let state = self.read().await?;
                 let mut replicas = Vec::new();
                 for id in self.transport.peers.keys().copied().collect::<Vec<_>>() {
@@ -851,7 +889,7 @@ impl AppClient {
                     );
                 }
                 Ok(
-                    json!({"format":state.format,"cluster":state.cluster,"quorum":true,"membership":state.membership_view(),"replicas":replicas,"recovery":state.recovery,"pending":state.scheduling_order().len()}),
+                    json!({"version":state.version,"software":super::version::Software::current(),"format":state.format,"cluster":state.cluster,"quorum":true,"membership":state.membership_view(),"replicas":replicas,"recovery":state.recovery,"pending":state.scheduling_order().len()}),
                 )
             }
             ApiRequest::History { id } => {

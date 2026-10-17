@@ -76,6 +76,12 @@ impl Journal {
                 "backend exists without worker journal; explicit recovery required"
             );
         }
+        if let Some(raw) = super::version::preflight(&path, "worker_journal")? {
+            ensure!(
+                raw["state"]["format"] == super::FORMAT,
+                "worker metadata format mismatch; explicit baseline migration required"
+            );
+        }
         let db = Database::create(path)?;
         let mut tx = db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;

@@ -23,6 +23,20 @@ pub struct Command {
 /// Deterministic application commands. External effects are reconciled by workers after commit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Mutation {
+    PrepareVersion {
+        expected_revision: u64,
+        target: u32,
+    },
+    ReplicaPrepared {
+        revision: u64,
+        node: u64,
+    },
+    ActivateVersion {
+        expected_revision: u64,
+    },
+    AbortVersion {
+        expected_revision: u64,
+    },
     HistoryReport(super::history::Report),
     HistoryPolicy {
         job: String,
@@ -143,6 +157,51 @@ pub enum Mutation {
     },
 }
 
+impl Mutation {
+    /// Explicitly classify every new operation. Ingress refuses inactive features before
+    /// replication, so an older voter never needs to deserialize a newer command variant.
+    pub(crate) fn minimum_generation(&self) -> u32 {
+        match self {
+            Self::PrepareVersion { .. }
+            | Self::ReplicaPrepared { .. }
+            | Self::ActivateVersion { .. }
+            | Self::AbortVersion { .. }
+            | Self::HistoryReport(..)
+            | Self::HistoryPolicy { .. }
+            | Self::SweepHistory { .. }
+            | Self::Enqueue(..)
+            | Self::EnrollStorage(..)
+            | Self::ReplaceStorage { .. }
+            | Self::RetireStorage { .. }
+            | Self::FinishStorageRetirement { .. }
+            | Self::DeclareStorageLost { .. }
+            | Self::ReviewStorageRecovery { .. }
+            | Self::StoragePolicy { .. }
+            | Self::ArtifactReady(..)
+            | Self::ArtifactReport(..)
+            | Self::ArtifactRetention { .. }
+            | Self::DeleteArtifact { .. }
+            | Self::ExpireArtifacts { .. }
+            | Self::Stage { .. }
+            | Self::CancelQueued { .. }
+            | Self::Place { .. }
+            | Self::Drain { .. }
+            | Self::RecoverWorker(..)
+            | Self::ResumeRecovery { .. }
+            | Self::Enroll { .. }
+            | Self::AddWorkerRuntimes { .. }
+            | Self::Assign { .. }
+            | Self::Desire { .. }
+            | Self::WorkerReport(..)
+            | Self::CheckpointReady(..)
+            | Self::SuspendJob { .. }
+            | Self::ResumeJob { .. }
+            | Self::ChangeMembership { .. }
+            | Self::Release { .. } => 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Reply {
     RecoveryUnknown { origin: String, current: String },
@@ -174,6 +233,8 @@ pub struct Receipt {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct State {
     #[serde(default)]
+    pub version: super::version::ClusterVersion,
+    #[serde(default)]
     pub history: super::history::Catalog,
     #[serde(default)]
     pub storage: super::artifact::Catalog,
@@ -201,6 +262,12 @@ pub fn key(principal: &str, id: &str) -> String {
 impl State {
     pub fn new(cluster: String) -> Self {
         Self {
+            // New clusters start at the binary's floor. Deserializing old metadata still
+            // defaults to generation one, never silently to the running executable's version.
+            version: super::version::ClusterVersion {
+                active: super::version::MIN,
+                ..Default::default()
+            },
             history: Default::default(),
             storage: Default::default(),
             jobs: BTreeMap::new(),
@@ -298,7 +365,21 @@ impl State {
         mutation: &Mutation,
         index: u64,
     ) -> Reply {
+        if mutation.minimum_generation() > self.version.active {
+            return Reply::rejected("operation requires an inactive cluster generation");
+        }
         match mutation {
+            Mutation::PrepareVersion {
+                expected_revision,
+                target,
+            } => self.prepare_version(*expected_revision, *target),
+            Mutation::ReplicaPrepared { revision, node } => {
+                self.replica_prepared(principal, *revision, *node)
+            }
+            Mutation::ActivateVersion { expected_revision } => {
+                self.activate_version(*expected_revision)
+            }
+            Mutation::AbortVersion { expected_revision } => self.abort_version(*expected_revision),
             Mutation::HistoryReport(r) => self.history_report(principal, r),
             Mutation::HistoryPolicy {
                 job,

@@ -36,6 +36,7 @@ class FixtureSafeguards(unittest.TestCase):
                 {'controller_home': '/tmp/not-this-fixture'},
                 {'controller_home': str(root / 'controller'), 'worker_home': str(Path.home() / '.fleet')},
                 {'client_home': '../escape'},
+                {'controller_home': str(root / 'controller'), 'storage_home': '/tmp/not-this-fixture'},
                 {},
             ]:
                 config.write_text(json.dumps(settings))

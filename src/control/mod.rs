@@ -24,6 +24,7 @@ pub mod storage_lifecycle;
 mod storage_status;
 pub mod store;
 pub mod upgrade;
+pub mod version;
 pub mod workload;
 
 pub use model::{Command, Mutation, Reply, Request, State};
@@ -41,4 +42,5 @@ openraft::declare_raft_types!(
 
 pub type Raft = openraft::Raft<TypeConfig>;
 pub type Entry = openraft::Entry<TypeConfig>;
-pub const FORMAT: u32 = 11;
+// Physical metadata layout. Independent of wire and cluster behavior generations.
+pub const FORMAT: u32 = 12;

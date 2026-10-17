@@ -147,8 +147,8 @@ rejected even when it might happen to work. Approved image availability remains 
 ## Upgrade and qualification
 
 Portable jobs introduced format 9 and [durable history](DURABLE_HISTORY.md) introduced format 10.
-[Storage-agent lifecycle](ARTIFACT_STORAGE.md#replace-and-retire-a-storage-agent) uses format 11. Use the explicit offline [metadata upgrade](CHECKPOINT_JOBS.md#explicit-format-5678910-upgrade)
-from formats 5–10; mixed binaries are rejected. Migration preserves old artifact IDs, suspended jobs and
+[Storage-agent lifecycle](ARTIFACT_STORAGE.md#replace-and-retire-a-storage-agent) introduced format 11. The [rolling-upgrade baseline](ROLLING_UPGRADES.md) uses physical format 12. Use the explicit offline [metadata upgrade](CHECKPOINT_JOBS.md#explicit-format-567891011-upgrade)
+from formats 5–11; older physical formats cannot join the new baseline. Migration preserves old artifact IDs, suspended jobs and
 retained request receipts. It does not retroactively turn old jobs into portable jobs.
 
 CI runs the Rust protocol/state-machine and headless GUI tests plus the JSON CLI scenario:

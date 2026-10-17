@@ -55,6 +55,7 @@ macOS VMs and can explicitly suspend at an application checkpoint and resume in 
 or public-internet-only networking policies remain unchanged.
 
 - [Artifact backups, restore, retention, and storage roles](docs/ARTIFACT_STORAGE.md)
+- [Rolling control-plane upgrades](docs/ROLLING_UPGRADES.md)
 - [Checkpoint-resumable VM jobs and metadata upgrade](docs/CHECKPOINT_JOBS.md)
 - [Local failure scenarios and CI](docs/LOCAL_ROLLOUT.md)
 - [Normal client/service guide](docs/NORMAL_FLEET.md)

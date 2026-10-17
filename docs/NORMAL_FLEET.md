@@ -221,7 +221,7 @@ another client may have submitted work since the earlier audit. A replica-only d
 an old worker remains busy. Reverting to the old installation also requires draining the new worker first.
 
 Cross-worker checkpoint migration, preemption, direct persistent-guest commands, per-user ACLs,
-background output fetching to remembered destinations, shared blob-cache vacuum, and mixed-version upgrades
+background output fetching to remembered destinations, and shared blob-cache vacuum
 are not in this release. Receipts are retained indefinitely unless explicitly released through the low-level
 administrative contract; automatic 90-day pruning remains future work. Metadata/snapshot size limits from
 the qualification remain applicable. Existing backend guarantees do not make CPU/GPU scheduling exclusive
@@ -232,3 +232,5 @@ The desktop GUI uses `iced-m3` Material 3 components, follows system light/dark 
 ## Qualification and rollout status
 
 See the [local scenarios and CI guide](LOCAL_ROLLOUT.md) for reproducible automated checks. Real hardware deployment records are retained locally.
+
+See [rolling control-plane upgrades](ROLLING_UPGRADES.md) for adjacent generation compatibility, preparation, activation, rollback boundaries, and release qualification.

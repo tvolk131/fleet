@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--binary', type=Path, required=True)
+    p.add_argument('--baseline-binary', type=Path, help='Qualify rolling-capable baseline to candidate during a running fake Tart job')
     p.add_argument('--home', type=Path, required=True)
     p.add_argument('--fake', action='store_true')
     p.add_argument('--storage-lifecycle', action='store_true', help='replace and retire storage, then qualify explicit lost-agent repair')
@@ -30,6 +31,7 @@ def main():
     assert a.home.is_absolute() and a.home.resolve().is_relative_to(Path('/tmp').resolve())
     assert a.home.name.startswith('fleet-control-') and not a.home.exists()
     assert a.fake or (a.instances and a.image_cache)
+    assert not a.baseline_binary or a.fake, 'mixed-version fixture is local/fake only'
     before = preservation()
     normal, normal_before = None, None
     installed = Path.home() / 'fleet/replicated/service.json'
@@ -44,7 +46,13 @@ def main():
     a.home.mkdir(mode=0o700, parents=True)
     shutil.copy2(a.binary.resolve(), a.home / 'fleet')
     binary = a.home / 'fleet'
+    candidate_binary = binary
     result = dict(real_tart=not a.fake, binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(), physical_failure_domain='same-machine; no physical host-loss claim')
+    if a.baseline_binary:
+        shutil.copy2(a.baseline_binary.resolve(), a.home / 'fleet-baseline')
+        binary = a.home / 'fleet-baseline'
+        result['baseline_binary_sha256'] = hashlib.sha256(binary.read_bytes()).hexdigest()
+    role_binaries = {}
     processes, logs, caches = {}, [], []
     client = a.home / 'client'
     backup_id = 'backup'
@@ -67,7 +75,7 @@ def main():
     def start(name):
         log = (a.home / f'{name}.log').open('a')
         logs.append(log)
-        processes[name] = subprocess.Popen([str(binary), 'service', 'run', '--config', str(a.home / f'{name}.json')], stdout=log, stderr=log)
+        processes[name] = subprocess.Popen([str(role_binaries.setdefault(name, binary)), 'service', 'run', '--config', str(a.home / f'{name}.json')], stdout=log, stderr=log)
 
     def stop(name):
         child = processes.pop(name, None)
@@ -189,6 +197,27 @@ print('diagnostic-'+sys.argv[1], file=sys.stderr, flush=True)""")
 
         initial = wait(stage_and_read, lambda j: j['latest_checkpoint'] is not None)
         checkpoint = initial['latest_checkpoint']
+        if a.baseline_binary:
+            supervisor = source / 'backend/jobs/exec-portable-a1/supervisor.json'
+            original_supervisor = supervisor.read_bytes()
+            binary = candidate_binary
+            stop('control')
+            role_binaries['control'] = binary
+            start('control')
+            version = request(op='versions')['version']
+            request(op='prepare_version', expected_revision=version['revision'], target=2, request_id='vm-upgrade-prepare')
+            ready = wait(lambda: request(op='versions')['version'], lambda v: v['pending']['ready'] == [1])
+            request(op='activate_version', expected_revision=ready['revision'], request_id='vm-upgrade-activate')
+            # Old agents remain usable after activation; then restart them one at a time.
+            assert request(op='job', id='portable')['phase'] == 'running'
+            for role in ['source', 'destination'] + (['backup'] if a.storage_lifecycle else []):
+                stop(role)
+                role_binaries[role] = binary
+                start(role)
+                assert request(op='job', id='portable')['phase'] == 'running'
+                assert supervisor.read_bytes() == original_supervisor
+            assert request(op='versions')['version']['active'] == 2
+            result['rolling_vm_agent_upgrade'] = True
         assert initial['assignment']['worker'] == 'source'
         bundle = initial['input_bundle']
         wait(lambda: request(op='artifacts'), lambda rows: any(r['artifact']['manifest']['kind'] == {'Checkpoint': checkpoint['id']} and r['artifact']['copies'].get(f'storage/{backup_id}', {})['phase'] == 'Ready' for r in rows))
