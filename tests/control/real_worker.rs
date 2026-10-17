@@ -239,7 +239,7 @@ async fn native_worker_survives_lost_reply_restart_and_replica_replacement() {
     let input = c.home.0.join("input.txt");
     std::fs::write(&input, "verified result\n").unwrap();
     let hash = local_store.blobs().add_path(&input).await.unwrap().hash;
-    let mut spec = job("echo started; cat input.txt > result.txt; sleep 25");
+    let mut spec = job("cat input.txt > result.txt; echo started; sleep 25");
     spec.inputs.insert(
         "input.txt".into(),
         jobs::Input {
@@ -281,20 +281,39 @@ async fn native_worker_survives_lost_reply_restart_and_replica_replacement() {
         jobs::read_json(&home.join("backend/jobs/exec-native/supervisor.json"))
             .unwrap()
             .unwrap();
-    let logs = data_call(
-        &c.client.endpoint,
-        &c.config.cluster,
-        &config.registration.peer,
-        DataRequest::Logs {
-            execution: "exec-native".into(),
-            stderr: false,
-            from: 0,
-            max: 1000,
-        },
-    )
-    .await
-    .unwrap();
-    assert!(matches!(logs, proto::Response::Logs { data, .. } if data == "started\n"));
+    // Running means the supervisor launched; the child can still be producing its first output.
+    // The marker follows result.txt publication so neither log nor output assertions race startup.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let logs = data_call(
+            &c.client.endpoint,
+            &c.config.cluster,
+            &config.registration.peer,
+            DataRequest::Logs {
+                execution: "exec-native".into(),
+                stderr: false,
+                from: 0,
+                max: 1000,
+            },
+        )
+        .await
+        .unwrap();
+        let proto::Response::Logs { data, .. } = logs else {
+            panic!("unexpected logs response: {logs:?}");
+        };
+        if data == "started\n" {
+            break;
+        }
+        assert!(
+            "started\n".starts_with(&data),
+            "unexpected log bytes: {data:?}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "startup log did not arrive"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     let files = fetch_outputs(
         &local_store,
         &c.client.endpoint,
