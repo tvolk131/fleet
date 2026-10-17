@@ -137,6 +137,7 @@ pub enum Answer {
 #[derive(Debug, Serialize, Deserialize)]
 struct Frame {
     format: u32,
+    replica_generation: Option<u32>,
     software: super::version::Software,
     cluster: String,
     message: Message,
@@ -171,7 +172,17 @@ async fn exchange_with_view(
     cluster: &str,
     message: Message,
 ) -> Result<WireAnswer> {
+    exchange_generation(connection, cluster, message, None).await
+}
+
+async fn exchange_generation(
+    connection: &Connection,
+    cluster: &str,
+    message: Message,
+    replica_generation: Option<u32>,
+) -> Result<WireAnswer> {
     let bytes = serde_json::to_vec(&Frame {
+        replica_generation,
         format: super::version::WIRE,
         software: super::version::Software::current(),
         cluster: cluster.into(),
@@ -189,6 +200,7 @@ pub type Blocked = Arc<RwLock<BTreeSet<EndpointId>>>;
 
 #[derive(Clone)]
 struct Factory {
+    store: Store,
     endpoint: Endpoint,
     cluster: String,
     blocked: Blocked,
@@ -292,12 +304,15 @@ impl Network {
                         .await?,
                 );
             }
-            exchange(
+            let generation = self.factory.store.state().await?.version.active;
+            Ok(exchange_generation(
                 self.connection.as_ref().expect("connected"),
                 &self.factory.cluster,
                 message,
+                Some(generation),
             )
-            .await
+            .await?
+            .answer)
         })
         .await
         .context("raft RPC timeout")?;
@@ -418,6 +433,14 @@ impl Handler {
             .is_some_and(|p| p.identity == peer);
         let is_admin = self.config.administrators.contains(&peer);
         if sender.is_some() {
+            if frame
+                .replica_generation
+                .is_none_or(|g| !super::version::Software::current().supports(g))
+            {
+                return Answer::Refused(
+                    "replica traffic requires an unsupported cluster generation".into(),
+                );
+            }
             let state = match self.store.state().await {
                 Ok(s) => s,
                 Err(e) => return Answer::Refused(e.to_string()),
@@ -830,6 +853,7 @@ impl Replica {
         }
         .validate()?;
         let factory = Factory {
+            store: store.clone(),
             endpoint: endpoint.clone(),
             cluster: config.cluster.clone(),
             blocked: blocked.clone(),
@@ -846,6 +870,7 @@ impl Replica {
         let presence = super::queue::Presence::default();
         let scheduler_task = super::queue::spawn(raft.clone(), store.clone(), presence.clone());
         let version_task = super::version::spawn(
+            raft.clone(),
             store.clone(),
             Client::from_endpoint(
                 endpoint.clone(),

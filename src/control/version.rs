@@ -193,7 +193,12 @@ impl State {
 
 /// Every replica prepares its own disk before acknowledging through the replicated journal.
 /// No quorum is required to restart; a quorum is required to record readiness or activate.
-pub fn spawn(store: Store, mut client: Client, node: u64) -> tokio::task::JoinHandle<()> {
+pub fn spawn(
+    raft: super::Raft,
+    store: Store,
+    mut client: Client,
+    node: u64,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let tick = async {
@@ -209,19 +214,25 @@ pub fn spawn(store: Store, mut client: Client, node: u64) -> tokio::task::JoinHa
                     .prepare_version(state.version.revision, p.target)
                     .await?;
                 client.learn(state.routing_view())?;
-                client
-                    .write(
-                        Request {
-                            origin: state.cluster,
-                            id: format!("replica-version-{}-{node}", state.version.revision),
-                            mutation: Mutation::ReplicaPrepared {
-                                revision: state.version.revision,
-                                node,
-                            },
-                        },
-                        Duration::from_secs(3),
-                    )
+                let request = Request {
+                    origin: state.cluster,
+                    id: format!("replica-version-{}-{node}", state.version.revision),
+                    mutation: Mutation::ReplicaPrepared {
+                        revision: state.version.revision,
+                        node,
+                    },
+                };
+                if raft.metrics().borrow().current_leader == Some(node) {
+                    // iroh deliberately refuses dialing one's own endpoint. Use the same Raft
+                    // command path locally; followers still authenticate through the network.
+                    raft.client_write(super::Command {
+                        principal: client.endpoint.id().to_string(),
+                        request,
+                    })
                     .await?;
+                } else {
+                    client.write(request, Duration::from_secs(3)).await?;
+                }
                 Ok(())
             };
             if let Err(error) = tick.await {
