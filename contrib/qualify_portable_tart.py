@@ -20,10 +20,13 @@ def main():
     p.add_argument('--binary', type=Path, required=True)
     p.add_argument('--home', type=Path, required=True)
     p.add_argument('--fake', action='store_true')
+    p.add_argument('--storage-lifecycle', action='store_true', help='replace and retire storage, then qualify explicit lost-agent repair')
     p.add_argument('--history', action='store_true', help='qualify archived logs/JSONL metrics across both attempts with source offline')
     p.add_argument('--instances', type=Path)
     p.add_argument('--image-cache', type=Path)
     a = p.parse_args()
+    if a.storage_lifecycle:
+        a.history = True
     assert a.home.is_absolute() and a.home.resolve().is_relative_to(Path('/tmp').resolve())
     assert a.home.name.startswith('fleet-control-') and not a.home.exists()
     assert a.fake or (a.instances and a.image_cache)
@@ -44,6 +47,7 @@ def main():
     result = dict(real_tart=not a.fake, binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(), physical_failure_domain='same-machine; no physical host-loss claim')
     processes, logs, caches = {}, [], []
     client = a.home / 'client'
+    backup_id = 'backup'
     source, destination, storage = [a.home / n for n in ('source', 'destination', 'storage')]
 
     def save(name, value):
@@ -113,7 +117,14 @@ def main():
             caches.append(cache)
         command('service', 'configure', '--config', a.home / f'{name}.json', '--worker-home', home)
     command('cluster', 'prepare-storage', '--home', storage, '--config', client / 'config.json', '--id', 'backup', '--failure-domain', 'same-qualification-machine', '--capacity-bytes', 32 << 20)
-    command('service', 'configure', '--config', a.home / 'control.json', '--controller-home', a.home / 'seed/node-1', '--storage-home', storage, '--bootstrap')
+    command('service', 'configure', '--config', a.home / 'control.json', '--controller-home', a.home / 'seed/node-1',
+            *([] if a.storage_lifecycle else ['--storage-home', storage]), '--bootstrap')
+    if a.storage_lifecycle:
+        command('service', 'configure', '--config', a.home / 'backup.json', '--storage-home', storage)
+        for store_id in ('replacement', 'reserve', 'recovery'):
+            command('cluster', 'prepare-storage', '--home', a.home / store_id, '--config', client / 'config.json',
+                    '--id', store_id, '--failure-domain', 'same-qualification-machine', '--capacity-bytes', 64 << 20)
+            command('service', 'configure', '--config', a.home / f'{store_id}.json', '--storage-home', a.home / store_id)
     inputs = a.home / 'original-inputs'
     inputs.mkdir()
     trainer = inputs / 'trainer'
@@ -148,6 +159,8 @@ print('diagnostic-'+sys.argv[1], file=sys.stderr, flush=True)""")
         job['metric_files'] = ['metrics.jsonl']
     try:
         start('control')
+        if a.storage_lifecycle:
+            start('backup')
         for home in (source, destination):
             command('--home', client, 'enroll', home / 'enroll.json', '--request-id', 'enroll-' + home.name)
         command('--home', client, 'storage', 'enroll', storage / 'registration.json', '--request-id', 'enroll-backup')
@@ -178,7 +191,7 @@ print('diagnostic-'+sys.argv[1], file=sys.stderr, flush=True)""")
         checkpoint = initial['latest_checkpoint']
         assert initial['assignment']['worker'] == 'source'
         bundle = initial['input_bundle']
-        wait(lambda: request(op='artifacts'), lambda rows: any(r['artifact']['manifest']['kind'] == {'Checkpoint': checkpoint['id']} and r['artifact']['copies']['storage/backup']['phase'] == 'Ready' for r in rows))
+        wait(lambda: request(op='artifacts'), lambda rows: any(r['artifact']['manifest']['kind'] == {'Checkpoint': checkpoint['id']} and r['artifact']['copies'].get(f'storage/{backup_id}', {})['phase'] == 'Ready' for r in rows))
         save('before-suspend.json', request(op='job', id='portable'))
         request(op='suspend', id='portable', checkpoint=checkpoint['id'], expected_revision=initial['revision'], request_id='suspend')
         suspended = wait(lambda: request(op='job', id='portable'), lambda j: j['phase'] == 'suspended')
@@ -197,6 +210,36 @@ print('diagnostic-'+sys.argv[1], file=sys.stderr, flush=True)""")
         stop('control')
         start('control')
         wait(lambda: request(op='storage'), lambda s: any(r['report'] is not None for r in s['storage_reports']))
+        if a.storage_lifecycle:
+            for store_id in ('replacement', 'reserve', 'recovery'):
+                command('--home', client, 'storage', 'enroll', a.home / store_id / 'registration.json', '--request-id', 'enroll-' + store_id)
+            # Pin the selected checkpoint; retiring a copy must preserve artifact-level pins.
+            cp_artifact = next(r['artifact'] for r in request(op='artifacts') if r['artifact']['manifest']['kind'] == {'Checkpoint': checkpoint['id']})
+            request(op='artifact_retention', id=cp_artifact['manifest']['id'], expected_revision=cp_artifact['revision'],
+                    pinned=True, expires_at=None, request_id='pin-during-replacement')
+            command('--home', client, 'storage', 'replace', 'backup', 'replacement', '--revision', 0, '--request-id', 'replace-backup')
+            request(op='retry', request_id='replace-backup')
+            plan = request(op='storage_plan', storage='backup')
+            assert plan['awaiting_replacement'], plan
+            rejected = api(binary, client, dict(op='retire_storage', storage='backup', expected_revision=1,
+                                               expected_inventory=plan['inventory'], request_id='too-early-retirement'))
+            assert rejected['ok'] and 'Rejected' in rejected['result']['reply'], rejected
+            start('replacement')
+            wait(lambda: request(op='storage_plan', storage='backup'), lambda p: not p['awaiting_replacement'])
+            stop('replacement'); start('replacement')
+            plan = wait(lambda: request(op='storage_plan', storage='backup'), lambda p: not p['awaiting_replacement'])
+            command('--home', client, 'storage', 'retire', 'backup', '--revision', 1, '--inventory', plan['inventory'], '--request-id', 'retire-backup')
+            wait(lambda: request(op='storage_plan', storage='backup'), lambda p: not p['awaiting_cleanup'])
+            command('--home', client, 'storage', 'finish-retirement', 'backup', '--revision', 2, '--request-id', 'finish-backup')
+            stop('backup'); start('backup')
+            assert request(op='storage_plan', storage='backup')['lifecycle']['phase'] == 'retired'
+            stop('backup')
+            assert not any((storage / 'objects').iterdir())
+            backup_id = 'replacement'
+            cp_artifact = next(r['artifact'] for r in request(op='artifacts') if r['artifact']['manifest']['id'] == cp_artifact['manifest']['id'])
+            assert cp_artifact['pinned'] and not cp_artifact['deleted']
+            result.update(storage_replacement=True, retirement_verified_before_cleanup=True, retirement_restart_fenced=True,
+                          replacement_preserves_pins=True, replacement_with_source_offline=True)
         if a.history:
             def read_stream(number, op, **extra):
                 offset, text = 0, []
@@ -221,6 +264,11 @@ print('diagnostic-'+sys.argv[1], file=sys.stderr, flush=True)""")
         final = wait(lambda: request(op='job', id='portable'), lambda j: j['phase'] in ('succeeded', 'failed', 'cancelled'), seconds=300)
         assert final['phase'] == 'succeeded', final
         assert final['assignment']['worker'] == 'destination' and len(final['attempts']) == 2
+        # Completion and artifact publication are asynchronous; wait for the selected attempt's verified output copy.
+        wait(lambda: request(op='artifacts'), lambda rows: any(
+            r['artifact']['manifest']['kind'] == 'FinalOutputs'
+            and r['artifact']['manifest']['origin'].get('Attempt',{}).get('attempt') == final['assignment']['id']
+            and r['artifact']['copies'].get(f'storage/{backup_id}',{}).get('phase') == 'Ready' for r in rows))
         request(op='fetch', id='portable', destination=str(a.home / 'outputs'))
         assert (a.home / 'outputs/result.txt').read_text() == '8'
         assert request(op='logs', id='portable')['Logs']['data'].count('resumed-once') == 1
@@ -239,18 +287,50 @@ print('diagnostic-'+sys.argv[1], file=sys.stderr, flush=True)""")
         result.update(cross_worker_resume=True, original_worker_and_client_unavailable=True, durable_executable_and_inputs=True,
                       cooperative_cleanup=True, controller_storage_restart=True, idempotent_resume=True, stable_job_identity=True)
         save('after-resume.json', final)
+        if a.storage_lifecycle:
+            status = request(op='storage')
+            request(op='storage_policy', expected_revision=status['revision'],
+                    policy={k:['replacement','reserve'] for k in ('inputs','checkpoints','outputs','history')}, request_id='redundant-backups')
+            start('reserve')
+            wait(lambda: request(op='artifacts'), lambda rows: all(r['artifact']['copies'].get('storage/reserve',{}).get('phase') == 'Ready' for r in rows))
+            stop('replacement')
+            (a.home/'replacement').rename(a.home/'lost-replacement')
+            plan = request(op='storage_plan', storage='replacement')
+            assert not plan['unavailable_without_agent'], plan
+            command('--home', client, 'storage', 'declare-lost', 'replacement', 'recovery', '--revision', 0,
+                    '--inventory', plan['inventory'], '--request-id', 'declare-lost-replacement')
+            request(op='retry', request_id='declare-lost-replacement')
+            start('recovery')
+            wait(lambda: request(op='storage_plan', storage='replacement'), lambda p: not p['awaiting_replacement'])
+            # A returning old disk cannot regain its identity, even though its payloads remain.
+            (a.home/'lost-replacement').rename(a.home/'replacement')
+            start('replacement')
+            assert request(op='storage_plan', storage='replacement')['lifecycle']['phase'] == 'lost'
+            stop('replacement')
+            assert any((a.home/'replacement/objects').iterdir())
+            backup_id = 'recovery'
+            stop('destination')
+            assert read_stream(2, 'logs') == 'resumed-once\n'
+            request(op='fetch', id='portable', destination=str(a.home/'recovered-outputs'))
+            assert (a.home/'recovered-outputs/result.txt').read_text() == '8'
+            start('destination')
+            result.update(lost_agent_repaired_from_survivor=True, returning_lost_identity_fenced=True,
+                          lost_copy_erasure_unconfirmed=True, restored_history_and_outputs_without_workers=True)
         input_artifact = next(r['artifact'] for r in request(op='artifacts') if r['artifact']['manifest']['id'] == bundle)
         refused = api(binary, client, dict(op='delete_artifact', id=bundle, expected_revision=input_artifact['revision'], request_id='cannot-delete-dependent-inputs'))
         assert refused['ok'] and 'Rejected' in refused['result']['reply'], refused
         (a.home / 'unavailable-source').rename(source)
         start('source')
-        wait(lambda: request(op='artifacts'), lambda rows: any(r['artifact']['manifest']['kind'] == 'FinalOutputs' and r['artifact']['copies']['storage/backup']['phase'] == 'Ready' for r in rows))
+        wait(lambda: request(op='artifacts'), lambda rows: any(r['artifact']['manifest']['kind'] == 'FinalOutputs' and r['artifact']['copies'].get(f'storage/{backup_id}', {})['phase'] == 'Ready' for r in rows))
         for kind in ('checkpoint-and-outputs', 'inputs'):
             for row in request(op='artifacts'):
                 art = row['artifact']
                 if (art['manifest']['kind'] == 'Inputs') == (kind == 'inputs'):
+                    if art['pinned']:
+                        request(op='artifact_retention', id=art['manifest']['id'], expected_revision=art['revision'], pinned=False, expires_at=None, request_id='unpin-' + art['manifest']['id'])
+                        art = next(r['artifact'] for r in request(op='artifacts') if r['artifact']['manifest']['id'] == art['manifest']['id'])
                     request(op='delete_artifact', id=art['manifest']['id'], expected_revision=art['revision'], request_id='delete-' + art['manifest']['id'])
-        wait(lambda: request(op='artifacts'), lambda rows: all(r['artifact']['deleted'] and all(c['phase'] == 'Deleted' for c in r['artifact']['copies'].values()) for r in rows))
+        wait(lambda: request(op='artifacts'), lambda rows: all(r['artifact']['deleted'] and all(c['phase'] in ('Deleted','Lost') for c in r['artifact']['copies'].values()) for r in rows))
         result.update(dependency_retention_and_cleanup=True, success=True)
     finally:
         # Restore only this fixture's source directory so its own service can honor cleanup intent.

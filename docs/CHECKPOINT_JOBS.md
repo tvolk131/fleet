@@ -138,12 +138,12 @@ after confirmed deletion; host checkpoint storage is retained separately and is 
 with explicit artifact retention/pinning and safe cleanup available through the storage catalog.
 Tart networking and VM isolation are unchanged.
 
-## Explicit format-5/6/7/8/9 upgrade
+## Explicit format-5/6/7/8/9/10 upgrade
 
-The model uses control-plane/worker format 10. Mixed-version operation is rejected. Fresh homes need no
-migration. For an existing format-5, format-6, format-7, format-8 or format-9 installation:
+The model uses control-plane/worker format 11. Mixed-version operation is rejected. Fresh homes need no
+migration. For an existing format-5, format-6, format-7, format-8, format-9 or format-10 installation:
 
-1. Finish or cancel queued/active jobs and stop or delete persistent VMs. Formats 6–9 can also retain suspended jobs. Do not upgrade under training.
+1. Finish or cancel queued/active jobs and stop or delete persistent VMs. Formats 6–10 can also retain suspended jobs. Do not upgrade under training.
 2. If needed, cooperatively shrink to a single voter using the old binary and let it settle.
 3. Stop controller, worker, and client-staging services. Preserve old binaries and service definitions.
 4. Run the new binary offline, listing all applicable worker and client homes:
@@ -164,7 +164,7 @@ replaces the compacted historical log; original raw log bytes remain in the back
 skips already-converted databases, allowing recovery from interruption between database commits.
 
 It refuses active/uncertain work, unapplied log suffixes, mixed cluster identities, nonempty prototype
-job databases, pending membership operations, and format-5/6/7/8/9 installations bound to emergency recovery
+job databases, pending membership operations, and format-5/6/7/8/9/10 installations bound to emergency recovery
 history. Those need a separately reviewed migration, not an override. Historical released receipt
 tombstones remain non-executable; a transformed old request may report a fingerprint conflict rather
 than an expired receipt. Full retained receipts and saved requests are rehashed for the typed commands.

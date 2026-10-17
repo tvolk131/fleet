@@ -23,8 +23,29 @@ fn old_mutation(m: &mut Value) {
         flatten(&mut r["observation"]["phase"]);
     }
 }
-fn edit(path: &std::path::Path, table: TableDefinition<&str, &[u8]>, f: impl FnOnce(&mut Value)) {
-    let db = Database::open(path).unwrap();
+async fn edit(
+    path: &std::path::Path,
+    table: TableDefinition<'_, &str, &[u8]>,
+    f: impl FnOnce(&mut Value),
+) {
+    // Cancelling a replica poll does not cancel its already-running blocking redb read.
+    // Unlike the production offline upgrade, this fixture restarts in the same process.
+    // Wait for actual lock release; never remove or bypass the database lock.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let db = loop {
+        match Database::open(path) {
+            Ok(db) => break db,
+            Err(redb::DatabaseError::DatabaseAlreadyOpen)
+                if tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => panic!(
+                "cannot open stopped fixture database {}: {error}",
+                path.display()
+            ),
+        }
+    };
     let tx = db.begin_write().unwrap();
     {
         let mut t = tx.open_table(table).unwrap();
@@ -101,7 +122,8 @@ async fn offline_upgrade_preserves_jobs_receipts_backend_ids_and_restarts_from_n
                 old_mutation(&mut r["command"]);
             }
         },
-    );
+    )
+    .await;
     edit(
         &home.join("worker.redb"),
         TableDefinition::new("worker_journal"),
@@ -119,7 +141,8 @@ async fn offline_upgrade_preserves_jobs_receipts_backend_ids_and_restarts_from_n
                 flatten(&mut r["observation"]["phase"]);
             }
         },
-    );
+    )
+    .await;
     let client = c.home.0.join("upgrade-client");
     std::fs::create_dir_all(client.join("requests")).unwrap();
     instances::write(&client.join("config.json"), &c.config).unwrap();
@@ -137,7 +160,8 @@ async fn offline_upgrade_preserves_jobs_receipts_backend_ids_and_restarts_from_n
         |v| {
             v["observations"]["old-job"][1]["phase"] = json!("Running");
         },
-    );
+    )
+    .await;
     assert!(
         fleet::control::upgrade::run(
             &controller,
@@ -153,7 +177,8 @@ async fn offline_upgrade_preserves_jobs_receipts_backend_ids_and_restarts_from_n
         |v| {
             v["observations"]["old-job"][1]["phase"] = json!("Succeeded");
         },
-    );
+    )
+    .await;
     let mut wrong = c.config.clone();
     wrong.cluster = "different-cluster".into();
     instances::write(&client.join("config.json"), &wrong).unwrap();
@@ -268,7 +293,8 @@ async fn format_nine_upgrade_preserves_receipts_and_adds_history_defaults_withou
             strip(v);
             v["format"] = json!(9);
         },
-    );
+    )
+    .await;
     fleet::control::upgrade::run(&controller, &[], &[]).unwrap();
     assert!(controller.join("control.redb.v9-backup").exists());
     c.start(1).await;
@@ -282,5 +308,80 @@ async fn format_nine_upgrade_preserves_receipts_and_adds_history_defaults_withou
         after.history_settings("legacy").unwrap().policy,
         fleet::history::Policy::default()
     );
+    c.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn format_ten_upgrade_preserves_artifact_inventory_and_adds_active_storage_lifecycle() {
+    let mut c = Cluster::new(1).await;
+    let (home, config) = prepare(&mut c, false).await;
+    let mut worker = Worker::start(&home, config, hello()).await.unwrap();
+    let (_, _, mut backup) = super::storage::backup(&mut c, "backup", 16 << 20).await;
+    c.client
+        .write(
+            Request {
+                origin: "cluster".into(),
+                id: "policy".into(),
+                mutation: Mutation::StoragePolicy {
+                    expected_revision: 0,
+                    policy: fleet::control::artifact::Policy {
+                        outputs: BTreeSet::from(["backup".into()]),
+                        ..Default::default()
+                    },
+                },
+            },
+            WAIT,
+        )
+        .await
+        .unwrap();
+    c.client
+        .write(
+            super::assign("output", workload("printf migration-data > result.txt")),
+            WAIT,
+        )
+        .await
+        .unwrap();
+    wait(
+        &mut c,
+        &mut worker,
+        "output",
+        WorkPhase::Job(AttemptPhase::Succeeded),
+    )
+    .await;
+    worker.tick().await.unwrap();
+    backup.tick().await.unwrap();
+    let before = c.client.read(WAIT).await.unwrap();
+    worker.shutdown().await.unwrap();
+    backup.shutdown().await.unwrap();
+    c.replicas.remove(&1).unwrap().shutdown().await.unwrap();
+    let controller = c.home.0.join("1");
+    edit(
+        &controller.join("control.redb"),
+        TableDefinition::new("meta"),
+        |v| {
+            v["format"] = json!(10);
+            v["storage"].as_object_mut().unwrap().remove("lifecycle");
+        },
+    )
+    .await;
+    edit(
+        &home.join("worker.redb"),
+        TableDefinition::new("worker_journal"),
+        |v| {
+            v["format"] = json!(10);
+        },
+    )
+    .await;
+    fleet::control::upgrade::run(&controller, std::slice::from_ref(&home), &[]).unwrap();
+    assert!(controller.join("control.redb.v10-backup").exists());
+    c.start(1).await;
+    let after = c.client.read(WAIT).await.unwrap();
+    assert_eq!(after.format, fleet::control::FORMAT);
+    assert_eq!(after.jobs, before.jobs);
+    assert_eq!(after.receipts, before.receipts);
+    assert_eq!(after.history, before.history);
+    assert_eq!(after.storage, before.storage);
+    assert!(after.storage_active("backup"));
+    assert_eq!(after.storage_plan("backup").unwrap().lifecycle.revision, 0);
     c.close().await;
 }

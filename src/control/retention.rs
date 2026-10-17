@@ -97,8 +97,14 @@ impl State {
                     d.reasons.push(
                         if a.copies.values().all(|c| c.phase == CopyPhase::Deleted) {
                             "payload deletion acknowledged; history retained"
+                        } else if a
+                            .copies
+                            .values()
+                            .all(|c| matches!(c.phase, CopyPhase::Deleted | CopyPhase::Lost))
+                        {
+                            "reachable copies deleted; lost-agent disk erasure is unconfirmed"
                         } else {
-                            "deletion committed; waiting for locations to reclaim bytes"
+                            "deletion committed; waiting for reachable locations to reclaim bytes"
                         }
                         .into(),
                     );

@@ -392,6 +392,16 @@ impl State {
     }
 
     pub fn enroll(&mut self, worker: &Registration) -> Reply {
+        if self
+            .storage
+            .stores
+            .values()
+            .any(|s| s.peer.identity == worker.peer.identity)
+        {
+            return Reply::rejected(
+                "worker requires a separate identity from every active or revoked storage agent",
+            );
+        }
         if let Err(e) = worker.validate() {
             return Reply::rejected(&e.to_string());
         }

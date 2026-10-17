@@ -51,9 +51,9 @@ jobs:
         run: |
           python3 contrib/qualify_checkpoint_tart.py --fake --rolling --backup-restore --binary "$PWD/target/debug/fleet" \
             --home /tmp/fleet-control-checkpoint-ci 2>&1 | tee checkpoint-client.log
-      - name: Portable Tart jobs, archived logs/metrics and cross-worker attempt history
+      - name: Portable Tart jobs, storage replacement/loss, and durable attempt history
         run: |
-          python3 contrib/qualify_portable_tart.py --fake --history --binary "$PWD/target/debug/fleet" \
+          python3 contrib/qualify_portable_tart.py --fake --storage-lifecycle --binary "$PWD/target/debug/fleet" \
             --home /tmp/fleet-control-portable-ci 2>&1 | tee portable-client.log
       - name: Rust tests (including Raft, redb, workers, and headless M3 GUI)
         run: cargo test --all-features --locked --no-fail-fast -- --test-threads=2 2>&1 | tee rust-tests.log

@@ -1,4 +1,4 @@
-//! Explicit offline conversion of idle format-5 through 9 metadata. No rolling mixed-version protocol.
+//! Explicit offline conversion of idle format-5 through 10 metadata. No rolling mixed-version protocol.
 use super::{Mutation, State};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -111,11 +111,11 @@ pub(crate) fn mutation(value: &mut Value, assignments: &Value) -> Result<()> {
 
 pub(crate) fn state(mut value: Value) -> Result<State> {
     artifact_origins(&mut value);
-    if matches!(value["format"].as_u64(), Some(6..=9)) {
+    if matches!(value["format"].as_u64(), Some(6..=10)) {
         let mut state: State = serde_json::from_value(value)?;
         ensure!(
             state.recovery.is_none(),
-            "format-6/7/8/9 recovery-bound state requires a separate migration"
+            "format-6/7/8/9/10 recovery-bound state requires a separate migration"
         );
         ensure!(
             state.membership.voter_ids().count() == 1
@@ -247,10 +247,10 @@ pub(crate) fn journal(mut value: Value) -> Result<Value> {
     if value["format"] == super::FORMAT {
         return Ok(value);
     }
-    if matches!(value["format"].as_u64(), Some(6..=9)) {
+    if matches!(value["format"].as_u64(), Some(6..=10)) {
         ensure!(
             value["recovery_inventory"].is_null() && value["recovery_binding"].is_null(),
-            "format-6/7/8/9 recovery-bound worker requires a separate migration"
+            "format-6/7/8/9/10 recovery-bound worker requires a separate migration"
         );
         for (_, item) in value["observations"]
             .as_object()

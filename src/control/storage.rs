@@ -168,10 +168,17 @@ impl Agent {
         let status = Arc::new(RwLock::new(serde_json::Value::Null));
         let upload_allowed = Arc::new(RwLock::new(BTreeMap::new()));
         let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let authorization = artifact_io::Authorization::new(
+            endpoint.clone(),
+            config.cluster.clone(),
+            config.controllers.clone(),
+            &home.join("storage.json"),
+        )?;
         let router = Router::builder(endpoint.clone())
             .accept(
                 super::input_upload::ALPN,
                 super::input_upload::Handler {
+                    authorization: authorization.clone(),
                     cluster: config.cluster.clone(),
                     administrators: config.administrators.clone(),
                     allowed: upload_allowed.clone(),
@@ -192,6 +199,7 @@ impl Agent {
             .accept(
                 artifact_io::ALPN,
                 artifact_io::Handler {
+                    authorization,
                     cluster: config.cluster.clone(),
                     access: access.clone(),
                     slots: Arc::new(tokio::sync::Semaphore::new(4)),
@@ -242,7 +250,11 @@ impl Agent {
         *self.upload_allowed.write().expect("input uploads") = view
             .artifacts
             .iter()
-            .filter(|a| !a.deleted && a.manifest.kind == Kind::Inputs)
+            .filter(|a| {
+                !a.deleted
+                    && a.manifest.kind == Kind::Inputs
+                    && view.lifecycle.phase != super::storage_lifecycle::Phase::Cleaning
+            })
             .map(|a| (a.manifest.id.clone(), a.manifest.clone()))
             .collect();
         let readers = self
@@ -313,7 +325,7 @@ impl Agent {
         m.validate()?;
         let root = self.home.join("objects").join(&m.id);
 
-        if artifact.deleted {
+        if artifact.deleted || view.lifecycle.phase == super::storage_lifecycle::Phase::Cleaning {
             ensure!(
                 view.cleanup_allowed,
                 "cleanup held after authority recovery"
@@ -383,9 +395,6 @@ impl Agent {
         std::fs::create_dir(&stage)?;
         let result = async {
             let mut sources = vec![];
-            if let Some(worker) = m.worker().and_then(|id| view.workers.get(id)) {
-                sources.push(worker.peer.clone());
-            }
             for id in &artifact.targets {
                 if id != &self.config.registration.id
                     && artifact
@@ -396,6 +405,10 @@ impl Agent {
                 {
                     sources.push(store.peer.clone());
                 }
+            }
+            // Prefer verified storage peers: a replacement commonly runs with its source worker offline.
+            if let Some(worker) = m.worker().and_then(|id| view.workers.get(id)) {
+                sources.push(worker.peer.clone());
             }
             let mut errors = Vec::new();
             for peer in sources {

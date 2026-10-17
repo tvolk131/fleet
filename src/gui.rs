@@ -45,6 +45,9 @@ struct App {
     workers: Vec<Value>,
     instances: Vec<Value>,
     storage: Value,
+    storage_selected: Option<String>,
+    storage_replacement: String,
+    storage_review: Option<(crate::control::storage_lifecycle::Plan, String)>,
     error: Option<String>,
     busy: bool,
     selected: Option<String>,
@@ -72,6 +75,11 @@ struct App {
 }
 #[derive(Debug, Clone)]
 enum Message {
+    ManageStorage(String),
+    StorageReplacement(String),
+    StorageAction(StorageAction),
+    ConfirmStorageLoss,
+    CancelStorageReview,
     Appearance(Mode),
     DismissNotice,
     Tick,
@@ -97,6 +105,13 @@ enum Message {
     Fetch,
     Retry,
     Acted(Result<Value, String>),
+}
+#[derive(Debug, Clone, Copy)]
+enum StorageAction {
+    Replace,
+    Retire,
+    Finish,
+    ReviewLoss,
 }
 #[derive(Debug, Clone)]
 struct Refresh {
@@ -127,6 +142,9 @@ impl App {
             workers: vec![],
             instances: vec![],
             storage: Value::Null,
+            storage_selected: None,
+            storage_replacement: String::new(),
+            storage_review: None,
             error: None,
             busy: false,
             selected: None,
@@ -180,6 +198,38 @@ impl App {
     }
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::ManageStorage(id) => {
+                self.storage_selected = Some(id);
+                self.storage_replacement.clear();
+                self.storage_review = None;
+            }
+            Message::StorageReplacement(value) => {
+                self.storage_replacement = value;
+                self.storage_review = None;
+            }
+            Message::CancelStorageReview => self.storage_review = None,
+            Message::StorageAction(action) => {
+                if self.acting {
+                    return Task::none();
+                }
+                if let Some(plan) = self.selected_storage_plan() {
+                    if matches!(action, StorageAction::ReviewLoss) {
+                        self.storage_review = Some((plan, self.storage_replacement.trim().into()));
+                    } else if let Some(request) =
+                        storage_action(&plan, action, self.storage_replacement.trim())
+                    {
+                        return self.act(request);
+                    }
+                }
+            }
+            Message::ConfirmStorageLoss => {
+                if self.acting {
+                    return Task::none();
+                }
+                if let Some((plan, replacement)) = self.storage_review.take() {
+                    return self.act(storage_loss_request(&plan, replacement));
+                }
+            }
             Message::HistoryVisible(value) => self.history_visible = value,
             Message::Appearance(mode) => self.dark = mode == Mode::Dark,
             Message::DismissNotice => self.notice = None,
@@ -1163,13 +1213,120 @@ impl App {
         page = page.push(body.height(Length::Fill));
         if !self.storage.is_null() {
             let mut storage = column![typography("Storage", TypeScale::TitleMedium)].spacing(6);
-            for line in storage_lines(&self.storage) {
-                storage = storage.push(typography(line, TypeScale::BodySmall));
+            if self.storage_review.is_none() {
+                for line in storage_lines(&self.storage) {
+                    storage = storage.push(typography(line, TypeScale::BodySmall));
+                }
+                for plan in self.storage["plans"].as_array().into_iter().flatten() {
+                    if let Some(id) = plan["storage"].as_str() {
+                        storage = storage.push(
+                            button(format!("Manage {id}"))
+                                .variant(ButtonVariant::Text)
+                                .size(ButtonSize::Small)
+                                .on_press(Message::ManageStorage(id.into())),
+                        );
+                    }
+                }
+                if let Some(plan) = self.selected_storage_plan() {
+                    use crate::control::storage_lifecycle::Phase;
+                    storage = storage.push(typography(
+                        format!("Manage {} · {:?}", plan.storage, plan.lifecycle.phase),
+                        TypeScale::TitleSmall,
+                    ));
+                    if matches!(
+                        plan.lifecycle.phase,
+                        Phase::Active | Phase::Draining | Phase::Cleaning
+                    ) {
+                        storage = storage.push(
+                            text_field("Replacement agent", &self.storage_replacement)
+                                .on_input(Message::StorageReplacement),
+                        );
+                        let mut actions = row![].spacing(8);
+                        if plan.lifecycle.phase == Phase::Active {
+                            actions = actions.push(
+                                button("Start replacement")
+                                    .variant(ButtonVariant::Tonal)
+                                    .disabled(
+                                        self.acting || self.storage_replacement.trim().is_empty(),
+                                    )
+                                    .on_press(Message::StorageAction(StorageAction::Replace)),
+                            );
+                        }
+                        if matches!(plan.lifecycle.phase, Phase::Active | Phase::Draining) {
+                            actions = actions.push(
+                                button("Retire old copies")
+                                    .variant(ButtonVariant::Tonal)
+                                    .disabled(
+                                        self.acting
+                                            || !plan.awaiting_replacement.is_empty()
+                                            || !plan.cleanup_allowed,
+                                    )
+                                    .on_press(Message::StorageAction(StorageAction::Retire)),
+                            );
+                        }
+                        if plan.lifecycle.phase == Phase::Cleaning {
+                            actions = actions.push(
+                                button("Finish retirement")
+                                    .variant(ButtonVariant::Tonal)
+                                    .disabled(
+                                        self.acting
+                                            || !plan.awaiting_cleanup.is_empty()
+                                            || !plan.cleanup_allowed,
+                                    )
+                                    .on_press(Message::StorageAction(StorageAction::Finish)),
+                            );
+                        }
+                        actions = actions.push(
+                            button("Review lost agent")
+                                .variant(ButtonVariant::Outlined)
+                                .disabled(self.acting || self.storage_replacement.trim().is_empty())
+                                .on_press(Message::StorageAction(StorageAction::ReviewLoss)),
+                        );
+                        storage = storage.push(actions);
+                    }
+                }
+            }
+            if let Some((plan, replacement)) = &self.storage_review {
+                let mut review = column![
+                    typography(format!("Declare {} lost", plan.storage), TypeScale::TitleMedium),
+                    typography(format!("Permanently revoke this identity and repair onto {replacement}. {} retained artifacts ({} bytes) are affected. {} have no recorded verified surviving copy. This does not erase the old disk or restore missing data.",
+                        plan.retained_artifacts, plan.retained_bytes, plan.unavailable_without_agent.len()), TypeScale::BodyMedium),
+                ].spacing(8);
+                for artifact in &plan.unavailable_without_agent {
+                    review = review.push(typography(
+                        format!("Unavailable without this agent: {artifact}"),
+                        TypeScale::BodySmall,
+                    ));
+                }
+                review = review.push(
+                    row![
+                        button("Acknowledge inventory and declare lost")
+                            .disabled(self.acting)
+                            .on_press(Message::ConfirmStorageLoss),
+                        button("Cancel")
+                            .variant(ButtonVariant::Text)
+                            .on_press(Message::CancelStorageReview),
+                    ]
+                    .spacing(8),
+                );
+                storage = storage.push(
+                    surface(review)
+                        .variant(SurfaceVariant::Outlined)
+                        .padding(12),
+                );
             }
             page = page.push(
-                surface(scrollable(storage).height(150))
-                    .variant(SurfaceVariant::Outlined)
-                    .padding(12),
+                surface(
+                    scrollable(storage).height(if self.storage_review.is_some() {
+                        360
+                    } else if self.storage_selected.is_some() {
+                        300
+                    } else {
+                        150
+                    }),
+                )
+                .variant(SurfaceVariant::Outlined)
+                .padding(12),
             );
         }
         if !self.instances.is_empty() {
@@ -1208,6 +1365,55 @@ impl App {
         }
         iced_m3::focus::scope(container(page).padding(24).height(Length::Fill))
     }
+    fn selected_storage_plan(&self) -> Option<crate::control::storage_lifecycle::Plan> {
+        let id = self.storage_selected.as_ref()?;
+        self.storage["plans"]
+            .as_array()?
+            .iter()
+            .find(|p| p["storage"].as_str() == Some(id))
+            .and_then(|p| serde_json::from_value(p.clone()).ok())
+    }
+}
+fn storage_loss_request(
+    plan: &crate::control::storage_lifecycle::Plan,
+    replacement: String,
+) -> ApiRequest {
+    ApiRequest::DeclareStorageLost {
+        request_id: id(),
+        storage: plan.storage.clone(),
+        replacement,
+        expected_revision: plan.lifecycle.revision,
+        expected_inventory: plan.inventory.clone(),
+        unavailable_artifacts: plan.unavailable_without_agent.clone(),
+    }
+}
+fn storage_action(
+    plan: &crate::control::storage_lifecycle::Plan,
+    action: StorageAction,
+    replacement: &str,
+) -> Option<ApiRequest> {
+    let storage = plan.storage.clone();
+    let expected_revision = plan.lifecycle.revision;
+    Some(match action {
+        StorageAction::Replace => ApiRequest::ReplaceStorage {
+            request_id: id(),
+            storage,
+            replacement: replacement.into(),
+            expected_revision,
+        },
+        StorageAction::Retire => ApiRequest::RetireStorage {
+            request_id: id(),
+            storage,
+            expected_revision,
+            expected_inventory: plan.inventory.clone(),
+        },
+        StorageAction::Finish => ApiRequest::FinishStorageRetirement {
+            request_id: id(),
+            storage,
+            expected_revision,
+        },
+        StorageAction::ReviewLoss => return None,
+    })
 }
 fn muted(theme: &Theme) -> text::Style {
     text::Style {
@@ -1372,6 +1578,15 @@ impl<Message> canvas::Program<Message, Theme> for Spark {
 
 fn storage_lines(storage: &Value) -> Vec<String> {
     let mut lines = Vec::new();
+    for p in storage["plans"].as_array().into_iter().flatten() {
+        lines.push(format!("{}: {} · {} retained bytes · {} awaiting replacement · {} awaiting cleanup · {} without a known surviving copy",
+            p["storage"].as_str().unwrap_or("unknown"), p["lifecycle"]["phase"].as_str().unwrap_or("unknown"), p["retained_bytes"],
+            p["awaiting_replacement"].as_array().map_or(0, Vec::len), p["awaiting_cleanup"].as_array().map_or(0, Vec::len),
+            p["unavailable_without_agent"].as_array().map_or(0, Vec::len)));
+        if p["lifecycle"]["phase"] == "lost" {
+            lines.push("Lost storage identity is revoked. Physical erasure is unconfirmed; unavailable data remains visible.".into());
+        }
+    }
     for location in storage["storage_reports"].as_array().into_iter().flatten() {
         let id = location["storage"].as_str().unwrap_or("unknown");
         let r = &location["report"];
@@ -1619,6 +1834,54 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn storage_loss_review_keeps_the_displayed_inventory_across_refresh() {
+        let mut app = sample();
+        app.storage = json!({"plans":[{"storage":"old", "lifecycle":{"revision":7,"phase":"active","replacement":null,"loss":null},
+            "inventory":"reviewed-inventory","retained_artifacts":1,"retained_bytes":64,
+            "awaiting_replacement":["missing-artifact"],"awaiting_cleanup":["missing-artifact"],
+            "unavailable_without_agent":["missing-artifact"],"protected_artifacts":["missing-artifact"],"cleanup_allowed":true}]});
+        let _ = app.update(Message::ManageStorage("old".into()));
+        let _ = app.update(Message::StorageReplacement("new".into()));
+        let _ = app.update(Message::StorageAction(StorageAction::ReviewLoss));
+        for dark in [false, true] {
+            app.dark = dark;
+            let snapshot = simulator(&app).snapshot(&app.theme()).unwrap();
+            if let Some(dir) = std::env::var_os("FLEET_GUI_PREVIEW") {
+                assert!(
+                    snapshot
+                        .matches_image(PathBuf::from(dir).join(if dark {
+                            "storage-lifecycle-dark"
+                        } else {
+                            "storage-lifecycle-light"
+                        }))
+                        .unwrap()
+                );
+            }
+        }
+        app.storage["plans"][0]["inventory"] = json!("changed-inventory");
+        app.storage["plans"][0]["lifecycle"]["revision"] = json!(8);
+        app.storage["plans"][0]["unavailable_without_agent"] = json!(["newly-missing"]);
+        let _ = app.update(Message::ConfirmStorageLoss);
+        let Some(ApiRequest::DeclareStorageLost {
+            storage,
+            replacement,
+            expected_revision,
+            expected_inventory,
+            unavailable_artifacts,
+            ..
+        }) = &app.pending
+        else {
+            panic!("expected reviewed loss request")
+        };
+        assert_eq!((storage.as_str(), replacement.as_str()), ("old", "new"));
+        assert_eq!(*expected_revision, 7);
+        assert_eq!(expected_inventory, "reviewed-inventory");
+        assert_eq!(
+            unavailable_artifacts,
+            &std::collections::BTreeSet::from(["missing-artifact".into()])
+        );
     }
     fn simulator(app: &App) -> iced_test::Simulator<'_, Message, Theme> {
         iced_test::Simulator::with_size(
