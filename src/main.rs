@@ -17,7 +17,37 @@ struct Args {
     command: Command,
 }
 #[derive(Subcommand)]
+enum VersionCommand {
+    Prepare {
+        target: u32,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    Activate {
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    Abort {
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
+    /// Cluster generation and live replica compatibility diagnostics.
+    Versions,
+    /// Prepare, activate, or abort a rolling cluster generation change.
+    Upgrade {
+        #[command(subcommand)]
+        action: VersionCommand,
+    },
     /// Cluster preparation, membership, recovery and low-level diagnostics.
     Cluster {
         #[command(subcommand)]
@@ -622,6 +652,35 @@ async fn run(args: Args) -> Result<()> {
         } => ApiRequest::ExpireArtifacts {
             request_id: request_id(rid),
             as_of,
+        },
+        Command::Versions => ApiRequest::Versions,
+        Command::Upgrade { action } => match action {
+            VersionCommand::Prepare {
+                target,
+                revision,
+                request_id,
+            } => ApiRequest::PrepareVersion {
+                target,
+                expected_revision: revision,
+                request_id: request_id
+                    .unwrap_or_else(|| format!("request-{:032x}", rand::random::<u128>())),
+            },
+            VersionCommand::Activate {
+                revision,
+                request_id,
+            } => ApiRequest::ActivateVersion {
+                expected_revision: revision,
+                request_id: request_id
+                    .unwrap_or_else(|| format!("request-{:032x}", rand::random::<u128>())),
+            },
+            VersionCommand::Abort {
+                revision,
+                request_id,
+            } => ApiRequest::AbortVersion {
+                expected_revision: revision,
+                request_id: request_id
+                    .unwrap_or_else(|| format!("request-{:032x}", rand::random::<u128>())),
+            },
         },
         Command::Status => ApiRequest::Status,
         Command::Replicas {

@@ -350,11 +350,17 @@ async fn format_ten_upgrade_preserves_artifact_inventory_and_adds_active_storage
     .await;
     worker.tick().await.unwrap();
     backup.tick().await.unwrap();
-    let before = c.client.read(WAIT).await.unwrap();
     worker.shutdown().await.unwrap();
     backup.shutdown().await.unwrap();
     c.replicas.remove(&1).unwrap().shutdown().await.unwrap();
     let controller = c.home.0.join("1");
+    // Compare offline images: the live retention reconciler may legitimately advance
+    // completion timestamps immediately before shutdown or after restart.
+    let before = Store::open(&controller.join("control.redb"), "cluster", 1)
+        .unwrap()
+        .state()
+        .await
+        .unwrap();
     edit(
         &controller.join("control.redb"),
         TableDefinition::new("meta"),
@@ -374,12 +380,19 @@ async fn format_ten_upgrade_preserves_artifact_inventory_and_adds_active_storage
     .await;
     fleet::control::upgrade::run(&controller, std::slice::from_ref(&home), &[]).unwrap();
     assert!(controller.join("control.redb.v10-backup").exists());
+    let migrated = Store::open(&controller.join("control.redb"), "cluster", 1)
+        .unwrap()
+        .state()
+        .await
+        .unwrap();
+    assert_eq!(migrated.history, before.history);
+    assert_eq!(migrated.storage, before.storage);
     c.start(1).await;
     let after = c.client.read(WAIT).await.unwrap();
     assert_eq!(after.format, fleet::control::FORMAT);
     assert_eq!(after.jobs, before.jobs);
     assert_eq!(after.receipts, before.receipts);
-    assert_eq!(after.history, before.history);
+    assert_eq!(after.history.attempts, before.history.attempts);
     assert_eq!(after.storage, before.storage);
     assert!(after.storage_active("backup"));
     assert_eq!(after.storage_plan("backup").unwrap().lifecycle.revision, 0);

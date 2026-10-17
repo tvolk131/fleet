@@ -23,6 +23,20 @@ pub struct Command {
 /// Deterministic application commands. External effects are reconciled by workers after commit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Mutation {
+    PrepareVersion {
+        expected_revision: u64,
+        target: u32,
+    },
+    ReplicaPrepared {
+        revision: u64,
+        node: u64,
+    },
+    ActivateVersion {
+        expected_revision: u64,
+    },
+    AbortVersion {
+        expected_revision: u64,
+    },
     HistoryReport(super::history::Report),
     HistoryPolicy {
         job: String,
@@ -174,6 +188,8 @@ pub struct Receipt {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct State {
     #[serde(default)]
+    pub version: super::version::ClusterVersion,
+    #[serde(default)]
     pub history: super::history::Catalog,
     #[serde(default)]
     pub storage: super::artifact::Catalog,
@@ -201,6 +217,7 @@ pub fn key(principal: &str, id: &str) -> String {
 impl State {
     pub fn new(cluster: String) -> Self {
         Self {
+            version: Default::default(),
             history: Default::default(),
             storage: Default::default(),
             jobs: BTreeMap::new(),
@@ -299,6 +316,17 @@ impl State {
         index: u64,
     ) -> Reply {
         match mutation {
+            Mutation::PrepareVersion {
+                expected_revision,
+                target,
+            } => self.prepare_version(*expected_revision, *target),
+            Mutation::ReplicaPrepared { revision, node } => {
+                self.replica_prepared(principal, *revision, *node)
+            }
+            Mutation::ActivateVersion { expected_revision } => {
+                self.activate_version(*expected_revision)
+            }
+            Mutation::AbortVersion { expected_revision } => self.abort_version(*expected_revision),
             Mutation::HistoryReport(r) => self.history_report(principal, r),
             Mutation::HistoryPolicy {
                 job,
