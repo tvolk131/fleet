@@ -134,7 +134,7 @@ impl Runner {
             );
             let cursors =
                 crate::history::state(&self.dir, crate::history::Stream::Metrics)?.sources;
-            let mut helper = self.helper(serde_json::json!({"kind":"observe","root":self.guest_root(),"patterns":[],"probes":[],"settle_seconds":0,"final":true,"metric_files":self.job.spec.metric_files,"history_cursors":cursors}));
+            let mut helper = self.helper(serde_json::json!({"kind":"observe","root":self.guest_root(),"patterns":[],"probes":[],"settle_seconds":0,"final":true,"metric_files":self.job.spec.metric_files,"history_cursors":cursors}))?;
             if let guest::Spec::Exec {
                 timeout_seconds, ..
             } = &mut helper
@@ -218,7 +218,7 @@ impl Runner {
                 crate::history::state(&self.dir, crate::history::Stream::Metrics)?.sources;
             let helper = self.helper(serde_json::json!({"kind":"observe", "root":self.guest_root(), "patterns":self.job.spec.publish,
                 "probes":self.job.spec.probes, "settle_seconds":self.job.spec.settle_seconds, "final":is_final,
-                "metric_files":self.job.spec.metric_files,"history_cursors":cursors}));
+                "metric_files":self.job.spec.metric_files,"history_cursors":cursors}))?;
             self.require(&sample_id, helper, None)?;
             let snapshot_path =
                 guest::operation_dir(&self.home, &self.status.instance, &sample_id)?.join("stdout");
@@ -407,16 +407,10 @@ mod tests {
         let mut request = serde_json::json!({"kind":"observe", "root":root, "patterns":["out/*"], "settle_seconds":100, "final":false,
             "probes":[{"jsonl_series":{"file":"*.jsonl", "field":"nested.loss", "points":2}}, {"glob_count":{"pattern":"out/checkpoint/*"}}]});
         let run = |request: &serde_json::Value| {
-            let output = Command::new("/usr/bin/python3")
-                .args(["-I", "-c", HELPER, &request.to_string()])
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            serde_json::from_slice::<Snapshot>(&output.stdout).unwrap()
+            serde_json::from_value::<Snapshot>(
+                fleet_guest::observe(serde_json::from_value(request.clone()).unwrap()).unwrap(),
+            )
+            .unwrap()
         };
         let live = run(&request);
         assert!(live.files.is_empty());

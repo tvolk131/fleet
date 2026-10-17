@@ -358,6 +358,11 @@ enum StorageCommand {
 }
 #[derive(Subcommand)]
 enum ServiceCommand {
+    /// Validate a rendered systemd unit before the privileged installer uses it.
+    ValidateUnit {
+        #[arg(long)]
+        file: PathBuf,
+    },
     Configure {
         #[arg(long)]
         config: PathBuf,
@@ -481,6 +486,10 @@ async fn run(args: Args) -> Result<()> {
         }
         Command::Service { action } => {
             return match action {
+                ServiceCommand::ValidateUnit { file } => {
+                    service::validate_unit(&std::fs::read_to_string(file)?)?;
+                    print(&serde_json::json!({"valid":true}))
+                }
                 ServiceCommand::Configure {
                     config,
                     controller_home,

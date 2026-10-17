@@ -4,7 +4,11 @@ version = "0.2.0"
 edition = "2024"
 default-run = "fleet"
 
+[workspace]
+members = ["crates/fleet-guest"]
+
 [dependencies]
+fleet-guest = { path = "crates/fleet-guest" }
 anyhow = "1.0.104"
 blake3 = "1.8.7"
 futures-lite = "2.6.1"
@@ -38,6 +42,23 @@ control-plane = ["dep:openraft", "dep:redb"]
 name = "fleet-control-lab"
 path = "src/bin/fleet-control-lab.rs"
 required-features = ["control-plane"]
+
+[[bin]]
+name = "fleet-guest"
+path = "src/bin/fleet-guest.rs"
+
+[[bin]]
+name = "fleet-qualify"
+path = "contrib/rust/main.rs"
+required-features = ["control-plane"]
+
+[[bin]]
+name = "fleet-test-workload"
+path = "tests/fixtures/workload.rs"
+
+[[bin]]
+name = "fleet-fake-tart"
+path = "tests/fixtures/fake_tart.rs"
 
 [dev-dependencies]
 # Renders the GUI headlessly in its tests (`cargo test --features gui`).

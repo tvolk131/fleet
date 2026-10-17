@@ -8,7 +8,7 @@ All roles use the same qualified Fleet version. See [normal setup](NORMAL_FLEET.
 ## Submission
 
 Configure the worker's pinned image catalog and Softnet as described in [VM instances](VM_INSTANCES.md).
-The image needs Tart's guest agent and `/usr/bin/python3`.
+The image needs Tart's guest agent. Install the matching `fleet-guest` executable beside the host Fleet binary; Fleet copies it into each VM through Tart's command channel. No guest interpreter is required.
 
 ```json
 {

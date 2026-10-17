@@ -1412,6 +1412,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "fleet-guest",
  "futures-lite",
  "iced",
  "iced-m3",
@@ -1429,6 +1430,18 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "fleet-guest"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

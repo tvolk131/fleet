@@ -27,7 +27,6 @@ pub use observe::{Progress, output_revision};
 pub const MAX_INPUTS: usize = 128;
 pub const MAX_OUTPUTS: usize = 256;
 pub const MAX_TOTAL: u64 = 4 << 30;
-const HELPER: &str = include_str!("vm_job.py");
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -373,19 +372,18 @@ impl Runner {
         }
         Ok(())
     }
-    fn helper(&self, value: serde_json::Value) -> guest::Spec {
-        guest::Spec::Exec {
+    fn helper(&self, value: serde_json::Value) -> Result<guest::Spec> {
+        let request: fleet_guest::Observation = serde_json::from_value(value)?;
+        Ok(guest::Spec::Exec {
             argv: vec![
-                "/usr/bin/python3".into(),
-                "-I".into(),
-                "-c".into(),
-                HELPER.into(),
-                value.to_string(),
+                guest::helper_guest_path()?,
+                "--job".into(),
+                serde_json::to_string(&request)?,
             ],
             cwd: None,
             env: Default::default(),
             timeout_seconds: 120,
-        }
+        })
     }
     fn link_logs(&self, operation: &Path) -> Result<()> {
         for (from, to) in [("stdout", "stdout.log"), ("stderr", "stderr.log")] {
@@ -422,7 +420,7 @@ impl Runner {
         let root = self.guest_root();
         self.require(
             "prepare",
-            self.helper(serde_json::json!({"kind":"prepare", "root":root, "platform":self.job.spec.vm.as_ref().and_then(|v| v.runtime.as_ref()).map(|r| &r.platform)})),
+            self.helper(serde_json::json!({"kind":"prepare", "root":root, "platform":self.job.spec.vm.as_ref().and_then(|v| v.runtime.as_ref()).map(|r| &r.platform)}))?,
             None,
         )?;
         let mut total = 0u64;

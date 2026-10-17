@@ -19,10 +19,10 @@ impl Job {
             rand::random::<u64>()
         ));
         fs::create_dir_all(dir.join("work")).unwrap();
-        fs::write(dir.join("work/test.py"), script).unwrap();
+
         fs::write(dir.join("job.json"), serde_json::to_vec(&serde_json::json!({
             "id": "test", "submitter": "test", "submitted_at": jobs::now(),
-            "spec": { "name": "test", "argv": ["/usr/bin/python3", "test.py"], "keep_awake": false,
+            "spec": { "name": "test", "argv": [env!("CARGO_BIN_EXE_fleet-test-workload"), script], "keep_awake": false,
                       "shutdown_grace_seconds": grace, "max_seconds": limit }
         })).unwrap()).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_fleet"))
@@ -63,19 +63,8 @@ impl Drop for Job {
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
-const GRACEFUL: &str = r#"import signal, time
-from pathlib import Path
-end = None
-def term(*_):
-    global end
-    with open('terms', 'a') as f: f.write('term\n')
-    if end is None: end = time.monotonic() + 0.4
-signal.signal(signal.SIGTERM, term)
-Path('ready').touch()
-while end is None or time.monotonic() < end: time.sleep(.01)
-Path('flushed').touch()
-"#;
-const STUBBORN: &str = "import signal,time\nfrom pathlib import Path\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nPath('ready').touch()\nwhile True: time.sleep(.01)\n";
+const GRACEFUL: &str = "graceful";
+const STUBBORN: &str = "stubborn";
 
 #[test]
 fn graceful_stop_preserves_each_reason_and_sends_one_term() {
@@ -142,19 +131,7 @@ fn paused_jobs_can_flush_and_legacy_default_is_ten_seconds() {
 }
 #[test]
 fn wrapper_exit_does_not_abandon_its_stubborn_descendant() {
-    let script = r#"import os,signal,time
-from pathlib import Path
-if os.fork() == 0:
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    Path('descendant-ready').touch()
-    while True:
-        Path('heartbeat').write_text(str(time.monotonic()))
-        time.sleep(.03)
-while not Path('descendant-ready').exists(): time.sleep(.01)
-signal.signal(signal.SIGTERM, lambda *_: exit(0))
-Path('ready').touch()
-while True: time.sleep(.01)
-"#;
+    let script = "descendant";
     let mut j = Job::start(script, Some(1), None);
     j.stop("cancel");
     let at = Instant::now();

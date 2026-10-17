@@ -127,33 +127,33 @@ key. Machines which have not accepted that manifest can still follow their previ
 
 ## Isolated failure qualification
 
-`contrib/qualify_control_multihost.py` consumes a private JSON inventory:
+`target/debug/fleet-qualify normal-multihost` consumes a private JSON inventory:
 
 ```json
 {"hosts":[
-  {"name":"m4pro","address":"192.0.2.11","ssh":[],"binary":"/absolute/isolated/bin/fleet-control-lab"},
-  {"name":"m1pro","address":"192.0.2.12","ssh":["ssh","-o","BatchMode=yes","m1pro"],"binary":"/absolute/isolated/bin/fleet-control-lab"},
-  {"name":"pi","address":"192.0.2.13","ssh":["ssh","-o","BatchMode=yes","fleet@192.0.2.13"],"binary":"/absolute/isolated/bin/fleet-control-lab"}
+  {"name":"m4pro","address":"192.0.2.11","ssh":[],"port":28460,"binary":"/absolute/isolated/bin/fleet"},
+  {"name":"m1pro","address":"192.0.2.12","ssh":["ssh","-o","BatchMode=yes","m1pro"],"port":28460,"binary":"/absolute/isolated/bin/fleet"},
+  {"name":"pi","address":"192.0.2.13","ssh":["ssh","-o","BatchMode=yes","fleet@192.0.2.13"],"port":28460,"binary":"/absolute/isolated/bin/fleet"}
 ]}
 ```
 
 Use three distinct physical hosts, with the first host running the harness. Install the experimental
-binaries at the specified paths first. Python 3.9 or newer and authenticated SSH access are required.
+`fleet` and `fleet-qualify` binaries beside one another at the specified paths first, built for each host platform. Authenticated SSH access is required; no interpreter is used. An optional `qualifier` inventory field overrides the absolute path to `fleet-qualify`.
 Choose a **new** fixture home under `/tmp` on all three hosts:
 
 ```sh
-python3 contrib/qualify_control_multihost.py --inventory /absolute/hosts.json \
+target/debug/fleet-qualify normal-multihost --inventory /absolute/hosts.json \
   --home /tmp/fleet-control-qualification-new --port 28460
 ```
 
-The harness records installed Fleet service identities, binary hashes, job/instance record hashes and
-queue rows before and after. It creates separate keys, journals, backend homes, blobs and logs, and uses
+The harness records installed binary hashes, job/instance record hashes and
+read-only database/journal byte hashes before and after. It creates separate keys, journals, backend homes, blobs and logs, and uses
 only its own recorded process identities for cleanup. Native canaries have hard runtime limits and use
 one declared CPU thread each; they mostly sleep. There is no training or GPU workload.
 
-The failure sequence covers leader SIGKILL, worker SIGKILL, minority refusal of strong reads/mutations,
-healing and idempotent retry, quorum loss/restoration, leader replacement, three-to-one and one-to-three
+The failure sequence covers leader SIGKILL, worker SIGKILL, idempotent retry, quorum loss/restoration, leader replacement, three-to-one and one-to-three
 membership changes, and stale-survivor disaster recovery followed by another three-host expansion.
+Authenticated minority partition/refusal remains covered by `tests/control.rs` using the same Raft network layer.
 Running native supervision must retain its original identity and print its start marker exactly once.
 Cancellation and hash-verified output retrieval must still work afterward. A final cold restart of
 only the M1 and Pi replicas must restore quorum without a controller running on the M4.

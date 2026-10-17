@@ -4,6 +4,54 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Validate Fleet's generated subset, without depending on a host interpreter.
+/// Reject duplicate service settings and continuations rather than interpreting ambiguous units.
+pub fn validate_unit(text: &str) -> Result<()> {
+    let mut section = "";
+    let mut values = std::collections::BTreeMap::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            section = name;
+            continue;
+        }
+        if section != "Service" {
+            continue;
+        }
+        ensure!(
+            !line.ends_with('\\'),
+            "continued service settings are unsupported"
+        );
+        let (key, value) = line.split_once('=').context("invalid service setting")?;
+        if !matches!(key.trim(), "User" | "ExecStart" | "KillMode") {
+            continue; // Environment and other list settings may legitimately occur more than once.
+        }
+        ensure!(
+            values.insert(key.trim(), value.trim()).is_none(),
+            "duplicate service setting"
+        );
+    }
+    let user = values.get("User").context("explicit User is required")?;
+    ensure!(
+        !matches!(*user, "" | "root" | "0"),
+        "Fleet must run as a regular user"
+    );
+    ensure!(
+        values
+            .get("ExecStart")
+            .is_some_and(|s| s.trim_start_matches('"').starts_with('/')
+                && s.contains(" service run --config ")),
+        "expected absolute Fleet service command"
+    );
+    ensure!(
+        values.get("KillMode") == Some(&"process"),
+        "do not terminate detached workload supervisors"
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
     pub controller_home: Option<PathBuf>,

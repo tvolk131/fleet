@@ -180,7 +180,7 @@ worker restart, leader loss, immutable attempts, resource-release ordering, and 
 and preservation. CI also runs:
 
 ```sh
-python3 contrib/qualify_checkpoint_tart.py --fake --backup-restore --binary "$PWD/target/debug/fleet" \
+target/debug/fleet-qualify checkpoint --fake --backup-restore --binary "$PWD/target/debug/fleet" \
   --home /tmp/fleet-control-checkpoint-ci
 ```
 
