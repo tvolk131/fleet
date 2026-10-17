@@ -63,6 +63,14 @@ fn put<T: Serialize>(table: &mut redb::Table<&str, &[u8]>, key: &str, value: &T)
 
 impl Store {
     pub fn preflight(path: &Path, cluster: &str, node: u64) -> Result<()> {
+        Self::preflight_for(path, cluster, node, super::version::Software::current())
+    }
+    fn preflight_for(
+        path: &Path,
+        cluster: &str,
+        node: u64,
+        software: super::version::Software,
+    ) -> Result<()> {
         if let Some(raw) = super::version::preflight(path, "meta")? {
             ensure!(
                 raw["identity"] == serde_json::json!([FORMAT, cluster, node]),
@@ -70,14 +78,14 @@ impl Store {
             );
             let version: super::version::ClusterVersion =
                 serde_json::from_value(raw["state"]["version"].clone())?;
-            super::version::Software::current().require(version.required(node))?;
+            software.require(version.required(node))?;
             if let Some(p) = version.pending
                 && raw["version_prepared"] == serde_json::json!([version.revision, p.target])
             {
-                super::version::Software::current().require(p.target)?;
+                software.require(p.target)?;
             }
         } else {
-            super::version::Software::current().require(1)?;
+            software.require(1)?;
         }
         Ok(())
     }
@@ -557,6 +565,12 @@ impl RaftStateMachine<TypeConfig> for Store {
                 let (_, cluster, node): (u32, String, u64) =
                     read(&table, "identity")?.context("missing identity")?;
                 ensure!(cluster == state.cluster, "snapshot cluster mismatch");
+                let old: State = read(&table, "state")?.context("missing state")?;
+                ensure!(
+                    state.version.active >= old.version.active
+                        && state.version.revision >= old.version.revision,
+                    "snapshot cannot roll back the cluster generation or upgrade revision"
+                );
                 super::version::Software::current().require(state.version.required(node))?;
                 // A snapshot carries committed readiness. Preserve any still-current local promise.
                 let prepared: Option<(u64, u32)> = read(&table, "version_prepared")?;
@@ -648,5 +662,88 @@ impl RaftSnapshotBuilder<TypeConfig> for Store {
             })
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+    use crate::control::{Command, Mutation, Request, network::Peer, version::Software};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[tokio::test]
+    async fn unacknowledged_preparation_blocks_old_binary_until_abort_is_applied() {
+        let home = std::env::temp_dir().join(format!(
+            "fleet-control-version-promise-{:032x}",
+            rand::random::<u128>()
+        ));
+        let path = home.join("control.redb");
+        let mut store = Store::open(&path, "cluster", 1).unwrap();
+        let log = |index| LogId::new(openraft::CommittedLeaderId::new(1, 1), index);
+        let peer = Peer {
+            identity: iroh::SecretKey::generate().public(),
+            address: "127.0.0.1:19001".parse().unwrap(),
+        };
+        store
+            .apply([Entry {
+                log_id: log(1),
+                payload: EntryPayload::Membership(openraft::Membership::new(
+                    vec![BTreeSet::from([1])],
+                    BTreeMap::from([(1, peer.node())]),
+                )),
+            }])
+            .await
+            .unwrap();
+        let command = |id: &str, mutation| Entry {
+            log_id: log(if id == "prepare" { 2 } else { 3 }),
+            payload: EntryPayload::Normal(Command {
+                principal: "admin".into(),
+                request: Request {
+                    origin: "cluster".into(),
+                    id: id.into(),
+                    mutation,
+                },
+            }),
+        };
+        store
+            .apply([command(
+                "prepare",
+                Mutation::PrepareVersion {
+                    expected_revision: 0,
+                    target: 2,
+                },
+            )])
+            .await
+            .unwrap();
+        store.prepare_version(1, 2).await.unwrap();
+        assert!(
+            store
+                .state()
+                .await
+                .unwrap()
+                .version
+                .pending
+                .unwrap()
+                .ready
+                .is_empty()
+        );
+        drop(store);
+        let bytes = std::fs::read(&path).unwrap();
+        let old = Software { min: 1, max: 1 };
+        assert!(Store::preflight_for(&path, "cluster", 1, old).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let mut store = Store::open(&path, "cluster", 1).unwrap();
+        store
+            .apply([command(
+                "abort",
+                Mutation::AbortVersion {
+                    expected_revision: 1,
+                },
+            )])
+            .await
+            .unwrap();
+        drop(store);
+        Store::preflight_for(&path, "cluster", 1, old).unwrap();
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

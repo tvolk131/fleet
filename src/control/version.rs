@@ -7,7 +7,7 @@ use std::{collections::BTreeSet, time::Duration};
 
 pub const WIRE: u32 = 1;
 pub const MIN: u32 = 1;
-pub const MAX: u32 = 1;
+pub const MAX: u32 = 2;
 
 /// Inspect before opening the real database for writes. An unclean redb file needs
 /// repair; repair a private scratch copy under the source lock, never the source.

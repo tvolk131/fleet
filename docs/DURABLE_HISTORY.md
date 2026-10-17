@@ -149,8 +149,8 @@ log expiry; this milestone does not add job-record garbage collection.
 
 ## Upgrade and qualification
 
-Durable history introduced format 10. The current protocol/storage format is **11**. Mixed-version operation is rejected. The explicit offline
-[upgrade procedure](CHECKPOINT_JOBS.md#explicit-format-5678910-upgrade) accepts idle format 5–10 singleton
+Durable history introduced format 10. The current physical format is **12**. [Rolling upgrades](ROLLING_UPGRADES.md) support adjacent cluster generations with explicit activation. The explicit offline
+[upgrade procedure](CHECKPOINT_JOBS.md#explicit-format-567891011-upgrade) accepts idle format 5–11 singleton
 state and preserves identities, receipts, jobs and checkpoints. No installed service is upgraded by
 qualification. Existing loose log files remain locally readable when available, but are not
 retroactively copied into archives. Historical metric records that were never captured cannot be

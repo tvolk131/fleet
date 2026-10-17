@@ -433,10 +433,9 @@ impl Handler {
             .is_some_and(|p| p.identity == peer);
         let is_admin = self.config.administrators.contains(&peer);
         if sender.is_some() {
-            if frame
-                .replica_generation
-                .is_none_or(|g| !super::version::Software::current().supports(g))
-            {
+            if frame.replica_generation.is_none_or(|g| {
+                !frame.software.supports(g) || !super::version::Software::current().supports(g)
+            }) {
                 return Answer::Refused(
                     "replica traffic requires an unsupported cluster generation".into(),
                 );
@@ -482,6 +481,13 @@ impl Handler {
             {
                 if request.id.is_empty() || request.id.len() > 512 {
                     return Answer::Refused("request ID must contain 1 to 512 bytes".into());
+                }
+                let state = match self.store.state().await {
+                    Ok(s) => s,
+                    Err(e) => return Answer::Refused(e.to_string()),
+                };
+                if request.mutation.minimum_generation() > state.version.active {
+                    return Answer::Refused("operation requires an inactive cluster generation; request was not accepted".into());
                 }
                 Answer::Write(
                     self.raft

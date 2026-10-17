@@ -11,11 +11,11 @@ changed by building, testing, or installing a release candidate.
 An executable supports at most two adjacent generations. Patch releases may retain the same range.
 Every replica must apply a command identically while the cluster remains at the old generation.
 Changes to deterministic command behavior require a new generation even when their schemas are
-unchanged. Old behavior must remain implemented until activation; new commands and snapshot schemas
+unchanged. Every mutation explicitly declares its minimum generation; ingress refuses inactive operations before appending them, and application also checks the gate. Old behavior must remain implemented until activation; new commands and snapshot schemas
 must not be emitted early. A Raft/redb dependency or physical-layout change requires its own explicit
 compatibility qualification; this mechanism is not permission to silently change those contracts.
 
-The control protocol and worker/storage interfaces are unchanged throughout this first transition.
+The first qualified transition is generation 1 to 2. It exercises activation and the downgrade floor; it deliberately keeps existing job/storage semantics and schemas unchanged. The control protocol and worker/storage interfaces are unchanged throughout this first transition.
 Old baseline workers, supervisors, storage agents and clients may continue serving during replica
 replacement. Future workload features must gate dispatch on the required agent capabilities.
 

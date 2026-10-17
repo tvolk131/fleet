@@ -398,3 +398,44 @@ async fn format_ten_upgrade_preserves_artifact_inventory_and_adds_active_storage
     assert_eq!(after.storage_plan("backup").unwrap().lifecycle.revision, 0);
     c.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn format_eleven_offline_upgrade_establishes_rolling_baseline_and_preserves_receipts() {
+    let mut c = Cluster::new(1).await;
+    let submitted = super::super::submit("baseline-submit", "baseline-job");
+    let accepted = c.client.write(submitted.clone(), WAIT).await.unwrap();
+    c.client
+        .write(
+            Request {
+                origin: "cluster".into(),
+                id: "cancel".into(),
+                mutation: Mutation::CancelQueued {
+                    id: "baseline-job".into(),
+                    expected_revision: 1,
+                },
+            },
+            WAIT,
+        )
+        .await
+        .unwrap();
+    c.replicas.remove(&1).unwrap().shutdown().await.unwrap();
+    let home = c.home.0.join("1");
+    edit(
+        &home.join("control.redb"),
+        TableDefinition::new("meta"),
+        |v| {
+            v["format"] = json!(11);
+            v.as_object_mut().unwrap().remove("version");
+        },
+    )
+    .await;
+    let bytes = std::fs::read(home.join("control.redb")).unwrap();
+    assert!(Store::open(&home.join("control.redb"), "cluster", 1).is_err());
+    assert_eq!(std::fs::read(home.join("control.redb")).unwrap(), bytes);
+    fleet::control::upgrade::run(&home, &[], &[]).unwrap();
+    assert!(home.join("control.redb.v11-backup").exists());
+    c.start(1).await;
+    assert_eq!(c.client.read(WAIT).await.unwrap().version.active, 1);
+    assert_eq!(c.client.write(submitted, WAIT).await.unwrap(), accepted);
+    c.close().await;
+}

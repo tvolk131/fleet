@@ -157,6 +157,51 @@ pub enum Mutation {
     },
 }
 
+impl Mutation {
+    /// Explicitly classify every new operation. Ingress refuses inactive features before
+    /// replication, so an older voter never needs to deserialize a newer command variant.
+    pub(crate) fn minimum_generation(&self) -> u32 {
+        match self {
+            Self::PrepareVersion { .. }
+            | Self::ReplicaPrepared { .. }
+            | Self::ActivateVersion { .. }
+            | Self::AbortVersion { .. }
+            | Self::HistoryReport(..)
+            | Self::HistoryPolicy { .. }
+            | Self::SweepHistory { .. }
+            | Self::Enqueue(..)
+            | Self::EnrollStorage(..)
+            | Self::ReplaceStorage { .. }
+            | Self::RetireStorage { .. }
+            | Self::FinishStorageRetirement { .. }
+            | Self::DeclareStorageLost { .. }
+            | Self::ReviewStorageRecovery { .. }
+            | Self::StoragePolicy { .. }
+            | Self::ArtifactReady(..)
+            | Self::ArtifactReport(..)
+            | Self::ArtifactRetention { .. }
+            | Self::DeleteArtifact { .. }
+            | Self::ExpireArtifacts { .. }
+            | Self::Stage { .. }
+            | Self::CancelQueued { .. }
+            | Self::Place { .. }
+            | Self::Drain { .. }
+            | Self::RecoverWorker(..)
+            | Self::ResumeRecovery { .. }
+            | Self::Enroll { .. }
+            | Self::AddWorkerRuntimes { .. }
+            | Self::Assign { .. }
+            | Self::Desire { .. }
+            | Self::WorkerReport(..)
+            | Self::CheckpointReady(..)
+            | Self::SuspendJob { .. }
+            | Self::ResumeJob { .. }
+            | Self::ChangeMembership { .. }
+            | Self::Release { .. } => 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Reply {
     RecoveryUnknown { origin: String, current: String },
@@ -315,6 +360,9 @@ impl State {
         mutation: &Mutation,
         index: u64,
     ) -> Reply {
+        if mutation.minimum_generation() > self.version.active {
+            return Reply::rejected("operation requires an inactive cluster generation");
+        }
         match mutation {
             Mutation::PrepareVersion {
                 expected_revision,
