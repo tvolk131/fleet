@@ -40,6 +40,35 @@ pub enum ApiRequest {
         policy: crate::history::Policy,
     },
     Storage,
+    StoragePlan {
+        storage: String,
+    },
+    ReplaceStorage {
+        request_id: String,
+        storage: String,
+        replacement: String,
+        expected_revision: u64,
+    },
+    RetireStorage {
+        request_id: String,
+        storage: String,
+        expected_revision: u64,
+        expected_inventory: String,
+    },
+    FinishStorageRetirement {
+        request_id: String,
+        storage: String,
+        expected_revision: u64,
+    },
+    DeclareStorageLost {
+        request_id: String,
+        storage: String,
+        replacement: String,
+        expected_revision: u64,
+        expected_inventory: String,
+        #[serde(default)]
+        unavailable_artifacts: BTreeSet<String>,
+    },
     ReviewStorageRecovery {
         request_id: String,
         expected_catalog: String,
@@ -205,6 +234,10 @@ impl ApiRequest {
         match self {
             Self::HistoryRetention { request_id, .. } => Some(request_id),
             Self::ReviewStorageRecovery { request_id, .. }
+            | Self::ReplaceStorage { request_id, .. }
+            | Self::RetireStorage { request_id, .. }
+            | Self::FinishStorageRetirement { request_id, .. }
+            | Self::DeclareStorageLost { request_id, .. }
             | Self::EnrollStorage { request_id, .. }
             | Self::StoragePolicy { request_id, .. }
             | Self::ArtifactRetention { request_id, .. }
@@ -312,6 +345,48 @@ impl AppClient {
             return self.send(prepared).await;
         }
         let mutation = match api {
+            ApiRequest::ReplaceStorage {
+                storage,
+                replacement,
+                expected_revision,
+                ..
+            } => Mutation::ReplaceStorage {
+                storage: storage.clone(),
+                replacement: replacement.clone(),
+                expected_revision: *expected_revision,
+            },
+            ApiRequest::RetireStorage {
+                storage,
+                expected_revision,
+                expected_inventory,
+                ..
+            } => Mutation::RetireStorage {
+                storage: storage.clone(),
+                expected_revision: *expected_revision,
+                expected_inventory: expected_inventory.clone(),
+            },
+            ApiRequest::FinishStorageRetirement {
+                storage,
+                expected_revision,
+                ..
+            } => Mutation::FinishStorageRetirement {
+                storage: storage.clone(),
+                expected_revision: *expected_revision,
+            },
+            ApiRequest::DeclareStorageLost {
+                storage,
+                replacement,
+                expected_revision,
+                expected_inventory,
+                unavailable_artifacts,
+                ..
+            } => Mutation::DeclareStorageLost {
+                storage: storage.clone(),
+                replacement: replacement.clone(),
+                expected_revision: *expected_revision,
+                expected_inventory: expected_inventory.clone(),
+                unavailable_artifacts: unavailable_artifacts.clone(),
+            },
             ApiRequest::ReviewStorageRecovery {
                 expected_catalog,
                 unavailable_locations,
@@ -636,6 +711,14 @@ impl AppClient {
     }
     pub async fn execute(&mut self, api: ApiRequest) -> Result<Value> {
         match &api {
+            ApiRequest::StoragePlan { storage } => {
+                let state = self.read().await?;
+                Ok(json!(
+                    state
+                        .storage_plan(storage)
+                        .context("unknown storage agent")?
+                ))
+            }
             ApiRequest::Storage => {
                 let state = self.read().await?;
                 let mut workers = Vec::new();
@@ -659,6 +742,10 @@ impl AppClient {
                 }
                 let mut storage_reports = Vec::new();
                 for store in state.storage.stores.values() {
+                    if !state.storage_enrolled(&store.id) {
+                        storage_reports.push(json!({"storage":store.id,"report":null,"error":"identity revoked; agent is not contacted"}));
+                        continue;
+                    }
                     let report = super::storage_status::read(
                         &self.transport.endpoint,
                         &store.peer,
@@ -673,7 +760,7 @@ impl AppClient {
                     });
                 }
                 Ok(
-                    json!({"storage_reports":storage_reports,"workers":workers,"retention":state.retention_plan(),"stores":state.storage.stores,"policy":state.storage.policy,"revision":state.storage.policy_revision,"catalog_fingerprint":state.artifact_catalog_fingerprint(),"cleanup_allowed":state.artifact_cleanup_allowed(None),"quarantined_locations":state.storage.quarantined_locations}),
+                    json!({"plans":state.storage.stores.keys().filter_map(|id| state.storage_plan(id)).collect::<Vec<_>>(),"storage_reports":storage_reports,"workers":workers,"retention":state.retention_plan(),"stores":state.storage.stores,"policy":state.storage.policy,"revision":state.storage.policy_revision,"catalog_fingerprint":state.artifact_catalog_fingerprint(),"cleanup_allowed":state.artifact_cleanup_allowed(None),"quarantined_locations":state.storage.quarantined_locations}),
                 )
             }
             ApiRequest::Artifacts { attempt } => {
@@ -707,6 +794,10 @@ impl AppClient {
                 Ok(answer)
             }
             ApiRequest::ReviewStorageRecovery { .. }
+            | ApiRequest::ReplaceStorage { .. }
+            | ApiRequest::RetireStorage { .. }
+            | ApiRequest::FinishStorageRetirement { .. }
+            | ApiRequest::DeclareStorageLost { .. }
             | ApiRequest::HistoryRetention { .. }
             | ApiRequest::EnrollStorage { .. }
             | ApiRequest::StoragePolicy { .. }

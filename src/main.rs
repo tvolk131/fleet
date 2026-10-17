@@ -252,6 +252,50 @@ enum ClientCommand {
 }
 #[derive(Subcommand)]
 enum StorageCommand {
+    /// Inspect lifecycle, copy progress and the inventory fingerprint before retirement or loss declaration.
+    Plan {
+        storage: String,
+    },
+    /// Drain future placement and copy retained artifacts to a separately enrolled replacement.
+    Replace {
+        storage: String,
+        replacement: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// Authorize old-copy cleanup only after every retained artifact has a verified replacement.
+    Retire {
+        storage: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        inventory: String,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// Revoke the identity after all old-copy deletions are acknowledged.
+    FinishRetirement {
+        storage: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// Permanently revoke an unavailable agent, without claiming its bytes were erased or recovered.
+    DeclareLost {
+        storage: String,
+        replacement: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        inventory: String,
+        #[arg(long)]
+        unavailable_artifact: Vec<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
     /// After inspecting recovered retention/copy inventory, authorize cleanup; named unavailable locations remain quarantined.
     ReviewRecovery {
         #[arg(long)]
@@ -466,6 +510,53 @@ async fn run(args: Args) -> Result<()> {
             operation,
         } => return fleet::instances::guest::supervise(&instance_home, &id, &operation),
         Command::Storage { action } => match action {
+            StorageCommand::Plan { storage } => ApiRequest::StoragePlan { storage },
+            StorageCommand::Replace {
+                storage,
+                replacement,
+                revision,
+                request_id: rid,
+            } => ApiRequest::ReplaceStorage {
+                request_id: request_id(rid),
+                storage,
+                replacement,
+                expected_revision: revision,
+            },
+            StorageCommand::Retire {
+                storage,
+                revision,
+                inventory,
+                request_id: rid,
+            } => ApiRequest::RetireStorage {
+                request_id: request_id(rid),
+                storage,
+                expected_revision: revision,
+                expected_inventory: inventory,
+            },
+            StorageCommand::FinishRetirement {
+                storage,
+                revision,
+                request_id: rid,
+            } => ApiRequest::FinishStorageRetirement {
+                request_id: request_id(rid),
+                storage,
+                expected_revision: revision,
+            },
+            StorageCommand::DeclareLost {
+                storage,
+                replacement,
+                revision,
+                inventory,
+                unavailable_artifact,
+                request_id: rid,
+            } => ApiRequest::DeclareStorageLost {
+                request_id: request_id(rid),
+                storage,
+                replacement,
+                expected_revision: revision,
+                expected_inventory: inventory,
+                unavailable_artifacts: unavailable_artifact.into_iter().collect(),
+            },
             StorageCommand::Status => ApiRequest::Storage,
             StorageCommand::ReviewRecovery {
                 catalog_fingerprint,

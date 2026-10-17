@@ -672,6 +672,12 @@ impl Worker {
                     cluster: config.cluster.clone(),
                     access: artifact_access.clone(),
                     slots: Arc::new(tokio::sync::Semaphore::new(4)),
+                    authorization: super::artifact_io::Authorization::new(
+                        endpoint.clone(),
+                        config.cluster.clone(),
+                        config.controllers.clone(),
+                        home,
+                    )?,
                 },
             )
             .accept(

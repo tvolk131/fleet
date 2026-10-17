@@ -29,11 +29,14 @@ Application consistency remains the application's responsibility.
 ## Consensus and reconciliation
 
 The closed command enum adds `EnrollStorage`, `StoragePolicy`, `ArtifactReady`, `ArtifactReport`,
-`ArtifactRetention`, `DeleteArtifact`, `ExpireArtifacts`, and `ReviewStorageRecovery`.
+`ArtifactRetention`, `DeleteArtifact`, `ExpireArtifacts`, and `ReviewStorageRecovery`. Agent lifecycle
+uses `ReplaceStorage`, `RetireStorage`, `FinishStorageRetirement`, and `DeclareStorageLost`.
 `CheckpointReady` also registers the corresponding artifact. History adds `HistoryReport`, `HistoryPolicy`
 and `SweepHistory`, reusing the artifact copy/retention commands. Applying these commands changes only
 metadata. Authenticated `StorageRead` and `WorkerRead` return quorum-confirmed intent. The storage and
-worker reconcilers perform transfers/deletion afterward, then propose versioned observations. Disk IO,
+worker reconcilers perform transfers/deletion afterward, then propose versioned observations.
+`AuthorizeArtifact` is a quorum-confirmed read that checks the current identities and assignment before
+each new transfer; it does not add a request receipt or a consensus command. Disk IO,
 network IO, and wall-clock expiry decisions never run inside the replicated state machine.
 
 ## Storage setup
@@ -63,7 +66,8 @@ fleet service run --config /absolute/storage-service.json
 Policy revisions are explicit. Read `storage status` before changing an existing policy; repeated
 `--input`, `--checkpoint`, `--output` and `--history` options select multiple destinations. Supply every
 desired category when replacing the default policy. Registration (identity, incarnation,
-address, failure domain, quota) is immutable in this milestone; prepare a new role/home to replace one.
+address, failure domain, quota) is immutable. Prepare a new role/home and use the replacement workflow below.
+Retired and lost IDs and public keys remain reserved and cannot be enrolled again, including as workers.
 Storage agents can read source artifacts and report their assigned copies, but cannot enqueue work,
 change policy, or read the administrator-only control-plane state.
 
@@ -94,7 +98,8 @@ fleet fetch-artifact ARTIFACT_ID /absolute/new-directory
 ```
 
 `artifacts` includes manifest, source/backup copy phases, revisions, pins, expiry, tombstones, and whether
-the artifact is currently protected. Copy phases are `Pending`, `Ready`, `Missing`, `Failed`, `Deleted`.
+the artifact is currently protected. Copy phases are `Pending`, `Ready`, `Missing`, `Failed`, `Deleted`, and `Lost`. `Lost` records explicit
+identity revocation; it never means that an unreachable disk was erased or its data restored.
 Source and storage observations are authenticated, compare-and-swap versioned, and authority-bound.
 A replica restart or leader change does not reset them. A stale report cannot undo deletion intent.
 
@@ -148,6 +153,89 @@ have their own bounded reclamation after verified backup or committed deletion. 
 to erase every historical copy from the host or external exports. Rolling jobs release capture slots
 after local reclamation; the default cumulative per-attempt limit is not reset by deletion.
 
+## Replace and retire a storage agent
+
+Storage identities have a replicated lifecycle: **active → draining → cleaning → retired**, with a
+separate irreversible **lost** state. Each lifecycle has a revision. The normal workflow is:
+
+1. Prepare and enroll a new storage role with a fresh identity, ID, and empty home. Start its service.
+2. Run `storage replace OLD NEW --revision REVISION`. Fleet atomically substitutes the new agent in
+   future placement and adds it to every retained artifact assigned to the old agent. The old agent
+   stays readable while draining. Existing pins, expiry, manifests, jobs and attempts are unchanged.
+3. Inspect `storage plan OLD`. Wait until `awaiting_replacement` is empty, then run `storage retire`
+   with that plan's revision and inventory fingerprint. The controller checks the current inventory
+   again before committing old-copy cleanup. A stale fingerprint or incomplete replacement is rejected.
+4. While **cleaning**, the old agent deletes only its own assigned copies and acknowledges each deletion.
+   `storage finish-retirement` succeeds only after all acknowledgments under the current authority.
+   It permanently revokes the old identity. Stop its service afterward.
+
+```sh
+fleet storage plan old-store
+fleet storage replace old-store new-store --revision 0 --request-id replace-old
+fleet storage plan old-store
+fleet storage retire old-store --revision 1 --inventory FINGERPRINT --request-id retire-old
+fleet storage plan old-store
+fleet storage finish-retirement old-store --revision 2 --request-id finish-old
+```
+
+Every retained artifact requires an independent new copy: choosing an existing backup target as the
+replacement is rejected when that would collapse two required copies into one. Other configured copies
+remain required. The replacement must be active and cannot itself drain while an incoming replacement
+is unfinished. An empty unused agent may retire without a replacement. Removing an agent from default
+policy alone still neither retires it nor deletes its existing copies.
+
+Transfers verify bytes and sizes before reporting Ready. Admission failures, unavailable sources,
+corruption, and restarts keep the operation pending; they do not authorize early cleanup. A Ready
+observation records verified durable bytes, not a guarantee of current host uptime or future disk
+health. Failure-domain labels remain operator declarations. Choose a different machine/disk when
+physical host-loss protection is required.
+
+## Explicit lost-agent recovery
+
+When an agent or its disk cannot be recovered, inspect `storage plan OLD` and enroll a fresh
+replacement. Then explicitly declare the old identity lost, using the plan's inventory fingerprint
+and acknowledging **exactly** its `unavailable_without_agent` artifact IDs:
+
+```sh
+fleet storage plan failed-store
+fleet storage declare-lost failed-store replacement-store --revision REVISION \
+  --inventory FINGERPRINT --unavailable-artifact ARTIFACT_ID --request-id lost-store
+# Repeat --unavailable-artifact for every listed ID; omit it when the set is empty.
+```
+
+This immediately fences the old identity, routes future placement to the replacement, removes the
+old required target, and records old unconfirmed copies as Lost. It preserves manifests, pins,
+resume dependencies and attempt history. Repair proceeds from surviving storage or worker copies;
+replacement copies remain Pending/Failed until their bytes are actually verified. Reads of unavailable
+data fail explicitly. Portable resume continues to require verified inputs and checkpoints. No
+metadata override creates bytes or turns missing data into a successful read.
+
+The acknowledged set means **no other current-authority Ready copy is recorded**. A surviving Ready
+observation may still refer to an offline host. The plan distinguishes this inventory assessment from
+actual repair completion. The loss record retains the reviewed inventory and artifact IDs even after
+history chunks later expire and compact. Cleanup of surviving copies still follows ordinary pin,
+retention, resume-dependency and emergency-recovery holds; a loss declaration does not bypass them.
+
+An old agent returning with its original disk cannot report Ready, accept new input uploads, or start
+new artifact reads. Storage servers and workers authorize every new artifact transfer through a fresh
+quorum read, so cached reader lists cannot restore revoked access. Transfers already authorized may
+finish; stale observations cannot restore the old placement. New transfers pause without quorum.
+Reusing the old disk/credentials is not a rejoin procedure: retain the disk for manual salvage and
+prepare a fresh role/home. This milestone does not add automatic salvage/import from a revoked disk.
+
+The lost path also handles a donor disappearing during drain or cleanup. If a replacement destination
+fails while another donor is draining toward it, declaring that destination lost redirects the pending
+replacement to the fresh agent. A loss declaration never claims physical deletion of the lost disk.
+Compact history cleanup can stop waiting for that revoked location, while the lifecycle loss record
+retains the explicit acknowledgement.
+
+The JSON CLI exposes `storage_plan`, `replace_storage`, `retire_storage`,
+`finish_storage_retirement`, and `declare_storage_lost`. Mutations use saved request IDs and explicit
+revisions; use `retry` after an unknown outcome. `storage` includes lifecycle plans and progress.
+The iced-m3 GUI shows these states and offers replacement/retirement actions. Declaring loss has a
+review panel listing the exact unavailable artifacts; it submits the displayed fingerprint rather
+than silently accepting a newer inventory during refresh.
+
 ## Emergency control-plane recovery
 
 Storage agents stay bound to their original cluster authority until explicitly rebound using the same
@@ -169,8 +257,10 @@ fleet storage review-recovery --catalog-fingerprint FINGERPRINT_FROM_STORAGE_STA
 The fingerprint binds approval to the inspected catalog; a changed catalog requires a new review.
 Unavailable locations must be named with repeated `--unavailable-location storage/ID` or `worker/ID`.
 They remain quarantined from cleanup even after review. Once they return and reconcile, inspect again
-and submit a new review without those exclusions. No timed lease or automatic authority takeover can
-turn a stale controller snapshot into deletion permission.
+and submit a new review without those exclusions. Permanently revoked locations cannot return; naming
+them in the review carries their existing Deleted/Lost observations into the new authority, allowing
+fully expired history to compact without claiming that a lost disk was erased. No timed lease or
+automatic authority takeover can turn a stale controller snapshot into deletion permission.
 
 ## CLI JSON interface and qualification
 
@@ -179,12 +269,13 @@ The normal `fleet api` interface exposes `storage`, `artifacts`, `enroll_storage
 `review_storage_recovery`. Mutations require an explicit request ID and applicable revision/fingerprint.
 Use `retry` after an unknown mutation outcome; do not invent a new request ID to bypass uncertainty.
 
-The current protocol/metadata format is 10. Mixed versions are refused. The explicit offline singleton upgrade
-accepts idle formats 5–9; formats 6–9 may include suspended jobs. It preserves checkpoint metadata and
+The current protocol/metadata format is 11. Mixed versions are refused. The explicit offline singleton upgrade
+accepts idle formats 5–10; formats 6–10 may include suspended jobs. It preserves checkpoint metadata and
 receipts, registers existing checkpoints as source artifacts, and creates versioned backups. It refuses
 recovery-bound old-format installations pending a separately reviewed migration. See
-[the upgrade procedure](CHECKPOINT_JOBS.md#explicit-format-56789-upgrade).
+[the upgrade procedure](CHECKPOINT_JOBS.md#explicit-format-5678910-upgrade).
 
+Rust qualification additionally covers replacement across leader loss, restart and stale access, explicit lost data, identity reuse rejection, copy-count preservation, and format-10 upgrade.
 Rust qualification covers three-replica checkpoint backup/export/resume with the original worker payloads
 and blob cache unavailable, leader loss, immutable attempt history, pins/expiry/cleanup, quotas,
 authentication, interrupted staging, corruption/peer repair, signed recovery/review, and format-6/7 upgrade.
@@ -201,3 +292,14 @@ records are unchanged. Separate homes/processes on one M4 qualify the recovery p
 of physical M4 loss**. That final failure domain still requires a second machine.
 
 See [rolling checkpoint storage](ROLLING_STORAGE.md) for opt-in automatic retention, cache reclamation and timestamped storage visibility.
+
+The portable CLI scenario exercises replacement and retirement of inputs, checkpoints, logs, metrics
+and outputs, then repair from a surviving backup after explicit agent loss:
+
+```sh
+python3 contrib/qualify_portable_tart.py --fake --storage-lifecycle \
+  --binary "$PWD/target/debug/fleet" --home /tmp/fleet-control-storage-lifecycle
+```
+
+All homes, keys, services, workloads and fault injection are isolated. This scenario is part of CI on
+Linux and macOS; it uses the fake Tart adapter because the behavior under test is storage orchestration.

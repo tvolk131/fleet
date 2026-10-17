@@ -1088,3 +1088,6 @@ mod runtime_update;
 
 #[path = "history.rs"]
 mod history;
+
+#[path = "storage_lifecycle.rs"]
+mod storage_lifecycle;

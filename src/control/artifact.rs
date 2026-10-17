@@ -191,6 +191,8 @@ pub enum CopyPhase {
     Missing,
     Failed,
     Deleted,
+    /// The administrator revoked an unavailable storage agent. This is not proof of erasure.
+    Lost,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Copy {
@@ -236,6 +238,8 @@ pub struct Policy {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Catalog {
     #[serde(default)]
+    pub lifecycle: BTreeMap<String, super::storage_lifecycle::Lifecycle>,
+    #[serde(default)]
     pub next_ordinal: u64,
     #[serde(default)]
     pub cleanup_reviewed: Option<String>,
@@ -266,6 +270,7 @@ pub struct Report {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct View {
     pub registration: Registration,
+    pub lifecycle: super::storage_lifecycle::Lifecycle,
     pub artifacts: Vec<Artifact>,
     pub workers: BTreeMap<String, super::workload::Registration>,
     pub stores: BTreeMap<String, Registration>,
@@ -315,6 +320,25 @@ impl State {
                 "artifact locations must report under recovered authority or be explicitly quarantined",
             );
         }
+        // Revoked identities cannot rebind/report after disaster recovery. An explicit review
+        // may carry forward their terminal observations without claiming lost bytes were erased.
+        let revoked: BTreeSet<_> = self
+            .storage
+            .stores
+            .keys()
+            .filter(|id| !self.storage_enrolled(id))
+            .map(|id| format!("storage/{id}"))
+            .collect();
+        for a in self.storage.artifacts.values_mut() {
+            for (location, copy) in &mut a.copies {
+                if revoked.contains(location)
+                    && unavailable.contains(location)
+                    && matches!(copy.phase, CopyPhase::Deleted | CopyPhase::Lost)
+                {
+                    copy.authority = self.cluster.clone();
+                }
+            }
+        }
         self.storage.cleanup_reviewed = Some(self.cluster.clone());
         self.storage.quarantined_locations = unavailable.clone();
         Reply::Recorded
@@ -327,6 +351,10 @@ impl State {
                     ensure!(
                         old == registration,
                         "storage identity/configuration is immutable"
+                    );
+                    ensure!(
+                        self.storage_enrolled(&registration.id),
+                        "storage identity is permanently revoked; enroll a fresh identity and ID"
                     );
                 }
                 ensure!(
@@ -482,9 +510,9 @@ impl State {
             .union(&policy.outputs)
             .chain(policy.inputs.iter())
             .chain(policy.history.iter())
-            .any(|id| !self.storage.stores.contains_key(id))
+            .any(|id| !self.storage_active(id))
         {
-            return Reply::rejected("unknown storage target");
+            return Reply::rejected("storage targets must be active");
         }
         self.storage.policy = policy.clone();
         self.storage.policy_revision += 1;
@@ -509,9 +537,10 @@ impl State {
     }
     pub fn artifact_reporter(&self, principal: &str, location: &str, incarnation: &str) -> bool {
         if let Some(id) = location.strip_prefix("storage/") {
-            self.storage.stores.get(id).is_some_and(|r| {
-                r.peer.identity.to_string() == principal && r.incarnation == incarnation
-            })
+            self.storage_enrolled(id)
+                && self.storage.stores.get(id).is_some_and(|r| {
+                    r.peer.identity.to_string() == principal && r.incarnation == incarnation
+                })
         } else if let Some(id) = location.strip_prefix("worker/") {
             self.workers.get(id).is_some_and(|r| {
                 r.peer.identity.to_string() == principal
@@ -526,6 +555,9 @@ impl State {
         if !self.artifact_reporter(principal, &report.location, &report.incarnation) {
             return Reply::rejected("artifact reporter identity mismatch");
         }
+        let releasing = report.location.strip_prefix("storage/").is_some_and(|id| {
+            self.storage_lifecycle(id).phase == super::storage_lifecycle::Phase::Cleaning
+        });
         let Some(a) = self.storage.artifacts.get_mut(&report.artifact) else {
             return Reply::rejected("unknown artifact");
         };
@@ -536,11 +568,13 @@ impl State {
             return Reply::rejected("stale artifact observation");
         }
         if report.detail.as_ref().is_some_and(|s| s.len() > 1000)
-            || report.phase == CopyPhase::Pending
+            || matches!(report.phase, CopyPhase::Pending | CopyPhase::Lost)
         {
             return Reply::rejected("invalid artifact observation");
         }
-        if a.deleted != (report.phase == CopyPhase::Deleted) && report.phase != CopyPhase::Failed {
+        if (a.deleted || releasing) != (report.phase == CopyPhase::Deleted)
+            && report.phase != CopyPhase::Failed
+        {
             return Reply::rejected("copy observation contradicts retention intent");
         }
         *copy = Copy {

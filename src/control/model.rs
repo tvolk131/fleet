@@ -34,6 +34,27 @@ pub enum Mutation {
     },
     Enqueue(super::queue::Submission),
     EnrollStorage(super::artifact::Registration),
+    ReplaceStorage {
+        storage: String,
+        replacement: String,
+        expected_revision: u64,
+    },
+    RetireStorage {
+        storage: String,
+        expected_revision: u64,
+        expected_inventory: String,
+    },
+    FinishStorageRetirement {
+        storage: String,
+        expected_revision: u64,
+    },
+    DeclareStorageLost {
+        storage: String,
+        replacement: String,
+        expected_revision: u64,
+        expected_inventory: String,
+        unavailable_artifacts: std::collections::BTreeSet<String>,
+    },
     ReviewStorageRecovery {
         expected_catalog: String,
         unavailable_locations: std::collections::BTreeSet<String>,
@@ -287,6 +308,33 @@ impl State {
             Mutation::SweepHistory { as_of } => self.sweep_history(*as_of),
             Mutation::Enqueue(s) => self.enqueue(s, index),
             Mutation::EnrollStorage(r) => self.enroll_storage(r),
+            Mutation::ReplaceStorage {
+                storage,
+                replacement,
+                expected_revision,
+            } => self.replace_storage(storage, replacement, *expected_revision),
+            Mutation::RetireStorage {
+                storage,
+                expected_revision,
+                expected_inventory,
+            } => self.retire_storage(storage, *expected_revision, expected_inventory),
+            Mutation::FinishStorageRetirement {
+                storage,
+                expected_revision,
+            } => self.finish_storage_retirement(storage, *expected_revision),
+            Mutation::DeclareStorageLost {
+                storage,
+                replacement,
+                expected_revision,
+                expected_inventory,
+                unavailable_artifacts,
+            } => self.lose_storage(
+                storage,
+                replacement,
+                *expected_revision,
+                expected_inventory,
+                unavailable_artifacts,
+            ),
             Mutation::ReviewStorageRecovery {
                 expected_catalog,
                 unavailable_locations,

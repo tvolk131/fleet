@@ -23,9 +23,10 @@ impl State {
         !a.deleted
             && !a.targets.is_empty()
             && a.targets.iter().all(|id| {
-                a.copies.get(&format!("storage/{id}")).is_some_and(|c| {
-                    c.authority == self.cluster && c.phase == artifact::CopyPhase::Ready
-                })
+                self.storage_readable(id)
+                    && a.copies.get(&format!("storage/{id}")).is_some_and(|c| {
+                        c.authority == self.cluster && c.phase == artifact::CopyPhase::Ready
+                    })
             })
     }
     pub fn portable_ready(&self, job: &Job) -> Result<()> {

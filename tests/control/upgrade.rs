@@ -284,3 +284,76 @@ async fn format_nine_upgrade_preserves_receipts_and_adds_history_defaults_withou
     );
     c.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn format_ten_upgrade_preserves_artifact_inventory_and_adds_active_storage_lifecycle() {
+    let mut c = Cluster::new(1).await;
+    let (home, config) = prepare(&mut c, false).await;
+    let mut worker = Worker::start(&home, config, hello()).await.unwrap();
+    let (_, _, mut backup) = super::storage::backup(&mut c, "backup", 16 << 20).await;
+    c.client
+        .write(
+            Request {
+                origin: "cluster".into(),
+                id: "policy".into(),
+                mutation: Mutation::StoragePolicy {
+                    expected_revision: 0,
+                    policy: fleet::control::artifact::Policy {
+                        outputs: BTreeSet::from(["backup".into()]),
+                        ..Default::default()
+                    },
+                },
+            },
+            WAIT,
+        )
+        .await
+        .unwrap();
+    c.client
+        .write(
+            super::assign("output", workload("printf migration-data > result.txt")),
+            WAIT,
+        )
+        .await
+        .unwrap();
+    wait(
+        &mut c,
+        &mut worker,
+        "output",
+        WorkPhase::Job(AttemptPhase::Succeeded),
+    )
+    .await;
+    worker.tick().await.unwrap();
+    backup.tick().await.unwrap();
+    let before = c.client.read(WAIT).await.unwrap();
+    worker.shutdown().await.unwrap();
+    backup.shutdown().await.unwrap();
+    c.replicas.remove(&1).unwrap().shutdown().await.unwrap();
+    let controller = c.home.0.join("1");
+    edit(
+        &controller.join("control.redb"),
+        TableDefinition::new("meta"),
+        |v| {
+            v["format"] = json!(10);
+            v["storage"].as_object_mut().unwrap().remove("lifecycle");
+        },
+    );
+    edit(
+        &home.join("worker.redb"),
+        TableDefinition::new("worker_journal"),
+        |v| {
+            v["format"] = json!(10);
+        },
+    );
+    fleet::control::upgrade::run(&controller, std::slice::from_ref(&home), &[]).unwrap();
+    assert!(controller.join("control.redb.v10-backup").exists());
+    c.start(1).await;
+    let after = c.client.read(WAIT).await.unwrap();
+    assert_eq!(after.format, fleet::control::FORMAT);
+    assert_eq!(after.jobs, before.jobs);
+    assert_eq!(after.receipts, before.receipts);
+    assert_eq!(after.history, before.history);
+    assert_eq!(after.storage, before.storage);
+    assert!(after.storage_active("backup"));
+    assert_eq!(after.storage_plan("backup").unwrap().lifecycle.revision, 0);
+    c.close().await;
+}

@@ -302,9 +302,10 @@ impl State {
         self.storage.artifacts.retain(|_, a| {
             !(matches!(a.manifest.kind, Kind::History { .. })
                 && a.deleted
-                && a.copies
-                    .values()
-                    .all(|c| c.authority == *cluster && c.phase == CopyPhase::Deleted))
+                && a.copies.values().all(|c| {
+                    c.authority == *cluster
+                        && matches!(c.phase, CopyPhase::Deleted | CopyPhase::Lost)
+                }))
         });
     }
 }

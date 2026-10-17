@@ -88,6 +88,11 @@ pub enum Message {
         storage: String,
         incarnation: String,
     },
+    AuthorizeArtifact {
+        reader: EndpointId,
+        artifact: String,
+        upload: bool,
+    },
     WorkerRead {
         worker: String,
         incarnation: String,
@@ -121,6 +126,7 @@ pub enum Answer {
     Inspect(ReplicaStatus),
     WorkerRead(Result<super::workload::WorkerView, ApiError>),
     StorageRead(Result<super::artifact::View, ApiError>),
+    AuthorizeArtifact(Result<bool, ApiError>),
     Refused(String),
 }
 
@@ -492,7 +498,7 @@ impl Handler {
                         .filter(|a| a.copies.contains_key(&format!("worker/{worker}")))
                         .cloned()
                         .collect(),
-                    stores: state.storage.stores.clone(),
+                    stores: state.readable_stores(),
                     cleanup_allowed: state
                         .artifact_cleanup_allowed(Some(&format!("worker/{worker}"))),
                     starts_allowed: state.recovery.as_ref().is_none_or(|r| r.resumed),
@@ -555,12 +561,11 @@ impl Handler {
                     Ok(s) => s,
                     Err(e) => return Answer::Refused(e.to_string()),
                 };
-                let Some(registration) = state
-                    .storage
-                    .stores
-                    .get(&storage)
-                    .filter(|r| r.peer.identity == peer && r.incarnation == incarnation)
-                else {
+                let Some(registration) = state.storage.stores.get(&storage).filter(|r| {
+                    r.peer.identity == peer
+                        && r.incarnation == incarnation
+                        && state.storage_enrolled(&storage)
+                }) else {
                     return Answer::Refused(
                         "storage identity or incarnation is not enrolled".into(),
                     );
@@ -569,18 +574,64 @@ impl Handler {
                     state.artifact_cleanup_allowed(Some(&format!("storage/{storage}")));
                 Answer::StorageRead(Ok(super::artifact::View {
                     registration: registration.clone(),
+                    lifecycle: state.storage_lifecycle(&storage),
                     artifacts: state
                         .storage
                         .artifacts
                         .values()
-                        .filter(|a| a.targets.contains(&storage))
+                        .filter(|a| a.copies.contains_key(&format!("storage/{storage}")))
                         .cloned()
                         .collect(),
+                    stores: state.readable_stores(),
                     workers: state.workers,
-                    stores: state.storage.stores,
                     checkpoints: state.checkpoints,
                     cleanup_allowed,
                 }))
+            }
+            Message::AuthorizeArtifact {
+                reader,
+                artifact,
+                upload,
+            } => {
+                if let Err(e) = self.raft.ensure_linearizable().await {
+                    return Answer::AuthorizeArtifact(Err(ApiError {
+                        message: e.to_string(),
+                        leader: e.forward_to_leader().and_then(|f| f.leader_id),
+                    }));
+                }
+                let state = match self.store.state().await {
+                    Ok(s) => s,
+                    Err(e) => return Answer::Refused(e.to_string()),
+                };
+                let permitted = state.storage.artifacts.get(&artifact).is_some_and(|a| {
+                    if a.deleted {
+                        return false;
+                    }
+                    let storage_source = state.storage.stores.values().any(|r| {
+                        r.peer.identity == peer
+                            && state.storage_readable(&r.id)
+                            && a.targets.contains(&r.id)
+                    });
+                    let worker_source = !upload
+                        && state.workers.values().any(|w| {
+                            w.peer.identity == peer
+                                && !state.worker_recovery_required(&w.id)
+                                && a.copies.contains_key(&format!("worker/{}", w.id))
+                        });
+                    let allowed_reader = self.config.administrators.contains(&reader)
+                        || (!upload
+                            && (state.workers.values().any(|w| {
+                                w.peer.identity == reader && !state.worker_recovery_required(&w.id)
+                            }) || state.storage.stores.values().any(|r| {
+                                r.peer.identity == reader
+                                    && state.storage_readable(&r.id)
+                                    && a.targets.contains(&r.id)
+                            })));
+                    (storage_source || worker_source)
+                        && allowed_reader
+                        && (!upload || a.manifest.kind == super::artifact::Kind::Inputs)
+                });
+                Answer::AuthorizeArtifact(Ok(permitted))
             }
             Message::Read if is_admin => {
                 if let Err(e) = self.raft.ensure_linearizable().await {
@@ -962,7 +1013,8 @@ impl Client {
                         Answer::Write(Err(e))
                         | Answer::Read(Err(e))
                         | Answer::WorkerRead(Err(e))
-                        | Answer::StorageRead(Err(e)),
+                        | Answer::StorageRead(Err(e))
+                        | Answer::AuthorizeArtifact(Err(e)),
                     )) => {
                         self.preferred = e.leader.filter(|id| self.peers.contains_key(id));
                         last_error = e.message;

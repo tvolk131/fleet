@@ -30,6 +30,7 @@ pub struct Handler {
     pub home: PathBuf,
     pub capacity: u64,
     pub slots: Arc<tokio::sync::Semaphore>,
+    pub authorization: artifact_io::Authorization,
 }
 #[derive(Serialize, Deserialize)]
 struct Request {
@@ -74,6 +75,9 @@ impl ProtocolHandler for Handler {
             let request: Request =
                 tokio::time::timeout(Duration::from_secs(10), read(&mut recv)).await??;
             let _gate = self.gate.lock().await;
+            self.authorization
+                .check(connection.remote_id(), &request.artifact, true)
+                .await?;
             let selected = (|| -> Result<(Manifest, bool)> {
                 ensure!(request.cluster == self.cluster, "upload authority mismatch");
                 let m = self
@@ -153,6 +157,9 @@ impl ProtocolHandler for Handler {
                     tokio::time::timeout(Duration::from_secs(10), recv.read_to_end(0)).await??;
                     artifact_io::verify(&files, &m)?;
                     crate::instances::write(&stage.join("manifest.json"), &m)?;
+                    self.authorization
+                        .check(connection.remote_id(), &m.id, true)
+                        .await?;
                     std::fs::rename(&stage, self.home.join("objects").join(&m.id))?;
                     std::fs::File::open(self.home.join("objects"))?.sync_all()?;
                     Ok::<_, anyhow::Error>(())
@@ -271,6 +278,7 @@ mod tests {
             .accept(
                 ALPN,
                 Handler {
+                    authorization: artifact_io::Authorization::upload_unit_test(),
                     cluster: "cluster".into(),
                     administrators: BTreeSet::from([client.id()]),
                     allowed,

@@ -29,6 +29,74 @@ pub struct Handler {
     pub cluster: String,
     pub access: Arc<RwLock<Access>>,
     pub slots: Arc<tokio::sync::Semaphore>,
+    pub authorization: Authorization,
+}
+/// Cached directory views cannot authorize a revoked agent. Each new transfer gets a quorum read.
+#[derive(Clone)]
+pub struct Authorization(Authority);
+#[derive(Clone)]
+enum Authority {
+    Controller(Arc<tokio::sync::Mutex<super::Client>>),
+    /// The isolated upload/quota unit test stubs its controller dependency. Integration tests
+    /// exercise real quorum authorization; this variant is absent from every production build.
+    #[cfg(test)]
+    UploadUnitTest,
+}
+impl std::fmt::Debug for Authorization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ArtifactAuthorization")
+    }
+}
+impl Authorization {
+    pub fn new(
+        endpoint: Endpoint,
+        cluster: String,
+        peers: BTreeMap<u64, Peer>,
+        home: &Path,
+    ) -> Result<Self> {
+        let mut client = super::Client::from_endpoint(endpoint, cluster.clone(), peers)?;
+        client.use_cache(super::discovery::incarnation_cache(
+            &home.join("artifact-authority.json"),
+            &cluster,
+        ))?;
+        Ok(Self(Authority::Controller(Arc::new(
+            tokio::sync::Mutex::new(client),
+        ))))
+    }
+    #[cfg(test)]
+    pub(super) fn upload_unit_test() -> Self {
+        Self(Authority::UploadUnitTest)
+    }
+    pub async fn check(&self, reader: EndpointId, artifact: &str, upload: bool) -> Result<()> {
+        #[cfg(not(test))]
+        let Authority::Controller(client) = &self.0;
+        #[cfg(test)]
+        let client = match &self.0 {
+            Authority::Controller(client) => client,
+            #[cfg(test)]
+            Authority::UploadUnitTest => return Ok(()),
+        };
+        let answer = tokio::time::timeout(Duration::from_secs(5), async {
+            client
+                .lock()
+                .await
+                .call(
+                    super::network::Message::AuthorizeArtifact {
+                        reader,
+                        artifact: artifact.into(),
+                        upload,
+                    },
+                    Duration::from_secs(3),
+                )
+                .await
+        })
+        .await??;
+        ensure!(
+            matches!(answer, super::network::Answer::AuthorizeArtifact(Ok(true))),
+            "artifact access is no longer authorized"
+        );
+        Ok(())
+    }
 }
 #[derive(Serialize, Deserialize)]
 struct Request {
@@ -115,6 +183,9 @@ impl ProtocolHandler for Handler {
             let bytes =
                 tokio::time::timeout(Duration::from_secs(10), recv.read_to_end(8192)).await??;
             let request: Request = serde_json::from_slice(&bytes)?;
+            self.authorization
+                .check(connection.remote_id(), &request.artifact, false)
+                .await?;
             let selected = (|| -> Result<_> {
                 ensure!(
                     request.cluster == self.cluster,
@@ -275,10 +346,11 @@ pub async fn fetch_available(
     ensure!(!destination.exists(), "artifact destination must be new");
     let mut sources = Vec::new();
     for id in &artifact.targets {
-        if artifact
-            .copies
-            .get(&format!("storage/{id}"))
-            .is_some_and(|c| c.phase == CopyPhase::Ready)
+        if state.storage_readable(id)
+            && artifact
+                .copies
+                .get(&format!("storage/{id}"))
+                .is_some_and(|c| c.phase == CopyPhase::Ready)
             && let Some(store) = state.storage.stores.get(id)
         {
             sources.push(&store.peer);
