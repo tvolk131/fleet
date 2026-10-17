@@ -151,8 +151,17 @@ impl State {
         Some(plan)
     }
     fn replacement_valid(&self, id: &str, replacement: &str) -> bool {
+        let policy = &self.storage.policy;
         id != replacement
             && self.storage_active(replacement)
+            && ![
+                &policy.inputs,
+                &policy.checkpoints,
+                &policy.outputs,
+                &policy.history,
+            ]
+            .iter()
+            .any(|targets| targets.contains(id) && targets.contains(replacement))
             && !self
                 .storage_affected(id)
                 .any(|a| !a.deleted && a.targets.contains(replacement))
@@ -576,6 +585,46 @@ mod tests {
             s.storage.artifacts[&id].copies["storage/new"].phase,
             CopyPhase::Ready
         );
+    }
+    #[test]
+    fn replacement_preserves_future_copy_count_even_without_artifacts() {
+        let copies = BTreeSet::from(["old".into(), "new".into()]);
+        for policy in [
+            Policy {
+                inputs: copies.clone(),
+                ..Default::default()
+            },
+            Policy {
+                checkpoints: copies.clone(),
+                ..Default::default()
+            },
+            Policy {
+                outputs: copies.clone(),
+                ..Default::default()
+            },
+            Policy {
+                history: copies.clone(),
+                ..Default::default()
+            },
+        ] {
+            let (mut s, _) = setup();
+            s.storage.artifacts.clear();
+            assert_eq!(
+                s.storage_policy(s.storage.policy_revision, &policy),
+                Reply::Recorded
+            );
+            rejected(s.replace_storage("old", "new", 0));
+            let plan = s.storage_plan("old").unwrap();
+            rejected(s.lose_storage("old", "new", 0, &plan.inventory, &BTreeSet::new()));
+            assert_eq!(s.storage.policy, policy);
+            assert_eq!(s.replace_storage("old", "other", 0), Reply::Recorded);
+            let p = &s.storage.policy;
+            for targets in [&p.inputs, &p.checkpoints, &p.outputs, &p.history] {
+                if !targets.is_empty() {
+                    assert_eq!(*targets, BTreeSet::from(["new".into(), "other".into()]));
+                }
+            }
+        }
     }
     #[test]
     fn already_redundant_destination_cannot_silently_reduce_number_of_copies() {

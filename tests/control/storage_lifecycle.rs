@@ -49,8 +49,24 @@ async fn artifact_authorization_follows_role_discovery_after_every_bootstrap_rep
     let request = c.membership_request("rotate-all", 1, &[4, 5, 6]);
     c.changed(request).await;
     // Only normal role polling learns the new membership. Neither artifact handler is called.
-    w.tick().await.unwrap();
-    backup.tick().await.unwrap();
+    // The retiring leader can step down before its successor is elected. Services retry their
+    // short polls in that interval; wait for that bounded reconciliation, not one lucky poll.
+    let deadline = tokio::time::Instant::now() + WAIT * 3;
+    loop {
+        let worker_poll = w.tick().await;
+        let storage_poll = backup.tick().await;
+        if worker_poll.is_ok()
+            && storage_poll.is_ok()
+            && w.client.peers.keys().copied().collect::<BTreeSet<_>>() == BTreeSet::from([4, 5, 6])
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "roles did not discover replacement replicas: worker={worker_poll:?}, storage={storage_poll:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     for id in 1..=3 {
         c.replicas.remove(&id).unwrap().shutdown().await.unwrap();
     }

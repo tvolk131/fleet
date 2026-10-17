@@ -180,8 +180,9 @@ fleet storage finish-retirement old-store --revision 2 --request-id finish-old
 
 Every retained artifact requires an independent new copy: choosing an existing backup target as the
 replacement is rejected when that would collapse two required copies into one. Other configured copies
-remain required. The replacement must be active and cannot itself drain while an incoming replacement
-is unfinished. An empty unused agent may retire without a replacement. Removing an agent from default
+remain required, including future defaults when the artifact catalogue is still empty. The replacement
+must be active and cannot itself drain while an incoming replacement is unfinished. An empty unused
+agent may retire without a replacement. Removing an agent from default
 policy alone still neither retires it nor deletes its existing copies.
 
 Transfers verify bytes and sizes before reporting Ready. Admission failures, unavailable sources,
