@@ -13,6 +13,40 @@ use std::{
     path::{Path, PathBuf},
 };
 use support::*;
+
+#[test]
+fn simulated_guest_exits_when_its_vm_stops_or_reboots() -> Result<()> {
+    let root = PathBuf::from(format!(
+        "/tmp/fleet-control-vm-lifetime-{:016x}",
+        rand::random::<u64>()
+    ));
+    fs::create_dir(&root)?;
+    for reboot in [false, true] {
+        let pid = root.join("pid");
+        fs::write(&pid, "first-launcher")?;
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_fleet-test-workload"))
+            .args(["sleep", "60"])
+            .env("FLEET_TEST_VM_LIFETIME", &pid)
+            .spawn()?;
+        let ready = root.join(format!("guest-{}.ready", child.id()));
+        let mut child = Process { child };
+        wait(|| Ok(json!(ready.exists())), |r| r == true, 5)?;
+        if reboot {
+            fs::write(&pid, "next-launcher")?;
+        } else {
+            fs::remove_file(&pid)?;
+        }
+        let status = wait(
+            || Ok(json!(child.child.try_wait()?.map(|s| s.success()))),
+            |r| !r.is_null(),
+            5,
+        )?;
+        ensure!(status == true, "simulated guest did not exit with its VM");
+    }
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
 fn lab() -> Result<Lab> {
     let root = PathBuf::from(format!(
         "/tmp/fleet-control-contract-{:016x}",

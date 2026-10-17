@@ -234,7 +234,10 @@ fn run() -> Result<()> {
                 }
             }
             translate(&mut request, &vm, name, &helper);
-            let error = Command::new(helper).arg(request.to_string()).exec();
+            let error = Command::new(helper)
+                .arg(request.to_string())
+                .env("FLEET_TEST_VM_LIFETIME", vm.join("pid"))
+                .exec();
             return Err(error.into());
         }
         "exec" | "stop" => {

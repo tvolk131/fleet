@@ -51,6 +51,25 @@ fn main() {
     }
 }
 fn run() -> Result<()> {
+    // This executable also runs as a durable guest input. In a real VM the OS
+    // terminates it at shutdown; the process-level Tart double needs the same
+    // lifetime even when its command-channel parent has already disappeared.
+    if let Some(path) = std::env::var_os("FLEET_TEST_VM_LIFETIME") {
+        let path = std::path::PathBuf::from(path);
+        let generation = fs::read(&path)?;
+        fs::write(
+            path.with_file_name(format!("guest-{}.ready", std::process::id())),
+            b"ready",
+        )?;
+        std::thread::spawn(move || {
+            loop {
+                if fs::read(&path).ok().as_ref() != Some(&generation) {
+                    std::process::exit(0);
+                }
+                sleep(20);
+            }
+        });
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = args.first().map(String::as_str).unwrap_or("checkpoint");
     match mode {
