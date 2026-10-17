@@ -181,7 +181,7 @@ impl Host {
                 self.spec.name,
                 self.generation
             );
-            let definition = self.s(&format!("{name}.plist"));
+            let definition = self.s(&format!("{name}-{}.plist", self.generation));
             let username = std::env::var("USER")?;
             let userhome = std::env::var("HOME")?;
             self.cli(&[

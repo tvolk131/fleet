@@ -63,11 +63,18 @@ pub fn main_args(mut args: impl Iterator<Item = String>) -> Result<i32> {
                 "invalid command/timeout"
             );
             let mut command = Command::new(&argv[0]);
-            command
-                .args(&argv[1..])
-                .envs(env)
-                .stdin(Stdio::null())
-                .process_group(0);
+            command.args(&argv[1..]).envs(env).stdin(Stdio::null());
+            // Match the previous helper's start_new_session: the workload has
+            // its own session and process group, independent of Tart's channel.
+            // setsid is async-signal-safe and this closure does not allocate.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
             if let Some(cwd) = cwd {
                 command.current_dir(cwd);
             }

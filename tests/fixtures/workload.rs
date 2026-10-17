@@ -222,6 +222,10 @@ fn run() -> Result<()> {
             std::io::stdout().write_all(&vec![b'x'; 9 << 20])?;
         }
         "streams" => {
+            ensure!(
+                unsafe { libc::getsid(0) == libc::getpid() && libc::getpgrp() == libc::getpid() },
+                "guest command did not receive its own session and process group"
+            );
             let mut f = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
