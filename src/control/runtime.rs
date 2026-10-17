@@ -676,7 +676,7 @@ impl Worker {
                         endpoint.clone(),
                         config.cluster.clone(),
                         config.controllers.clone(),
-                        home,
+                        &home.join("worker.json"),
                     )?,
                 },
             )

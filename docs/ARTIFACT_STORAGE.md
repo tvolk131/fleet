@@ -220,6 +220,8 @@ An old agent returning with its original disk cannot report Ready, accept new in
 new artifact reads. Storage servers and workers authorize every new artifact transfer through a fresh
 quorum read, so cached reader lists cannot restore revoked access. Transfers already authorized may
 finish; stale observations cannot restore the old placement. New transfers pause without quorum.
+Authorization shares the role's authenticated discovery cache, so it follows replica rotations even
+when no artifacts were read during the change, including after a cold restart.
 Reusing the old disk/credentials is not a rejoin procedure: retain the disk for manual salvage and
 prepare a fresh role/home. This milestone does not add automatic salvage/import from a revoked disk.
 

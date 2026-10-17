@@ -36,7 +36,10 @@ pub struct Handler {
 pub struct Authorization(Authority);
 #[derive(Clone)]
 enum Authority {
-    Controller(Arc<tokio::sync::Mutex<super::Client>>),
+    Controller {
+        client: Arc<tokio::sync::Mutex<super::Client>>,
+        discovery: PathBuf,
+    },
     /// The isolated upload/quota unit test stubs its controller dependency. Integration tests
     /// exercise real quorum authorization; this variant is absent from every production build.
     #[cfg(test)]
@@ -52,16 +55,15 @@ impl Authorization {
         endpoint: Endpoint,
         cluster: String,
         peers: BTreeMap<u64, Peer>,
-        home: &Path,
+        role_config: &Path,
     ) -> Result<Self> {
         let mut client = super::Client::from_endpoint(endpoint, cluster.clone(), peers)?;
-        client.use_cache(super::discovery::incarnation_cache(
-            &home.join("artifact-authority.json"),
-            &cluster,
-        ))?;
-        Ok(Self(Authority::Controller(Arc::new(
-            tokio::sync::Mutex::new(client),
-        ))))
+        let discovery = super::discovery::incarnation_cache(role_config, &cluster);
+        client.use_cache(discovery.clone())?;
+        Ok(Self(Authority::Controller {
+            client: Arc::new(tokio::sync::Mutex::new(client)),
+            discovery,
+        }))
     }
     #[cfg(test)]
     pub(super) fn upload_unit_test() -> Self {
@@ -69,17 +71,22 @@ impl Authorization {
     }
     pub async fn check(&self, reader: EndpointId, artifact: &str, upload: bool) -> Result<()> {
         #[cfg(not(test))]
-        let Authority::Controller(client) = &self.0;
+        let Authority::Controller { client, discovery } = &self.0;
         #[cfg(test)]
-        let client = match &self.0 {
-            Authority::Controller(client) => client,
+        let (client, discovery) = match &self.0 {
+            Authority::Controller { client, discovery } => (client, discovery),
             #[cfg(test)]
             Authority::UploadUnitTest => return Ok(()),
         };
         let answer = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut client = client.lock().await;
+            // The role's regular polls learn replica rotations even when no artifact has been
+            // served yet. Share that authenticated, authority-scoped cache before making a fresh
+            // quorum read, rather than stranding this client on retired bootstrap replicas.
+            if discovery.exists() {
+                client.learn(serde_json::from_slice(&std::fs::read(discovery)?)?)?;
+            }
             client
-                .lock()
-                .await
                 .call(
                     super::network::Message::AuthorizeArtifact {
                         reader,

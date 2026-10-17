@@ -21,6 +21,80 @@ async fn write(c: &mut Cluster, id: &str, mutation: Mutation) -> Reply {
 fn rejected(reply: Reply) {
     assert!(matches!(reply, Reply::Rejected { .. }), "{reply:?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn artifact_authorization_follows_role_discovery_after_every_bootstrap_replica_retires() {
+    let mut c = Cluster::new(3).await;
+    let (home, config) = prepare(&mut c, false).await;
+    let mut w = Worker::start(&home, config.clone(), hello()).await.unwrap();
+    let (backup_home, backup_config, mut backup) =
+        storage::backup(&mut c, "backup", 16 << 20).await;
+    write(
+        &mut c,
+        "policy",
+        Mutation::StoragePolicy {
+            expected_revision: 0,
+            policy: artifact::Policy {
+                outputs: BTreeSet::from(["backup".into()]),
+                ..Default::default()
+            },
+        },
+    )
+    .await;
+    let a = output(&mut c, &mut w).await;
+    backup.tick().await.unwrap();
+    for id in 4..=6 {
+        c.prepare(id, true).await;
+    }
+    let request = c.membership_request("rotate-all", 1, &[4, 5, 6]);
+    c.changed(request).await;
+    // Only normal role polling learns the new membership. Neither artifact handler is called.
+    w.tick().await.unwrap();
+    backup.tick().await.unwrap();
+    for id in 1..=3 {
+        c.replicas.remove(&id).unwrap().shutdown().await.unwrap();
+    }
+    for (name, peer) in [
+        ("worker", &config.registration.peer),
+        ("storage", &backup_config.registration.peer),
+    ] {
+        artifact_io::fetch(
+            &c.client.endpoint,
+            peer,
+            "cluster",
+            &a.manifest,
+            &c.home.0.join(format!("rotated-{name}")),
+        )
+        .await
+        .unwrap();
+    }
+    w.shutdown().await.unwrap();
+    backup.shutdown().await.unwrap();
+    // Original on-disk configs still name 1/2/3. The authority-scoped discovery cache survives.
+    let mut w = Worker::start(&home, config.clone(), hello()).await.unwrap();
+    let mut backup = fleet::control::storage::Agent::start(&backup_home, backup_config.clone())
+        .await
+        .unwrap();
+    w.tick().await.unwrap();
+    backup.tick().await.unwrap();
+    for (name, peer) in [
+        ("worker", &config.registration.peer),
+        ("storage", &backup_config.registration.peer),
+    ] {
+        artifact_io::fetch(
+            &c.client.endpoint,
+            peer,
+            "cluster",
+            &a.manifest,
+            &c.home.0.join(format!("restarted-{name}")),
+        )
+        .await
+        .unwrap();
+    }
+    w.shutdown().await.unwrap();
+    backup.shutdown().await.unwrap();
+    c.close().await;
+}
 async fn output(c: &mut Cluster, w: &mut Worker) -> artifact::Artifact {
     let mut r = super::super::submit("submit", "lifecycle-job");
     if let Mutation::Enqueue(s) = &mut r.mutation {

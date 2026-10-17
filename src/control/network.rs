@@ -979,7 +979,16 @@ impl Client {
         let mut last_error = String::new();
         while start.elapsed() < deadline {
             let mut ids: Vec<_> = self.peers.keys().copied().collect();
-            ids.sort_by_key(|id| Some(*id) != self.preferred);
+            // Try authenticated current members before fallback bootstrap seeds. After a restart,
+            // short worker/storage deadlines must not be consumed by three retired seed addresses.
+            ids.sort_by_key(|id| {
+                (
+                    Some(*id) != self.preferred,
+                    self.discovery
+                        .as_ref()
+                        .is_some_and(|view| !view.peers.contains_key(id)),
+                )
+            });
             for id in ids {
                 if !self.peers.contains_key(&id) {
                     continue;

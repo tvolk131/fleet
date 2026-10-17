@@ -172,7 +172,7 @@ impl Agent {
             endpoint.clone(),
             config.cluster.clone(),
             config.controllers.clone(),
-            home,
+            &home.join("storage.json"),
         )?;
         let router = Router::builder(endpoint.clone())
             .accept(
