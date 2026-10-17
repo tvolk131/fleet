@@ -22,6 +22,27 @@ fn rejected(reply: Reply) {
     assert!(matches!(reply, Reply::Rejected { .. }), "{reply:?}");
 }
 
+async fn wait_for_socket_release(address: std::net::SocketAddr) {
+    // These fixtures restart inside one process. Iroh can finish logical shutdown before
+    // the last socket owner is dropped; wait for actual release, not an arbitrary sleep.
+    // A leaked owner still fails at the deadline instead of being hidden by a bind retry.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        match UdpSocket::bind(address) {
+            Ok(socket) => {
+                drop(socket);
+                return;
+            }
+            Err(error) => assert!(
+                error.kind() == std::io::ErrorKind::AddrInUse
+                    && tokio::time::Instant::now() < deadline,
+                "storage socket {address} was not released: {error}"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn artifact_authorization_follows_role_discovery_after_every_bootstrap_replica_retires() {
     let mut c = Cluster::new(3).await;
@@ -86,6 +107,7 @@ async fn artifact_authorization_follows_role_discovery_after_every_bootstrap_rep
     }
     w.shutdown().await.unwrap();
     backup.shutdown().await.unwrap();
+    wait_for_socket_release(backup_config.registration.peer.address).await;
     // Original on-disk configs still name 1/2/3. The authority-scoped discovery cache survives.
     let mut w = Worker::start(&home, config.clone(), hello()).await.unwrap();
     let mut backup = fleet::control::storage::Agent::start(&backup_home, backup_config.clone())
@@ -210,6 +232,7 @@ async fn replacement_survives_leader_loss_restarts_and_revokes_stale_data_access
     new.tick().await.unwrap();
     // Restart the destination and verify its committed files before old-copy cleanup.
     new.shutdown().await.unwrap();
+    wait_for_socket_release(new_config.registration.peer.address).await;
     let mut new = fleet::control::storage::Agent::start(&new_home, new_config.clone())
         .await
         .unwrap();
@@ -289,6 +312,7 @@ async fn replacement_survives_leader_loss_restarts_and_revokes_stale_data_access
     );
     assert!(old.tick().await.is_err());
     old.shutdown().await.unwrap();
+    wait_for_socket_release(old_config.registration.peer.address).await;
     let mut old = fleet::control::storage::Agent::start(&old_home, old_config)
         .await
         .unwrap();
