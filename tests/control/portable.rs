@@ -78,8 +78,11 @@ async fn portable_inputs_and_checkpoint_resume_on_another_worker_without_source_
     // Both the executable bit and an ordinary input must survive storage and new-worker staging.
     let root = c.home.0.join("client-inputs");
     std::fs::create_dir(&root).unwrap();
-    let script = format!("#!/usr/bin/python3\n{}", spec.argv[2]);
-    std::fs::write(root.join("trainer"), script.as_bytes()).unwrap();
+    std::fs::copy(
+        env!("CARGO_BIN_EXE_fleet-test-workload"),
+        root.join("trainer"),
+    )
+    .unwrap();
     std::fs::write(root.join("dataset"), b"immutable training data").unwrap();
     let mut files = Vec::new();
     for name in ["trainer", "dataset"] {
@@ -98,7 +101,12 @@ async fn portable_inputs_and_checkpoint_resume_on_another_worker_without_source_
         });
     }
     spec.argv = vec!["./trainer".into()];
-    spec.checkpoint.as_mut().unwrap().resume_argv[2]="import pathlib,sys,os; assert os.access('trainer',os.X_OK); assert pathlib.Path('dataset').read_bytes()==b'immutable training data'; n=int(pathlib.Path(sys.argv[1]).read_text()); pathlib.Path('result.txt').write_text(str(n+1)); print('resumed-once',flush=True)".into();
+    spec.checkpoint.as_mut().unwrap().resume_argv = vec![
+        "./trainer".into(),
+        "resume".into(),
+        "{checkpoint}/state".into(),
+        "immutable".into(),
+    ];
     let bundle = artifact::Manifest::inputs("portable".into(), files).unwrap();
     let submission = Submission {
         id: "portable".into(),

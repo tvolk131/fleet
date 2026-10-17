@@ -166,7 +166,7 @@ The portable canary additionally exercises 9 MiB stdout, 2,000 declared metric r
 cooperative cross-worker resume, offline source reads, storage/controller restart and retention edits:
 
 ```sh
-python3 contrib/qualify_portable_tart.py --fake --history --binary "$PWD/target/debug/fleet" \
+target/debug/fleet-qualify portable --fake --history --binary "$PWD/target/debug/fleet" \
   --home /tmp/fleet-control-history-ci
 ```
 

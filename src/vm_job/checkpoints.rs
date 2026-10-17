@@ -185,7 +185,7 @@ impl Runner {
             "checkpoint capture slots full; waiting for controller-authorized reclamation (check pins, resume dependencies and backup health)"
         );
         let scan = format!("cp-scan-{}", ledger.generation);
-        self.require(&scan, self.helper(serde_json::json!({"kind":"manifest", "root":self.guest_root(), "patterns":[policy.manifests], "final":true})), None)?;
+        self.require(&scan, self.helper(serde_json::json!({"kind":"manifest", "root":self.guest_root(), "patterns":[policy.manifests], "final":true}))?, None)?;
         let scan_path =
             guest::operation_dir(&self.home, &self.status.instance, &scan)?.join("stdout");
         anyhow::ensure!(

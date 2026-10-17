@@ -84,19 +84,10 @@ cluster membership and disables bootstrap for the prepared replica. Initial lab 
 bootstrap only for the original cohort. Port selection is provisional until the process starts;
 if a port is occupied, recreate that unadmitted lab replica before submitting its descriptor.
 
-Prepare a desired voter map replacing replica 1 with replica 4, plus a map for the later shrink:
+Replace replica 1 with replica 4 through the ordinary client. The CLI constructs the voter map:
 
 ```sh
-python3 - "$lab_dir" <<'PY'
-import json, pathlib, sys
-root = pathlib.Path(sys.argv[1])
-voters = json.loads((root / 'client/config.json').read_text())['peers']
-voters.update(json.loads((root / 'node-4/peer.json').read_text()))
-del voters['1']
-(root / 'replace.json').write_text(json.dumps(voters, indent=2))
-(root / 'shrink.json').write_text(json.dumps({'4': voters['4']}, indent=2))
-PY
-target/debug/fleet-control-lab membership --origin "$cluster_origin" --key "$lab_dir/client/node.key" --config "$lab_dir/client/config.json" --request-id replace-1-with-4 --expected-revision 1 --voters "$lab_dir/replace.json"
+target/debug/fleet --home "$lab_dir/client" replicas --add "$lab_dir/node-4/peer.json" --remove 1 --request-id replace-1-with-4
 ```
 
 The command waits up to 30 seconds for completion and prints the completed operation. `--wait-seconds`
@@ -106,7 +97,7 @@ request ID is unnecessary. Once complete, stop the retired replica and reduce th
 ```sh
 kill "$lab_pid_1"
 wait "$lab_pid_1"
-target/debug/fleet-control-lab membership --origin "$cluster_origin" --key "$lab_dir/client/node.key" --config "$lab_dir/client/config.json" --request-id shrink-to-4 --expected-revision 2 --voters "$lab_dir/shrink.json"
+target/debug/fleet --home "$lab_dir/client" replicas --remove 2 --remove 3 --request-id shrink-to-4
 ```
 
 After that operation completes, replicas 2 and 3 can be stopped. Replica 4 now has the same cluster's

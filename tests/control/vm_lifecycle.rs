@@ -107,21 +107,8 @@ async fn vm_observations_replay_and_same_size_outputs_survive_restart_and_cancel
     spec.vm = Some(vm_spec());
     spec.shutdown_grace_seconds = None;
     spec.argv = vec![
-        "/usr/bin/python3".into(),
-        "-c".into(),
-        r#"
-import pathlib,time
-p=pathlib.Path('out'); p.mkdir()
-(p/'result').write_text('v1')
-pathlib.Path('metrics.jsonl').write_text('{"step":1,"loss":0.8}\n{"step":2,"loss":0.6}\n')
-print('started-once',flush=True)
-while not pathlib.Path('advance').exists(): time.sleep(.1)
-(p/'result').write_text('v2')
-with open('metrics.jsonl','a') as f: f.write('{"step":3,"loss":0.4}\n')
-print('advanced-once',flush=True)
-time.sleep(180)
-"#
-        .into(),
+        env!("CARGO_BIN_EXE_fleet-test-workload").into(),
+        "observe".into(),
     ];
     spec.max_seconds = Some(240);
     spec.publish = vec!["out/*".into()];

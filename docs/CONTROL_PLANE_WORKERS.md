@@ -175,9 +175,9 @@ worker SIGKILL, replica replacement and shrink, quorum outage, cancellation befo
 CPU/memory/GPU conflicts, report gaps/stale revisions, two shared VMs, and persistent/disposable cleanup.
 The full suite also covers the existing native/Tart backends and Raft persistence/membership contracts.
 
-`contrib/qualify_control_worker.py` is a separately invoked real-Tart qualification tool. It requires explicit
+`target/debug/fleet-qualify normal-tart` is a separately invoked real-Tart qualification tool. It requires explicit
 paths, refuses an occupied qualification home or unfinished legacy jobs/VMs, uses an independent APFS image
-cache clone, and compares installed job/instance/queue records afterward. It runs small native and offline
+cache clone, and compares installed job/instance/database hashes afterward. It runs small native and offline
 VM jobs, captures live metrics/files, kills a replica leader and worker, cancels the VM job, and creates/stops/
 deletes a persistent instance. It cleans up only its own resources. It does not reserve capacity through a
 second coordinator; run it only with the physical machine idle and no legacy queue waiting to start.

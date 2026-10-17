@@ -154,7 +154,7 @@ retained request receipts. It does not retroactively turn old jobs into portable
 CI runs the Rust protocol/state-machine and headless GUI tests plus the JSON CLI scenario:
 
 ```sh
-python3 contrib/qualify_portable_tart.py --fake --binary "$PWD/target/debug/fleet" \
+target/debug/fleet-qualify portable --fake --binary "$PWD/target/debug/fleet" \
   --home /tmp/fleet-control-portable-ci
 ```
 

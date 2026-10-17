@@ -24,8 +24,8 @@ Keep release binaries at stable, versioned paths because workers record their su
 Build on each target OS/architecture:
 
 ```sh
-cargo build --release --locked --bin fleet                 # headless node
-cargo build --release --locked --features gui --bin fleet  # desktop client
+cargo build --release --locked --bin fleet --bin fleet-guest  # headless node
+cargo build --release --locked --features gui --bin fleet --bin fleet-guest  # desktop client
 ```
 
 Prepare a new initial cohort on an administrator machine. Addresses are examples; use stable LAN addresses
@@ -76,11 +76,11 @@ Render an installation definition, then install it with the repository helper:
 fleet service render --kind launchd --name local.fleet.node --user fleet \
   --user-home /Users/fleet --executable /absolute/release/fleet \
   --config /absolute/node-service.json --output /absolute/local.fleet.node.plist
-sudo contrib/install-service.sh launchd local.fleet.node /absolute/local.fleet.node.plist
+sudo contrib/install-service.sh launchd local.fleet.node /absolute/local.fleet.node.plist /absolute/release/fleet
 ```
 
 On Linux, use `--kind systemd --name fleet-node` and a `.service` output, then
-`sudo contrib/install-service.sh systemd fleet-node /absolute/fleet-node.service`.
+`sudo contrib/install-service.sh systemd fleet-node /absolute/fleet-node.service /absolute/release/fleet`.
 These are system services running as the selected regular user. The installer refuses the legacy
 agent/coordinator labels and refuses to overwrite a different service definition. It preserves detached
 supervisors on service restart. Mac services must be qualified in their actual launch context without
