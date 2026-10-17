@@ -85,7 +85,7 @@ impl Store {
                 software.require(p.target)?;
             }
         } else {
-            software.require(1)?;
+            software.require(software.min)?;
         }
         Ok(())
     }

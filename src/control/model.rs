@@ -262,7 +262,12 @@ pub fn key(principal: &str, id: &str) -> String {
 impl State {
     pub fn new(cluster: String) -> Self {
         Self {
-            version: Default::default(),
+            // New clusters start at the binary's floor. Deserializing old metadata still
+            // defaults to generation one, never silently to the running executable's version.
+            version: super::version::ClusterVersion {
+                active: super::version::MIN,
+                ..Default::default()
+            },
             history: Default::default(),
             storage: Default::default(),
             jobs: BTreeMap::new(),

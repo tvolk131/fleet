@@ -126,6 +126,19 @@ def main():
         rejected(op='prepare_version', request_id='skip-generation', expected_revision=0, target=3)
         assert state()['version']['active'] == 1
         phase('unsupported_network_client_and_generation_jump_rejected')
+        # A future binary may bootstrap its own fresh cluster at its floor; it must never
+        # reinterpret the existing cluster's generation or join that older quorum.
+        future = root / 'future-seed'
+        command(a.unsupported, 'cluster', 'init', '--home', future, '--replicas', 1)
+        command(a.unsupported, 'service', 'configure', '--config', root / 'node-4.json',
+                '--controller-home', future / 'node-1', '--bootstrap')
+        binaries[4] = a.unsupported
+        start(4)
+        fresh = command(a.unsupported, 'cluster', 'read', '--key', future / 'client/node.key', '--config', future / 'client/config.json')
+        assert fresh['version']['active'] == 3
+        assert state()['version']['active'] == 1
+        stop(4)
+        phase('fresh_future_cluster_uses_its_floor_without_upgrading_existing_state')
 
         # The first upgraded follower starts from an unclean database and a compacted log.
         leader = inspect(1)['leader']

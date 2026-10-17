@@ -8,7 +8,7 @@ changed by building, testing, or installing a release candidate.
 
 ## Upgrade contract
 
-An executable supports at most two adjacent generations. Patch releases may retain the same range.
+An executable supports at most two adjacent generations. A fresh cluster starts at the executable’s lowest supported generation; existing metadata always keeps its recorded generation. Patch releases may retain the same range.
 Every replica must apply a command identically while the cluster remains at the old generation.
 Changes to deterministic command behavior require a new generation even when their schemas are
 unchanged. Every mutation explicitly declares its minimum generation; ingress refuses inactive operations before appending them, and application also checks the gate. Old behavior must remain implemented until activation; new commands and snapshot schemas
