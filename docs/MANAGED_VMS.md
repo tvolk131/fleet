@@ -61,6 +61,8 @@ has no transport entry yet. Missing destination bindings/exports leave routes un
 adapters may retain their last committed policy; an unconfirmed revocation is not a completed one.
 Unrelated catalog changes preserve established streams when an adapter's filtered policy is unchanged.
 A relevant policy change closes its existing streams before acknowledging the replacement.
+Reports describe a recent observation, not continuous availability. After a known worker restart,
+require an increased adapter boot counter before accepting its subsequent applied report.
 
 Manual host topology remains editable through `tunnels apply`. Read `host_topology` and `host_revision`
 from `tunnels status` when editing it; `topology` is the combined effective catalog. The reserved `mvm-`

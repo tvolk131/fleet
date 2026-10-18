@@ -290,8 +290,39 @@ pub fn run(a: tart::Options) -> Result<()> {
         );
     }
     l.phase("worker_creates_private_identities_and_enforces_named_vm_connections");
+    let old_reports = l.request(json!({"op":"vm"}))?["enforcement"]["adapters"].clone();
+    let restarted: BTreeSet<_> = ["a", "b"]
+        .into_iter()
+        .zip(workers)
+        .filter(|(_, worker)| *worker == workers[0])
+        .map(|(id, _)| fleet::control::vm::adapter_id(id))
+        .collect();
     l.stop(workers[0], false)?;
     l.start(workers[0], None)?;
+    // A recently stopped process's last report can remain fresh for its bounded
+    // freshness window. This test knows it restarted the worker: require each
+    // affected adapter's new boot before waiting for applied policy.
+    wait(
+        || l.request(json!({"op":"vm"})),
+        |v| {
+            restarted.iter().all(|id| {
+                let old = old_reports
+                    .as_array()
+                    .and_then(|rows| rows.iter().find(|r| r["adapter"] == *id))
+                    .and_then(|r| r["observation"]["report"]["boot"].as_u64())
+                    .unwrap_or(0);
+                v["enforcement"]["adapters"].as_array().is_some_and(|rows| {
+                    rows.iter().any(|r| {
+                        r["adapter"] == *id
+                            && r["observation"]["report"]["boot"]
+                                .as_u64()
+                                .is_some_and(|boot| boot > old)
+                    })
+                })
+            })
+        },
+        90,
+    )?;
     enforced(&l)?;
     ensure!(
         l.request(json!({"op":"vm"}))?["catalog"]["bindings"] == keys,
