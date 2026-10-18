@@ -19,6 +19,16 @@ const SECRET: &str = "0202020202020202020202020202020202020202020202020202020202
 const CURL: &str =
     "curlimages/curl@sha256:d43bdb28bae0be0998f3be83199bfb2b81e0a30b034b6d7586ce7e05de34c3fd";
 
+fn connected(status: &str, ids: &[String]) -> bool {
+    // Failed nodes also appear in `status`. Count only the healthy section,
+    // rather than accepting any occurrence of an ID in the overall output.
+    let Some(healthy) = status.split("==== HEALTHY NODES ====").nth(1) else {
+        return false;
+    };
+    let healthy = healthy.split("====").next().unwrap_or_default();
+    ids.iter().all(|id| healthy.contains(&id[..16]))
+}
+
 fn wait(
     mut call: impl FnMut() -> Result<Value>,
     predicate: impl Fn(&Value) -> bool,
@@ -176,13 +186,15 @@ impl Lab {
     fn healthy(&self, ids: &[String]) -> Result<()> {
         wait(
             || {
-                let status = self.exec(0, &["/garage", "status"])?;
-                Ok(json!(status))
+                let statuses = (0..ids.len())
+                    .map(|node| self.exec(node, &["/garage", "status"]))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(json!(statuses))
             },
-            |status| {
-                ids.iter()
-                    .all(|id| status.as_str().unwrap().contains(&id[..16]))
-                    && !status.as_str().unwrap().contains("UNAVAILABLE")
+            |statuses| {
+                statuses.as_array().is_some_and(|rows| {
+                    rows.iter().all(|row| connected(row.as_str().unwrap(), ids))
+                })
             },
             60,
         )?;
@@ -210,7 +222,7 @@ impl Lab {
         .map(str::to_owned)
         .collect();
         args.extend([
-            "--fail".into(),
+            "--fail-with-body".into(),
             "--silent".into(),
             "--show-error".into(),
             "--max-time".into(),
@@ -234,8 +246,12 @@ impl Lab {
         let result = result?;
         ensure!(
             result.status.success(),
-            "S3 fixture transfer: {}",
-            String::from_utf8_lossy(&result.stderr)
+            "S3 fixture transfer (node={node}, upload={upload}, object={object}): {}; {}",
+            String::from_utf8_lossy(&result.stderr),
+            String::from_utf8_lossy(&result.stdout)
+                .chars()
+                .take(2048)
+                .collect::<String>()
         );
         if !upload {
             fs::write(file, &result.stdout)?;
@@ -243,6 +259,7 @@ impl Lab {
         Ok(start.elapsed().as_secs_f64())
     }
 }
+
 impl Drop for Lab {
     fn drop(&mut self) {
         self.collect_logs();
@@ -612,4 +629,26 @@ pub fn run(options: Options) -> Result<()> {
     save(&home.join("result.json"), &report)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::connected;
+
+    #[test]
+    fn failed_nodes_are_not_readiness_evidence() {
+        let ids = vec![
+            "0123456789abcdef@127.0.0.1:1".into(),
+            "fedcba9876543210@127.0.0.1:2".into(),
+        ];
+        assert!(connected(
+            "==== HEALTHY NODES ====\n0123456789abcdef up\nfedcba9876543210 up\n",
+            &ids
+        ));
+        assert!(!connected(
+            "==== HEALTHY NODES ====\n0123456789abcdef up\n==== FAILED NODES ====\nfedcba9876543210 unavailable\n",
+            &ids
+        ));
+        assert!(!connected("0123456789abcdef fedcba9876543210", &ids));
+    }
 }
