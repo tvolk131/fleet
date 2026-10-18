@@ -70,6 +70,11 @@ jobs:
             --home /tmp/fleet-control-portable-ci 2>&1 | tee portable-client.log
       - name: Rust tests (including Raft, redb, workers, and headless M3 GUI)
         run: cargo test --workspace --all-features --locked --no-fail-fast -- --test-threads=2 2>&1 | tee rust-tests.log
+      - name: VM service attachments, permissions, revocation and cached-policy restarts
+        run: |
+          target/debug/fleet-qualify vm-services --fake --binary "$PWD/target/debug/fleet" \
+            --baseline-binary /tmp/fleet-upgrade-binaries/fleet-service-baseline \
+            --home /tmp/fleet-control-vm-services-ci 2>&1 | tee vm-services.log
       - name: Worker library without the optional control plane
         run: cargo check --no-default-features --lib --locked
       - name: Clippy
@@ -100,6 +105,9 @@ jobs:
           fi
           if [ -f /tmp/fleet-control-garage-ci/result.json ]; then
             cp /tmp/fleet-control-garage-ci/result.json ci-evidence/garage-tunnels.json
+          fi
+          if [ -f /tmp/fleet-control-vm-services-ci/qualification.json ]; then
+            cp /tmp/fleet-control-vm-services-ci/qualification.json ci-evidence/vm-services.json
           fi
           # Never upload fixture homes: they contain private identity keys and databases.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

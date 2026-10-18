@@ -18,11 +18,17 @@ use std::{
 use tokio::{sync::watch, task::JoinHandle};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub adapter: String,
     pub identity: EndpointId,
     pub authority: Authority,
     pub network: transport::Network,
+    #[serde(
+        default,
+        skip_serializing_if = "super::attachment::Attachment::is_host"
+    )]
+    pub attachment: super::attachment::Attachment,
     #[serde(default)]
     pub accepted_recovery: Option<Box<crate::control::recovery::Manifest>>,
 }
@@ -37,6 +43,7 @@ pub struct Agent {
     report: Option<Report>,
     task: Option<JoinHandle<()>>,
     _lock: crate::instances::Lock,
+    _attachment_lock: Option<crate::instances::Lock>,
 }
 impl Agent {
     pub async fn prepare(
@@ -44,6 +51,22 @@ impl Agent {
         adapter: String,
         authority: Authority,
         network: transport::Network,
+    ) -> Result<Adapter> {
+        Self::prepare_attached(
+            home,
+            adapter,
+            authority,
+            network,
+            super::attachment::Attachment::Host,
+        )
+        .await
+    }
+    pub async fn prepare_attached(
+        home: &Path,
+        adapter: String,
+        authority: Authority,
+        network: transport::Network,
+        attachment: super::attachment::Attachment,
     ) -> Result<Adapter> {
         ensure!(!home.exists(), "tunnel home must be new");
         ensure!(super::name(&adapter), "invalid adapter ID");
@@ -70,12 +93,19 @@ impl Agent {
             "no tunnel contact addresses"
         );
         crate::instances::write(
-            &home.join("tunnel.json"),
+            // Old binaries must fail closed, rather than ignore the attachment
+            // field and accidentally bind these guest ports on the host.
+            &home.join(if attachment.is_host() {
+                "tunnel.json"
+            } else {
+                "tunnel-vm.json"
+            }),
             &Config {
                 adapter,
                 identity,
                 authority,
                 network,
+                attachment,
                 accepted_recovery: None,
             },
         )?;
@@ -85,7 +115,9 @@ impl Agent {
     pub async fn start(home: &Path) -> Result<Self> {
         let lock = crate::instances::try_lock(&home.join("tunnel.lock"))?
             .context("tunnel adapter already running")?;
-        let config: Config = serde_json::from_slice(&std::fs::read(home.join("tunnel.json"))?)?;
+        let path = config_path(home)?;
+        let config: Config = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let attachment_lock = config.attachment.lock()?;
         ensure!(
             home.join("node.key").is_file(),
             "missing adapter identity; do not replace automatically"
@@ -123,12 +155,17 @@ impl Agent {
         .await?;
         let endpoint = transport::endpoint(key, &config.network).await?;
         client.use_cache(crate::control::discovery::incarnation_cache(
-            &home.join("tunnel.json"),
+            &path,
             &config.authority.cluster,
         ))?;
         let (policy, receiver) = watch::channel(view);
         let (status, transport_status) = watch::channel(TransportStatus::Starting);
-        let task = tokio::spawn(transport::run_observed(endpoint.clone(), receiver, status));
+        let task = tokio::spawn(transport::run_attached(
+            endpoint.clone(),
+            receiver,
+            status,
+            config.attachment.clone(),
+        ));
         Ok(Self {
             home: home.into(),
             config,
@@ -140,6 +177,7 @@ impl Agent {
             report: None,
             task: Some(task),
             _lock: lock,
+            _attachment_lock: attachment_lock,
         })
     }
     fn empty(config: &Config) -> View {
@@ -282,7 +320,7 @@ impl Drop for Agent {
 pub fn accept_recovery(home: &Path, manifest: &crate::control::recovery::Manifest) -> Result<()> {
     let _lock = crate::instances::try_lock(&home.join("tunnel.lock"))?
         .context("stop tunnel adapter before recovery")?;
-    let path = home.join("tunnel.json");
+    let path = config_path(home)?;
     let mut config: Config = serde_json::from_slice(&std::fs::read(&path)?)?;
     if config.accepted_recovery.as_deref() == Some(manifest) {
         return Ok(());
@@ -293,4 +331,14 @@ pub fn accept_recovery(home: &Path, manifest: &crate::control::recovery::Manifes
     crate::instances::write(&home.join("policy.json"), &Agent::empty(&config))?;
     crate::instances::write(&path, &config)?;
     Ok(())
+}
+
+fn config_path(home: &Path) -> Result<PathBuf> {
+    let host = home.join("tunnel.json");
+    let vm = home.join("tunnel-vm.json");
+    ensure!(
+        !(host.exists() && vm.exists()),
+        "ambiguous adapter attachment configuration"
+    );
+    Ok(if vm.exists() { vm } else { host })
 }

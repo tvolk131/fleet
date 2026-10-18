@@ -15,12 +15,15 @@ administrative changes, read the global job database, or claim another adapter's
 identity. The receiving adapter authenticates the iroh peer before resolving a
 named service to a fixed local socket.
 
-Targets and listening ports must use loopback. There is no caller-supplied IP
+Targets and listening ports must use loopback in the adapter's attachment. There is no caller-supplied IP
 destination, LAN forwarding, public port exposure, DNS interception, or virtual
 network interface. A local listening port grants access as that host's adapter:
 all processes able to reach the host's loopback are inside this trust boundary.
-Do not expose these ports to mutually untrusted VM guests. Per-VM networking and
-guest identities require a separate attachment and isolation design.
+Do not expose a host adapter's ports to mutually untrusted VM guests. Use a
+[VM attachment](VM_SERVICE_NETWORKING.md) instead: a separate host-owned identity
+bound to one persistent VM, with its local sockets inside that guest. Guest
+traffic crosses Tart's private guest channel; the host checks its permitted route
+and the destination checks the authenticated adapter identity.
 
 ## Committed policy and outages
 
@@ -203,3 +206,12 @@ The optional `cargo test --release --features gui --test tunnels tunnel_throughp
 connection establishment. These local measurements do not predict WAN performance;
 latency, relay placement, flow-control windows and host contention all matter. There
 are no timing thresholds in CI. All local scenarios use one physical failure domain.
+
+`fleet-qualify garage-native --binary /absolute/path/to/fleet --garage
+/absolute/path/to/garage --home /tmp/fleet-control-garage-native-test` checks a
+separately built stock Garage executable with SQLite, loopback-only RPC/S3, signed
+8 MiB S3 write/read through Fleet tunnels, and object persistence after a clean
+Garage process restart. It installs no service and makes no power-loss or
+multi-machine durability claim. Stock Garage v2.4.1 builds on Apple Silicon with
+`cargo build --locked -p garage --no-default-features --features bundled-libs,sqlite`.
+The fixture uses disposable test credentials, never production S3 credentials.

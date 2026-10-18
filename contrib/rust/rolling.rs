@@ -1,5 +1,5 @@
 use super::support::*;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -538,6 +538,31 @@ pub fn build(output_dir: &Path) -> Result<()> {
             .status()?;
         ensure!(status.success(), "baseline extraction failed");
         build_one(&baseline, "fleet-baseline", false)?;
+        let adapter_previous = read(&root.join("contrib/service_adapter_baseline.json"))?;
+        let adapter_source = scratch.join("service-baseline");
+        fs::create_dir(&adapter_source)?;
+        let status = std::process::Command::new("git")
+            .args(["archive", "--format=tar", "--output"])
+            .arg(&archive)
+            .arg(
+                adapter_previous["revision"]
+                    .as_str()
+                    .context("service adapter revision required")?,
+            )
+            .current_dir(&root)
+            .status()?;
+        ensure!(status.success(), "service adapter baseline unavailable");
+        let status = std::process::Command::new("tar")
+            .arg("-xf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&adapter_source)
+            .status()?;
+        ensure!(
+            status.success(),
+            "service adapter baseline extraction failed"
+        );
+        build_one(&adapter_source, "fleet-service-baseline", false)?;
         let future = scratch.join("unsupported");
         fs::create_dir(&future)?;
         for dir in ["src", "crates", "contrib/rust", "tests/fixtures"] {
@@ -572,7 +597,7 @@ pub fn build(output_dir: &Path) -> Result<()> {
             hashes[0] != hashes[1] && hashes[0] != hashes[2] && hashes[1] != hashes[2],
             "builds must be distinct"
         );
-        let report = json!({"baseline":previous,"unsupported_is_test_fixture":true,"sha256":{"fleet-baseline":hashes[0],"fleet-candidate":hashes[1],"fleet-unsupported":hashes[2]}});
+        let report = json!({"baseline":previous,"service_adapter_baseline":adapter_previous,"unsupported_is_test_fixture":true,"sha256":{"fleet-baseline":hashes[0],"fleet-candidate":hashes[1],"fleet-unsupported":hashes[2],"fleet-service-baseline":digest(&output_dir.join("fleet-service-baseline"))?}});
         save(&output_dir.join("builds.json"), &report)?;
         println!("{report}");
         Ok(())

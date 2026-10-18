@@ -37,6 +37,11 @@ pub enum Command {
         /// JSON with a stable UDP bind address and explicit relay URLs.
         #[arg(long)]
         network: PathBuf,
+        /// Attach sockets inside a persistent VM owned by this local worker.
+        #[arg(long, requires = "instance")]
+        worker_home: Option<PathBuf>,
+        #[arg(long, requires = "worker_home")]
+        instance: Option<String>,
     },
     Run {
         #[arg(long)]
@@ -76,17 +81,28 @@ pub async fn run(command: Command) -> Result<Option<ApiRequest>> {
             adapter,
             authority,
             network,
+            worker_home,
+            instance,
         } => {
             let network: transport::Network = serde_json::from_slice(&std::fs::read(network)?)?;
             anyhow::ensure!(
                 network.bind.is_none_or(|b| b.port() != 0),
                 "prepared adapters require stable UDP ports"
             );
-            let descriptor = agent::Agent::prepare(
+            let authority = serde_json::from_slice(&std::fs::read(authority)?)?;
+            let attachment = match (worker_home, instance) {
+                (Some(home), Some(id)) => {
+                    super::attachment::Attachment::prepare(&home, &id, &authority)?
+                }
+                (None, None) => super::attachment::Attachment::Host,
+                _ => anyhow::bail!("both worker-home and instance are required"),
+            };
+            let descriptor = agent::Agent::prepare_attached(
                 &adapter_home,
                 adapter,
-                serde_json::from_slice(&std::fs::read(authority)?)?,
+                authority,
                 network,
+                attachment,
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&descriptor)?);

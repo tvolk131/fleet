@@ -1,10 +1,12 @@
 #![allow(dead_code)] // Shared fixture functions are also used by the integration-test target.
 mod garage;
+mod garage_native;
 mod host;
 mod multihost;
 mod rolling;
 mod support;
 mod tart;
+mod vm_services;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 #[derive(Parser)]
@@ -18,6 +20,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Garage(garage::Options),
+    GarageNative(garage_native::Options),
+    VmServices(tart::Options),
     Host,
     BuildUpgradeFixtures {
         #[arg(long)]
@@ -41,6 +45,8 @@ enum Commands {
 fn main() {
     let result = match Cli::parse().command {
         Commands::Garage(options) => garage::run(options),
+        Commands::GarageNative(options) => garage_native::run(options),
+        Commands::VmServices(options) => vm_services::run(options),
         Commands::Host => host::stdin(),
         Commands::BuildUpgradeFixtures { output } => rolling::build(&output),
         Commands::RollingUpgrade {

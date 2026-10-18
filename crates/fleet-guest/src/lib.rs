@@ -16,6 +16,7 @@ use std::{
 };
 
 pub const READY: &str = "fleet-guest-v2";
+pub mod tunnel;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
@@ -41,6 +42,21 @@ pub enum Request {
 
 pub fn main_args(mut args: impl Iterator<Item = String>) -> Result<i32> {
     let first = args.next().context("guest request required")?;
+    if first == "--services" {
+        let config: tunnel::Config =
+            serde_json::from_str(&args.next().context("service configuration required")?)?;
+        ensure!(args.next().is_none(), "unexpected arguments");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        let result = runtime.block_on(tunnel::guest(config));
+        // Tokio's stdin reader may be blocked in the OS after a protocol failure.
+        // main exits immediately; never wait for another byte from a failed host.
+        runtime.shutdown_background();
+        result?;
+        return Ok(0);
+    }
     if first == "--job" {
         let request: Observation =
             serde_json::from_str(&args.next().context("job request required")?)?;
