@@ -584,6 +584,18 @@ pub fn run(options: Options) -> Result<()> {
         "adapter",
         "/fleet service run --config /state/adapter-service.json",
     )?;
+    // A write on node 0 can reach quorum through node 1 while the restarted
+    // node 2 is still reconnecting. Prove node 2's actual read path recovered
+    // using cached routes, with the controller still stopped.
+    wait(
+        || lab.s3(2, false, "payload", &downloaded).map(|s| json!(s)),
+        |_| true,
+        60,
+    )?;
+    ensure!(
+        fs::read(&downloaded)? == bytes,
+        "bytes differ after adapter restart without controller"
+    );
     wait(
         || {
             lab.s3(0, true, "during-controller-outage", &payload)
@@ -592,7 +604,14 @@ pub fn run(options: Options) -> Result<()> {
         |_| true,
         60,
     )?;
-    lab.s3(2, false, "during-controller-outage", &downloaded)?;
+    wait(
+        || {
+            lab.s3(2, false, "during-controller-outage", &downloaded)
+                .map(|s| json!(s))
+        },
+        |_| true,
+        60,
+    )?;
     ensure!(
         fs::read(&downloaded)? == bytes,
         "bytes differ during controller outage"
