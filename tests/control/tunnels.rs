@@ -105,6 +105,226 @@ async fn echo(addr: std::net::SocketAddr) {
     .unwrap();
 }
 
+async fn status(c: &mut Cluster) -> tunnels::status::Snapshot {
+    match c.client.call(Message::TunnelStatus, WAIT).await.unwrap() {
+        Answer::TunnelStatus(Ok(s)) => s,
+        other => panic!("status: {other:?}"),
+    }
+}
+async fn applied(c: &mut Cluster, agent: &mut Agent) -> tunnels::status::Snapshot {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            agent.tick().await.unwrap();
+            let s = status(c).await;
+            if s.all_confirmed {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enforcement_is_durable_but_leader_changes_restarts_and_late_reports_cannot_fake_freshness()
+{
+    let mut c = Cluster::new(3).await;
+    activate(&mut c).await;
+    let adapter = descriptor(&c, "a").await;
+    let identity = adapter.endpoint.id;
+    assert_eq!(
+        c.client
+            .write(
+                replace(
+                    Topology {
+                        adapters: BTreeMap::from([("a".into(), adapter)]),
+                        ..Default::default()
+                    },
+                    0
+                ),
+                WAIT
+            )
+            .await
+            .unwrap(),
+        Reply::Recorded
+    );
+    let s = status(&mut c).await;
+    assert!(!s.all_confirmed);
+    assert_eq!(s.adapters[0].state, "unknown");
+    let mut agent = Agent::start(&c.home.0.join("a")).await.unwrap();
+    let s = applied(&mut c, &mut agent).await;
+    let old = s.adapters[0].observation.clone().unwrap();
+    let before = c.client.read(WAIT).await.unwrap().last_applied;
+    // Heartbeats and lost-reply retries update leader-local contact without
+    // appending a consensus record or an ever-growing request receipt.
+    agent.tick().await.unwrap();
+    assert_eq!(c.client.read(WAIT).await.unwrap().last_applied, before);
+    let leader = c.leader().await;
+    c.replicas
+        .remove(&leader)
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    let s = status(&mut c).await;
+    assert_eq!(s.adapters[0].observation, Some(old.clone()));
+    assert_eq!(s.adapters[0].state, "unknown");
+    assert!(!s.all_confirmed);
+    applied(&mut c, &mut agent).await;
+    agent.shutdown().await;
+    let mut agent = Agent::start(&c.home.0.join("a")).await.unwrap();
+    let s = applied(&mut c, &mut agent).await;
+    let new = s.adapters[0].observation.clone().unwrap();
+    assert!(new.report.boot > old.report.boot);
+    let mut peer = Client::new(
+        fleet::keys::load_or_create(&c.home.0.join("a/node.key")).unwrap(),
+        "cluster".into(),
+        c.config.peers.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        peer.call(Message::TunnelObserve(old.report), WAIT)
+            .await
+            .unwrap(),
+        Answer::TunnelObserve(Ok(Reply::Rejected { .. }))
+    ));
+    assert_eq!(
+        status(&mut c).await.adapters[0].observation,
+        Some(new.clone())
+    );
+    let mut forged = new.report;
+    forged.adapter = "other-adapter".into();
+    assert!(
+        peer.call(Message::TunnelObserve(forged), WAIT)
+            .await
+            .is_err()
+    );
+    assert!(peer.call(Message::TunnelStatus, WAIT).await.is_err());
+    assert_eq!(
+        c.client
+            .write(replace(Topology::default(), 1), WAIT)
+            .await
+            .unwrap(),
+        Reply::Recorded
+    );
+    let pending = status(&mut c).await;
+    assert!(pending.adapters[0].retired);
+    assert_eq!(pending.adapters[0].state, "pending");
+    let removed = applied(&mut c, &mut agent).await;
+    assert!(removed.adapters[0].retired);
+    assert_eq!(removed.adapters[0].desired_revision, 2);
+    assert_eq!(removed.known_identities[&identity], "a");
+    peer.endpoint.close().await;
+    agent.shutdown().await;
+    c.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wait_reports_failure_timeout_success_scope_and_supersession_without_mutating_policy() {
+    use fleet::control::client::{ApiRequest, AppClient};
+    let mut c = Cluster::new(1).await;
+    activate(&mut c).await;
+    let a = descriptor(&c, "a").await;
+    let b = descriptor(&c, "b").await;
+    let identity = a.endpoint.id;
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let t = Topology {
+        adapters: BTreeMap::from([("a".into(), a), ("b".into(), b)]),
+        services: BTreeMap::from([(
+            "echo".into(),
+            Service {
+                owner: "b".into(),
+                target: target.local_addr().unwrap(),
+                allowed: BTreeSet::from(["a".into()]),
+            },
+        )]),
+        routes: vec![Route {
+            adapter: "a".into(),
+            service: "echo".into(),
+            listen: occupied.local_addr().unwrap(),
+        }],
+    };
+    assert_eq!(
+        c.client.write(replace(t, 0), WAIT).await.unwrap(),
+        Reply::Recorded
+    );
+    let mut app = AppClient::connect(&c.home.0.join("app-client"))
+        .await
+        .unwrap();
+    let mut agent = Agent::start(&c.home.0.join("a")).await.unwrap();
+    let failed = tokio::time::timeout(WAIT, async {
+        loop {
+            agent.tick().await.unwrap();
+            let s = app.execute(ApiRequest::Tunnels).await.unwrap();
+            if s["adapters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["state"] == "failed")
+            {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(failed["all_confirmed"], false);
+    let all = ApiRequest::WaitTunnels {
+        revision: 1,
+        timeout_seconds: 1,
+        identities: BTreeSet::new(),
+    };
+    let timeout = app.execute(all.clone()).await.unwrap();
+    assert_eq!(timeout["confirmed"], false);
+    assert_eq!(timeout["outcome"], "unconfirmed");
+    assert_eq!(timeout["last_snapshot"]["revision"], 1);
+    assert_eq!(c.client.read(WAIT).await.unwrap().tunnels.revision, 1);
+    drop(occupied);
+    tokio::time::timeout(WAIT, async {
+        loop {
+            agent.tick().await.unwrap();
+            let s = status(&mut c).await;
+            if s.adapters
+                .iter()
+                .any(|r| r.identity == identity && r.state == "applied")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let selected = ApiRequest::WaitTunnels {
+        revision: 1,
+        timeout_seconds: 2,
+        identities: BTreeSet::from([identity]),
+    };
+    assert_eq!(app.execute(selected).await.unwrap()["confirmed"], true);
+    // The absent owner still prevents a claim that the entire topology is enforced.
+    assert_eq!(app.execute(all).await.unwrap()["confirmed"], false);
+    assert_eq!(
+        c.client
+            .write(replace(Topology::default(), 1), WAIT)
+            .await
+            .unwrap(),
+        Reply::Recorded
+    );
+    let old = ApiRequest::WaitTunnels {
+        revision: 1,
+        timeout_seconds: 2,
+        identities: BTreeSet::new(),
+    };
+    assert_eq!(app.execute(old).await.unwrap()["outcome"], "superseded");
+    agent.shutdown().await;
+    app.transport.endpoint.close().await;
+    c.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tunnel_catalog_is_gated_replicated_and_not_writable_by_adapters() {
     let mut c = Cluster::new(3).await;
@@ -331,7 +551,8 @@ async fn recovered_authority_requires_explicit_adapter_rebind_and_reviewed_route
     let (_, manifest) = super::real_worker::recovery::restore(&mut c, 1, "tunnel-recovery").await;
     let state = c.client.read(WAIT).await.unwrap();
     assert_eq!(state.tunnels.topology, Topology::default());
-    assert!(state.tunnels.known_identities.contains(&identity));
+    assert!(state.tunnels.known_identities.contains_key(&identity));
+    assert!(state.tunnels.observations.is_empty());
     let old: tunnels::View =
         serde_json::from_slice(&std::fs::read(home.join("policy.json")).unwrap()).unwrap();
     assert_ne!(old.cluster, state.cluster);

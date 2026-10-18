@@ -87,6 +87,8 @@ pub enum Message {
     TunnelRead {
         adapter: String,
     },
+    TunnelObserve(super::tunnels::status::Report),
+    TunnelStatus,
     StorageRead {
         storage: String,
         incarnation: String,
@@ -132,6 +134,8 @@ pub enum Answer {
     Read(Result<Box<State>, ApiError>),
     Inspect(ReplicaStatus),
     TunnelRead(Result<super::tunnels::View, ApiError>),
+    TunnelObserve(Result<Reply, ApiError>),
+    TunnelStatus(Result<super::tunnels::status::Snapshot, ApiError>),
     WorkerRead(Result<super::workload::WorkerView, ApiError>),
     StorageRead(Result<super::artifact::View, ApiError>),
     AuthorizeArtifact(Result<bool, ApiError>),
@@ -395,6 +399,7 @@ struct Handler {
     blocked: Blocked,
     drop_write_reply: Arc<AtomicBool>,
     presence: super::queue::Presence,
+    tunnel_presence: super::tunnels::status::Presence,
 }
 
 impl std::fmt::Debug for Handler {
@@ -462,6 +467,89 @@ impl Handler {
             return Answer::Refused("only the replica can acknowledge its preparation".into());
         }
         match frame.message {
+            Message::TunnelStatus if is_admin => {
+                if let Err(e) = self.raft.ensure_linearizable().await {
+                    return Answer::TunnelStatus(Err(ApiError {
+                        message: e.to_string(),
+                        leader: e.forward_to_leader().and_then(|f| f.leader_id),
+                    }));
+                }
+                match self.store.state().await {
+                    Ok(state) => Answer::TunnelStatus(Ok(state.tunnel_status(
+                        &self.tunnel_presence,
+                        self.raft.metrics().borrow().current_term,
+                    ))),
+                    Err(e) => Answer::Refused(e.to_string()),
+                }
+            }
+            Message::TunnelObserve(report) => {
+                let received = std::time::Instant::now();
+                if let Err(e) = self.raft.ensure_linearizable().await {
+                    return Answer::TunnelObserve(Err(ApiError {
+                        message: e.to_string(),
+                        leader: e.forward_to_leader().and_then(|f| f.leader_id),
+                    }));
+                }
+                let state = match self.store.state().await {
+                    Ok(s) => s,
+                    Err(e) => return Answer::Refused(e.to_string()),
+                };
+                if state.version.active < super::tunnels::GENERATION
+                    || !state.tunnel_report_allowed(peer, &report)
+                {
+                    return Answer::Refused(
+                        "adapter observation identity or generation mismatch".into(),
+                    );
+                }
+                let term = self.raft.metrics().borrow().current_term;
+                let same = state
+                    .tunnels
+                    .observations
+                    .get(&peer)
+                    .is_some_and(|o| o.report == report);
+                let reply = if same {
+                    Ok(Reply::Recorded)
+                } else {
+                    self.raft
+                        .client_write(Command {
+                            principal: peer.to_string(),
+                            request: Request {
+                                origin: self.config.cluster.clone(),
+                                id: format!("tunnel-{}-{}", report.boot, report.sequence),
+                                mutation: super::Mutation::TunnelReport {
+                                    report: report.clone(),
+                                    recorded_at_ms: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                        .min(u64::MAX as u128)
+                                        as u64,
+                                },
+                            },
+                        })
+                        .await
+                        .map(|r| r.data)
+                        .map_err(|e| ApiError {
+                            message: e.to_string(),
+                            leader: e.forward_to_leader().and_then(|f| f.leader_id),
+                        })
+                };
+                if matches!(reply, Ok(Reply::Recorded)) {
+                    self.tunnel_presence
+                        .lock()
+                        .expect("tunnel presence")
+                        .insert(
+                            peer,
+                            super::tunnels::status::Contact {
+                                term,
+                                boot: report.boot,
+                                sequence: report.sequence,
+                                at: received,
+                            },
+                        );
+                }
+                Answer::TunnelObserve(reply)
+            }
             Message::TunnelRead { adapter } => {
                 if let Err(e) = self.raft.ensure_linearizable().await {
                     return Answer::TunnelRead(Err(ApiError {
@@ -765,7 +853,7 @@ impl ProtocolHandler for Handler {
                 .map(|s| {
                     s.workers.values().any(|w| w.peer.identity == peer)
                         || s.storage.stores.values().any(|w| w.peer.identity == peer)
-                        || s.tunnels.known_identities.contains(&peer)
+                        || s.tunnels.known_identities.contains_key(&peer)
                 })
                 .unwrap_or(false)
         {
@@ -910,6 +998,7 @@ impl Replica {
                     store: store.clone(),
                     config,
                     presence,
+                    tunnel_presence: super::tunnels::status::Presence::default(),
                     blocked: blocked.clone(),
                     drop_write_reply: drop_write_reply.clone(),
                 },
@@ -1118,6 +1207,8 @@ impl Client {
                         | Answer::WorkerRead(Err(e))
                         | Answer::StorageRead(Err(e))
                         | Answer::TunnelRead(Err(e))
+                        | Answer::TunnelObserve(Err(e))
+                        | Answer::TunnelStatus(Err(e))
                         | Answer::AuthorizeArtifact(Err(e)),
                     )) => {
                         self.preferred = e.leader.filter(|id| self.peers.contains_key(id));

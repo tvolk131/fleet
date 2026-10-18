@@ -1,6 +1,7 @@
 #![cfg(feature = "control-plane")]
 use fleet::control::tunnels::{
     Adapter, Route, Service, Topology, View,
+    status::TransportStatus,
     transport::{self, Network},
 };
 use iroh::{Endpoint, EndpointAddr, SecretKey};
@@ -79,6 +80,19 @@ async fn connect(addr: std::net::SocketAddr) -> TcpStream {
     })
     .await
     .unwrap()
+}
+
+async fn reported(rx: &mut watch::Receiver<TransportStatus>, want: TransportStatus) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if *rx.borrow_and_update() == want {
+                break;
+            }
+            rx.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
 }
 async fn half_close_roundtrip(relay: Option<iroh::RelayUrl>) {
     let a = ep(relay.clone()).await;
@@ -225,7 +239,8 @@ async fn committed_revocation_closes_an_established_tunnel() {
     let (pa, ra) = watch::channel(view(&t, "a", 1));
     let (pb, rb) = watch::channel(view(&t, "b", 1));
     let ta = tokio::spawn(transport::run(a.clone(), ra));
-    let tb = tokio::spawn(transport::run(b.clone(), rb));
+    let (status, mut observed) = watch::channel(TransportStatus::Starting);
+    let tb = tokio::spawn(transport::run_observed(b.clone(), rb, status));
     let mut socket = connect(listen).await;
     socket.write_all(b"hello").await.unwrap();
     let (mut service, _) = tokio::time::timeout(Duration::from_secs(5), target.accept())
@@ -238,6 +253,10 @@ async fn committed_revocation_closes_an_established_tunnel() {
     let mut revoked = view(&t, "b", 2);
     revoked.topology = Topology::default();
     pb.send(revoked).unwrap();
+    reported(&mut observed, TransportStatus::Applied { revision: 2 }).await;
+    // The application acknowledgment is emitted only after old bridge tasks
+    // have dropped their local service socket. No guest/service ACK is needed.
+    assert!(service.read_u8().await.is_err());
     let read = tokio::time::timeout(Duration::from_secs(5), socket.read_u8())
         .await
         .unwrap();
@@ -245,6 +264,50 @@ async fn committed_revocation_closes_an_established_tunnel() {
     drop((pa, pb));
     ta.await.unwrap();
     tb.await.unwrap();
+    a.close().await;
+    b.close().await;
+}
+
+#[tokio::test]
+async fn listener_conflict_never_acknowledges_a_partially_applied_policy() {
+    let a = ep(None).await;
+    let b = ep(None).await;
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let available = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first = available.local_addr().unwrap();
+    drop(available);
+    let mut t = topology(a.addr(), b.addr(), target.local_addr().unwrap(), first);
+    t.routes.push(Route {
+        adapter: "a".into(),
+        service: "echo".into(),
+        listen: occupied.local_addr().unwrap(),
+    });
+    let (policy, rx) = watch::channel(view(&t, "a", 1));
+    let (status, mut observed) = watch::channel(TransportStatus::Starting);
+    let task = tokio::spawn(transport::run_observed(a.clone(), rx, status));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match &*observed.borrow_and_update() {
+                TransportStatus::Failed { revision: 1, error } => {
+                    assert!(!error.is_empty());
+                    break;
+                }
+                TransportStatus::Applied { .. } => panic!("partial policy reported as applied"),
+                _ => {}
+            }
+            observed.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    // The first successful bind was also released: the whole policy failed closed.
+    let released = TcpListener::bind(first).await.unwrap();
+    drop((released, occupied));
+    reported(&mut observed, TransportStatus::Applied { revision: 1 }).await;
+    assert!(TcpStream::connect(first).await.is_ok());
+    drop(policy);
+    task.await.unwrap();
     a.close().await;
     b.close().await;
 }

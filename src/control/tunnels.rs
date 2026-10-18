@@ -10,6 +10,7 @@ use std::{
 
 pub mod agent;
 pub mod cli;
+pub mod status;
 pub mod transport;
 
 /// Generation two was already advertised by the previous release. New variants
@@ -50,7 +51,9 @@ pub struct Catalog {
     pub topology: Topology,
     /// Retired adapters retain only permission to fetch an empty policy. Without
     /// these tombstones an adapter restarting after removal could keep stale access.
-    pub known_identities: BTreeSet<EndpointId>,
+    pub known_identities: BTreeMap<EndpointId, String>,
+    #[serde(default)]
+    pub observations: BTreeMap<EndpointId, status::Observation>,
 }
 
 /// Only a quorum-confirmed view can replace an adapter's durable policy cache.
@@ -193,7 +196,15 @@ impl State {
             return Reply::rejected("tunnel revision exhausted");
         };
         let mut known_identities = self.tunnels.known_identities.clone();
-        known_identities.extend(topology.adapters.values().map(|a| a.endpoint.id));
+        for (name, adapter) in &topology.adapters {
+            if known_identities
+                .get(&adapter.endpoint.id)
+                .is_some_and(|old| old != name)
+            {
+                return Reply::rejected("an adapter identity cannot change its registered name");
+            }
+            known_identities.insert(adapter.endpoint.id, name.clone());
+        }
         if known_identities.len() > 4096 {
             return Reply::rejected("tunnel identity history exhausted");
         }
@@ -201,6 +212,7 @@ impl State {
             revision: next,
             topology: topology.clone(),
             known_identities,
+            observations: self.tunnels.observations.clone(),
         };
         Reply::Recorded
     }

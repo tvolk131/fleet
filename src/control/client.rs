@@ -22,6 +22,12 @@ const WAIT: Duration = Duration::from_secs(15);
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ApiRequest {
     Tunnels,
+    WaitTunnels {
+        revision: u64,
+        timeout_seconds: u64,
+        #[serde(default)]
+        identities: BTreeSet<iroh::EndpointId>,
+    },
     ReplaceTunnels {
         request_id: String,
         expected_revision: u64,
@@ -352,6 +358,86 @@ impl AppClient {
     }
     pub async fn read(&mut self) -> Result<State> {
         self.transport.read(WAIT).await
+    }
+    async fn tunnel_status(&mut self) -> Result<super::tunnels::status::Snapshot> {
+        let started = std::time::Instant::now();
+        let state = self.read().await?;
+        // Keep new GUI/status clients usable against the previous release before activation.
+        if state.version.active < super::tunnels::GENERATION {
+            return Ok(state.tunnel_status(&Default::default(), 0));
+        }
+        match self
+            .transport
+            .call(super::network::Message::TunnelStatus, WAIT)
+            .await?
+        {
+            super::network::Answer::TunnelStatus(Ok(mut snapshot)) => {
+                snapshot.elapse(started.elapsed());
+                Ok(snapshot)
+            }
+            other => bail!("tunnel status unavailable: {other:?}"),
+        }
+    }
+    async fn wait_tunnels(
+        &mut self,
+        revision: u64,
+        seconds: u64,
+        identities: &BTreeSet<iroh::EndpointId>,
+    ) -> Result<Value> {
+        ensure!(
+            (1..=300).contains(&seconds),
+            "wait timeout must be between 1 and 300 seconds"
+        );
+        let scope = if identities.is_empty() {
+            "all_known_identities"
+        } else {
+            "selected_identities"
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+        let mut last = None;
+        let mut error = None;
+        loop {
+            match tokio::time::timeout_at(deadline, self.tunnel_status()).await {
+                Ok(Ok(snapshot)) => {
+                    ensure!(
+                        identities
+                            .iter()
+                            .all(|id| snapshot.known_identities.contains_key(id)),
+                        "unknown adapter identity in wait scope"
+                    );
+                    if snapshot.revision > revision {
+                        return Ok(
+                            json!({"confirmed":false,"outcome":"superseded","revision":revision,"scope":scope,"identities":identities,"snapshot":snapshot}),
+                        );
+                    }
+                    if snapshot.revision == revision
+                        && snapshot
+                            .adapters
+                            .iter()
+                            .filter(|r| identities.is_empty() || identities.contains(&r.identity))
+                            .all(|r| r.state == "applied")
+                    {
+                        return Ok(
+                            json!({"confirmed":true,"outcome":"applied","revision":revision,"scope":scope,"identities":identities,"snapshot":snapshot}),
+                        );
+                    }
+                    last = Some(snapshot);
+                    error = None;
+                }
+                Ok(Err(e)) => error = Some(e.to_string()),
+                Err(_) => break,
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + Duration::from_millis(200)),
+            )
+            .await;
+        }
+        Ok(
+            json!({"confirmed":false,"outcome":"unconfirmed","revision":revision,"scope":scope,"identities":identities,"last_snapshot":last,"error":error,"message":"Timed out waiting for enforcement; no committed change was undone. Any last_snapshot describes a previous poll, not current freshness."}),
+        )
     }
     async fn prepare_mutation(&mut self, api: &ApiRequest) -> Result<Value> {
         let id = api.request_id().context("mutation request ID required")?;
@@ -771,7 +857,15 @@ impl AppClient {
     pub async fn execute(&mut self, api: ApiRequest) -> Result<Value> {
         match &api {
             ApiRequest::ReplaceTunnels { .. } => self.prepare_mutation(&api).await,
-            ApiRequest::Tunnels => Ok(json!(self.read().await?.tunnels)),
+            ApiRequest::Tunnels => Ok(json!(self.tunnel_status().await?)),
+            ApiRequest::WaitTunnels {
+                revision,
+                timeout_seconds,
+                identities,
+            } => {
+                self.wait_tunnels(*revision, *timeout_seconds, identities)
+                    .await
+            }
             ApiRequest::StoragePlan { storage } => {
                 let state = self.read().await?;
                 Ok(json!(

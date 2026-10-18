@@ -1,5 +1,9 @@
 //! Optional service role with its own identity, authority binding and durable policy.
-use super::{Adapter, Topology, View, transport};
+use super::{
+    Adapter, Topology, View,
+    status::{Report, TransportStatus},
+    transport,
+};
 use crate::control::{
     Client, Config as Authority,
     network::{Answer, Message},
@@ -28,6 +32,9 @@ pub struct Agent {
     endpoint: Endpoint,
     client: Client,
     policy: watch::Sender<View>,
+    transport_status: watch::Receiver<TransportStatus>,
+    boot: u64,
+    report: Option<Report>,
     task: Option<JoinHandle<()>>,
     _lock: crate::instances::Lock,
 }
@@ -96,6 +103,16 @@ impl Agent {
             Self::empty(&config)
         };
         Self::validate_view(&config, &view)?;
+        let boot_path = home.join("boot.json");
+        let previous: u64 = if boot_path.exists() {
+            serde_json::from_slice(&std::fs::read(&boot_path)?)?
+        } else {
+            0
+        };
+        let boot = previous
+            .checked_add(1)
+            .context("adapter boot counter exhausted")?;
+        crate::instances::write(&boot_path, &boot)?;
         // Control traffic has its own direct transport. Forcing service traffic
         // through a relay must not change the existing control-plane transport.
         let mut client = Client::new(
@@ -110,13 +127,17 @@ impl Agent {
             &config.authority.cluster,
         ))?;
         let (policy, receiver) = watch::channel(view);
-        let task = tokio::spawn(transport::run(endpoint.clone(), receiver));
+        let (status, transport_status) = watch::channel(TransportStatus::Starting);
+        let task = tokio::spawn(transport::run_observed(endpoint.clone(), receiver, status));
         Ok(Self {
             home: home.into(),
             config,
             endpoint,
             client,
             policy,
+            transport_status,
+            boot,
+            report: None,
             task: Some(task),
             _lock: lock,
         })
@@ -182,6 +203,49 @@ impl Agent {
             );
             crate::instances::write(&self.home.join("policy.json"), &view)?;
             self.policy.send(view).context("tunnel transport stopped")?;
+        }
+        self.observe().await?;
+        Ok(())
+    }
+    async fn observe(&mut self) -> Result<()> {
+        ensure!(
+            self.task.as_ref().is_some_and(|t| !t.is_finished()),
+            "tunnel transport stopped"
+        );
+        let transport = self.transport_status.borrow().clone();
+        let cached_revision = self.policy.borrow().revision;
+        if self
+            .report
+            .as_ref()
+            .is_none_or(|r| r.transport != transport || r.cached_revision != cached_revision)
+        {
+            let sequence = self
+                .report
+                .as_ref()
+                .map_or(0, |r| r.sequence)
+                .checked_add(1)
+                .context("adapter observation sequence exhausted")?;
+            self.report = Some(Report {
+                adapter: self.config.adapter.clone(),
+                boot: self.boot,
+                sequence,
+                cached_revision,
+                transport,
+            });
+        }
+        match self
+            .client
+            .call(
+                Message::TunnelObserve(self.report.clone().expect("report")),
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            Ok(Answer::TunnelObserve(Ok(crate::control::Reply::Recorded))) => {}
+            Ok(Answer::TunnelObserve(Ok(other))) => {
+                anyhow::bail!("adapter observation rejected: {other:?}")
+            }
+            other => tracing::debug!(?other, "tunnel observation unconfirmed; will retry"),
         }
         Ok(())
     }

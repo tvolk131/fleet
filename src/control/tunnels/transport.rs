@@ -1,4 +1,5 @@
 //! One TCP connection per authenticated QUIC connection; no byte replay on failure.
+use super::status::TransportStatus;
 use super::{Topology, View};
 use anyhow::{Context, Result, ensure};
 use iroh::{
@@ -185,88 +186,154 @@ fn known_inbound(topology: &Topology, owner: &str, peer: EndpointId) -> bool {
     })
 }
 
-/// Dropping this future closes listeners and aborts every socket/connection task.
-/// Policies are replaced conservatively: any revision closes all active tunnels.
-pub async fn serve(endpoint: Endpoint, view: View) -> Result<()> {
-    view.topology.validate()?;
-    let view = Arc::new(view);
-    let slots = Arc::new(Semaphore::new(MAX_STREAMS));
-    let mut tasks = JoinSet::new();
-    let mut listeners = JoinSet::new();
-    // Bind the entire policy before accepting traffic. A collision fails closed.
-    let mut bound = Vec::new();
-    for route in &view.topology.routes {
-        ensure!(
-            route.adapter == view.adapter,
-            "foreign route in adapter view"
-        );
-        bound.push((
-            TcpListener::bind(route.listen).await?,
-            route.service.clone(),
-        ));
+struct Session {
+    endpoint: Endpoint,
+    view: Arc<View>,
+    slots: Arc<Semaphore>,
+    tasks: JoinSet<Result<()>>,
+    listeners: JoinSet<Result<()>>,
+    rx: tokio::sync::mpsc::Receiver<(TcpStream, String)>,
+    _tx: tokio::sync::mpsc::Sender<(TcpStream, String)>,
+}
+impl Session {
+    async fn bind(endpoint: Endpoint, view: View) -> Result<Self> {
+        view.topology.validate()?;
+        let view = Arc::new(view);
+        let slots = Arc::new(Semaphore::new(MAX_STREAMS));
+        let tasks = JoinSet::new();
+        let mut listeners = JoinSet::new();
+        // Bind the entire policy before accepting traffic. A collision fails closed.
+        let mut bound = Vec::new();
+        for route in &view.topology.routes {
+            ensure!(
+                route.adapter == view.adapter,
+                "foreign route in adapter view"
+            );
+            bound.push((
+                TcpListener::bind(route.listen).await?,
+                route.service.clone(),
+            ));
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        for (listener, service) in bound {
+            let tx = tx.clone();
+            listeners.spawn(async move {
+                loop {
+                    let (socket, _) = listener.accept().await?;
+                    // Never accumulate an unbounded queue of accepted local sockets.
+                    match tx.try_send((socket, service.clone())) {
+                        Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+        }
+        // Keep a sender alive for an adapter with no outbound routes.
+        Ok(Self {
+            endpoint,
+            view,
+            slots,
+            tasks,
+            listeners,
+            rx,
+            _tx: tx,
+        })
     }
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    for (listener, service) in bound {
-        let tx = tx.clone();
-        listeners.spawn(async move {
-            loop {
-                let (socket, _) = listener.accept().await?;
-                // Never accumulate an unbounded queue of accepted local sockets.
-                match tx.try_send((socket, service.clone())) {
-                    Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+    async fn serve(&mut self) -> Result<()> {
+        let Self {
+            endpoint,
+            view,
+            slots,
+            tasks,
+            listeners,
+            rx,
+            ..
+        } = self;
+        loop {
+            // Completed tasks still occupy JoinSet entries. Drain them before
+            // accepting more work so a flood of short connections cannot accumulate
+            // an unbounded completion queue after their semaphore permits release.
+            while let Some(result) = tasks.try_join_next() {
+                if let Err(error) = result? {
+                    tracing::debug!(%error, "tunnel connection closed");
                 }
             }
-            Ok::<_, anyhow::Error>(())
-        });
+            tokio::select! {
+                Some(incoming_conn) = endpoint.accept() => {
+                    let Ok(permit) = slots.clone().try_acquire_owned() else { incoming_conn.refuse(); continue; };
+                    let view = view.clone();
+                    tasks.spawn(async move {
+                        let _permit = permit;
+                        let conn = tokio::time::timeout(HANDSHAKE, incoming_conn).await??;
+                        if !known_inbound(&view.topology, &view.adapter, conn.remote_id()) {
+                            conn.close(1u32.into(), b"unauthorized adapter");
+                            return Ok(());
+                        }
+                        incoming(conn, view).await
+                    });
+                }
+                Some((tcp, service)) = rx.recv() => {
+                    let Ok(permit) = slots.clone().try_acquire_owned() else { continue; };
+                    let (ep, view) = (endpoint.clone(), view.clone());
+                    tasks.spawn(async move { let _permit = permit; outgoing(ep, tcp, view, service).await });
+                }
+                Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Err(error) = result? { tracing::debug!(%error, "tunnel connection closed"); }
+                }
+                Some(result) = listeners.join_next(), if !listeners.is_empty() => { result??; anyhow::bail!("tunnel listener stopped"); }
+            }
+        }
     }
-    // Keep a sender alive for an adapter with no outbound routes.
-    let _tx = tx;
-    loop {
-        // Completed tasks still occupy JoinSet entries. Drain them before
-        // accepting more work so a flood of short connections cannot accumulate
-        // an unbounded completion queue after their semaphore permits release.
-        while let Some(result) = tasks.try_join_next() {
-            if let Err(error) = result? {
-                tracing::debug!(%error, "tunnel connection closed");
-            }
-        }
-        tokio::select! {
-            Some(incoming_conn) = endpoint.accept() => {
-                let Ok(permit) = slots.clone().try_acquire_owned() else { incoming_conn.refuse(); continue; };
-                let view = view.clone();
-                tasks.spawn(async move {
-                    let _permit = permit;
-                    let conn = tokio::time::timeout(HANDSHAKE, incoming_conn).await??;
-                    if !known_inbound(&view.topology, &view.adapter, conn.remote_id()) {
-                        conn.close(1u32.into(), b"unauthorized adapter");
-                        return Ok(());
-                    }
-                    incoming(conn, view).await
-                });
-            }
-            Some((tcp, service)) = rx.recv() => {
-                let Ok(permit) = slots.clone().try_acquire_owned() else { continue; };
-                let (ep, view) = (endpoint.clone(), view.clone());
-                tasks.spawn(async move { let _permit = permit; outgoing(ep, tcp, view, service).await });
-            }
-            Some(result) = tasks.join_next(), if !tasks.is_empty() => {
-                if let Err(error) = result? { tracing::debug!(%error, "tunnel connection closed"); }
-            }
-            Some(result) = listeners.join_next(), if !listeners.is_empty() => { result??; anyhow::bail!("tunnel listener stopped"); }
-        }
+    async fn shutdown(mut self) {
+        self.listeners.abort_all();
+        self.tasks.abort_all();
+        // Abort alone schedules cancellation. Join every task before acknowledging
+        // replacement, so no task holding an old permission/socket remains alive.
+        while self.listeners.join_next().await.is_some() {}
+        while self.tasks.join_next().await.is_some() {}
     }
 }
 
-pub async fn run(endpoint: Endpoint, mut policies: watch::Receiver<View>) {
+pub async fn run(endpoint: Endpoint, policies: watch::Receiver<View>) {
+    let (status, _) = watch::channel(TransportStatus::Starting);
+    run_observed(endpoint, policies, status).await;
+}
+
+pub async fn run_observed(
+    endpoint: Endpoint,
+    mut policies: watch::Receiver<View>,
+    status: watch::Sender<TransportStatus>,
+) {
     loop {
         let view = policies.borrow_and_update().clone();
-        tokio::select! {
-            result = serve(endpoint.clone(), view) => {
-                if let Err(error) = result { tracing::warn!(%error, "tunnel policy failed closed; retrying"); }
-                tokio::select! { _ = tokio::time::sleep(Duration::from_secs(2)) => {}, changed = policies.changed() => { if changed.is_err() { break; } } }
+        let revision = view.revision;
+        status.send_replace(TransportStatus::Applying { revision });
+        let binding = tokio::select! {
+            result = Session::bind(endpoint.clone(), view) => result,
+            changed = policies.changed() => { if changed.is_err() { break; } else { continue; } }
+        };
+        let error = match binding {
+            Ok(mut session) => {
+                status.send_replace(TransportStatus::Applied { revision });
+                let result = tokio::select! {
+                    result = session.serve() => Some(result),
+                    changed = policies.changed() => { if changed.is_err() {session.shutdown().await; break;} None }
+                };
+                session.shutdown().await;
+                match result {
+                    None => continue,
+                    Some(Ok(())) => "transport stopped".into(),
+                    Some(Err(e)) => e.to_string(),
+                }
             }
-            changed = policies.changed() => { if changed.is_err() { break; } }
-        }
+            Err(e) => e.to_string(),
+        };
+        tracing::warn!(%error, "tunnel policy failed closed; retrying");
+        status.send_replace(TransportStatus::Failed {
+            revision,
+            error: error.chars().take(128).collect(),
+        });
+        tokio::select! { _ = tokio::time::sleep(Duration::from_secs(2)) => {}, changed = policies.changed() => { if changed.is_err() { break; } } }
     }
 }

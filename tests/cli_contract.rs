@@ -121,6 +121,118 @@ fn cancel(l: &Lab, id: &str) -> Result<()> {
 }
 
 #[test]
+fn tunnel_cli_distinguishes_committed_policy_from_confirmed_enforcement() -> Result<()> {
+    let mut l = lab()?;
+    // Status remains readable before generation-three activation.
+    ensure!(
+        l.request(json!({"op":"tunnels"}))?["revision"] == 0,
+        "initial catalog"
+    );
+    l.request(json!({"op":"prepare_version","request_id":"tunnel-prepare","expected_revision":0,"target":fleet::control::tunnels::GENERATION}))?;
+    wait(
+        || l.request(json!({"op":"versions"})),
+        |v| v["version"]["pending"]["ready"] == json!([1]),
+        10,
+    )?;
+    l.request(
+        json!({"op":"activate_version","request_id":"tunnel-activate","expected_revision":1}),
+    )?;
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    save(
+        &l.root.join("network.json"),
+        &json!({"bind":port.local_addr()?.to_string(),"relays":[]}),
+    )?;
+    drop(port);
+    let adapter = l.cli(&[
+        "tunnels",
+        "prepare",
+        "--adapter-home",
+        &l.s("adapter"),
+        "--adapter",
+        "a",
+        "--authority",
+        &l.s("client/config.json"),
+        "--network",
+        &l.s("network.json"),
+    ])?;
+    save(
+        &l.root.join("topology.json"),
+        &json!({"adapters":{"a":adapter},"services":{},"routes":[]}),
+    )?;
+    l.cli(&[
+        "--home",
+        &l.s("client"),
+        "tunnels",
+        "apply",
+        &l.s("topology.json"),
+        "--revision",
+        "0",
+        "--request-id",
+        "routes",
+    ])?;
+    let unknown = l.cli(&["--home", &l.s("client"), "tunnels", "status"])?;
+    ensure!(
+        unknown["revision"] == 1 && unknown["adapters"][0]["state"] == "unknown",
+        "commit was confused with enforcement: {unknown}"
+    );
+    let unconfirmed = l.cli(&[
+        "--home",
+        &l.s("client"),
+        "tunnels",
+        "wait",
+        "--revision",
+        "1",
+        "--timeout-seconds",
+        "1",
+    ])?;
+    ensure!(
+        unconfirmed["confirmed"] == false && unconfirmed["outcome"] == "unconfirmed",
+        "missing explicit timeout: {unconfirmed}"
+    );
+    l.cli(&[
+        "service",
+        "configure",
+        "--config",
+        &l.s("adapter.json"),
+        "--tunnel-home",
+        &l.s("adapter"),
+    ])?;
+    l.start("adapter", None)?;
+    let confirmed = l.request(json!({"op":"wait_tunnels","revision":1,"timeout_seconds":10}))?;
+    ensure!(
+        confirmed["confirmed"] == true && confirmed["scope"] == "all_known_identities",
+        "missing confirmation: {confirmed}"
+    );
+    let identity = unknown["adapters"][0]["identity"].as_str().unwrap();
+    let selected = l.cli(&[
+        "--home",
+        &l.s("client"),
+        "tunnels",
+        "wait",
+        "--revision",
+        "1",
+        "--timeout-seconds",
+        "2",
+        "--identity",
+        identity,
+    ])?;
+    ensure!(
+        selected["confirmed"] == true && selected["scope"] == "selected_identities",
+        "missing selected scope: {selected}"
+    );
+    l.stop("adapter", false)?;
+    l.stop("controller", false)?;
+    l.start("controller", None)?;
+    let restarted = l.request(json!({"op":"tunnels"}))?;
+    ensure!(
+        restarted["adapters"][0]["state"] == "unknown"
+            && restarted["adapters"][0]["observation"]["last_applied"]["revision"] == 1,
+        "restart resurrected freshness: {restarted}"
+    );
+    Ok(())
+}
+
+#[test]
 fn storage_reports_are_timestamped_and_offline_is_explicit() -> Result<()> {
     let mut l = lab()?;
     let s = wait(

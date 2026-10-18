@@ -45,6 +45,8 @@ struct App {
     workers: Vec<Value>,
     instances: Vec<Value>,
     storage: Value,
+    tunnels: Value,
+    tunnels_checked: std::time::Instant,
     storage_selected: Option<String>,
     storage_replacement: String,
     storage_review: Option<(crate::control::storage_lifecycle::Plan, String)>,
@@ -115,6 +117,8 @@ enum StorageAction {
 }
 #[derive(Debug, Clone)]
 struct Refresh {
+    tunnels: Value,
+    tunnels_checked: std::time::Instant,
     history_epoch: u64,
     selected_attempt: Option<u32>,
     history: Option<Value>,
@@ -142,6 +146,8 @@ impl App {
             workers: vec![],
             instances: vec![],
             storage: Value::Null,
+            tunnels: Value::Null,
+            tunnels_checked: std::time::Instant::now(),
             storage_selected: None,
             storage_replacement: String::new(),
             storage_review: None,
@@ -266,6 +272,8 @@ impl App {
                                 .cloned()
                                 .unwrap_or_default();
                             let storage = c.execute(ApiRequest::Storage).await?;
+                            let tunnels = c.execute(ApiRequest::Tunnels).await?;
+                            let tunnels_checked = std::time::Instant::now();
                             // Pin the log read to the attempt in this queue snapshot. A resume can
                             // commit between these requests; never mix its log with the old offset.
                             let attempt = selected_attempt.or_else(|| {
@@ -363,6 +371,8 @@ impl App {
                                 }
                             }
                             Ok::<_, anyhow::Error>(Box::new(Refresh {
+                                tunnels,
+                                tunnels_checked,
                                 history_epoch,
                                 selected_attempt,
                                 history,
@@ -422,6 +432,8 @@ impl App {
                         self.workers = r.workers;
                         self.instances = r.instances;
                         self.storage = r.storage;
+                        self.tunnels = r.tunnels;
+                        self.tunnels_checked = r.tunnels_checked;
                         if !attempt_changed
                             && r.selected == self.selected
                             && r.stderr == self.stderr
@@ -794,6 +806,24 @@ impl App {
                 );
             }
             page = page.push(machines);
+        }
+        if self.tunnels["adapters"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+        {
+            let mut tunnels = column![typography("Service connections", TypeScale::TitleLarge), typography("Latest adapter reports; committed configuration alone does not confirm enforcement.", TypeScale::BodySmall).style(muted)].spacing(8);
+            for line in tunnel_lines(
+                &self.tunnels,
+                self.tunnels_checked.elapsed(),
+                self.error.is_some(),
+            ) {
+                tunnels = tunnels.push(typography(line, TypeScale::BodyMedium));
+            }
+            page = page.push(
+                surface(tunnels)
+                    .variant(SurfaceVariant::Outlined)
+                    .padding(16),
+            );
         }
         let mut jobs = column![typography("Jobs", TypeScale::TitleLarge)].spacing(12);
         if self.jobs.is_empty() {
@@ -1456,6 +1486,58 @@ fn action_notice(value: &Value) -> String {
     "Outputs fetched and verified.".into()
 }
 
+fn tunnel_lines(snapshot: &Value, elapsed: Duration, unavailable: bool) -> Vec<String> {
+    fn number(value: &Value) -> String {
+        value
+            .as_u64()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    }
+    snapshot["adapters"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|r| {
+            let age = r["last_contact_age_ms"]
+                .as_u64()
+                .map(|a| a.saturating_add(elapsed.as_millis().min(u64::MAX as u128) as u64));
+            let fresh = !unavailable
+                && r["fresh"] == true
+                && age.is_some_and(|a| a <= snapshot["fresh_for_ms"].as_u64().unwrap_or(0));
+            let status = if !fresh {
+                "Unknown — report unavailable or stale"
+            } else {
+                match r["state"].as_str() {
+                    Some("applied") => "Applied (last report)",
+                    Some("failed") => "Failed to apply; traffic blocked",
+                    _ => "Application pending",
+                }
+            };
+            let o = &r["observation"];
+            let detail = o["report"]["transport"]["error"]
+                .as_str()
+                .map(|e| format!(" · {e}"))
+                .unwrap_or_default();
+            format!(
+                "{}{} · {status} · desired {} · cached {} · last applied {} · boot {} · {}{}",
+                r["adapter"].as_str().unwrap_or("adapter"),
+                if r["retired"] == true {
+                    " (removed)"
+                } else {
+                    ""
+                },
+                number(&r["desired_revision"]),
+                number(&o["report"]["cached_revision"]),
+                number(&o["last_applied"]["revision"]),
+                number(&o["report"]["boot"]),
+                age.map(|a| format!("contact {}s ago", a / 1000))
+                    .unwrap_or_else(|| "no contact in this leader term".into()),
+                detail
+            )
+        })
+        .collect()
+}
+
 fn history_series(text: &str) -> BTreeMap<String, Vec<f64>> {
     let mut result = BTreeMap::<String, Vec<f64>>::new();
     let mut segments = BTreeMap::<String, u64>::new();
@@ -1794,6 +1876,8 @@ mod tests {
         let mut jobs = app.jobs.clone();
         jobs[0]["assignment"]["execution"] = json!("exec-training-a2");
         let _ = app.update(Message::Refreshed(Ok(Box::new(Refresh {
+            tunnels: Value::Null,
+            tunnels_checked: std::time::Instant::now(),
             history_epoch: 0,
             selected_attempt: None,
             history: None,
@@ -1938,6 +2022,8 @@ mod tests {
             }
         }
         let _ = app.update(Message::Refreshed(Ok(Box::new(Refresh {
+            tunnels: Value::Null,
+            tunnels_checked: std::time::Instant::now(),
             history_epoch: 1,
             selected_attempt: Some(1),
             history: None,
@@ -1960,10 +2046,50 @@ mod tests {
         );
     }
     #[test]
+    fn tunnel_reports_expire_locally_and_never_disguise_refresh_failure() {
+        let mut app = sample();
+        app.tunnels = json!({"fresh_for_ms":15000,"adapters":[{"adapter":"garage-a","desired_revision":7,"retired":true,"fresh":true,"state":"applied","last_contact_age_ms":1000,"observation":{"report":{"boot":2,"cached_revision":7,"transport":{"phase":"applied","revision":7}},"last_applied":{"revision":7}}}]});
+        let line = &tunnel_lines(&app.tunnels, Duration::ZERO, false)[0];
+        assert!(
+            line.contains("Applied (last report)")
+                && line.contains("(removed)")
+                && line.contains("last applied 7")
+        );
+        assert!(tunnel_lines(&app.tunnels, Duration::from_secs(15), false)[0].contains("Unknown"));
+        assert!(tunnel_lines(&app.tunnels, Duration::ZERO, true)[0].contains("Unknown"));
+        for state in ["applied", "pending", "failed", "unknown"] {
+            app.tunnels["adapters"][0]["state"] = json!(state);
+            app.tunnels["adapters"][0]["fresh"] = json!(state != "unknown");
+            if state == "failed" {
+                app.tunnels["adapters"][0]["observation"]["report"]["transport"] =
+                    json!({"phase":"failed","error":"port occupied"});
+                assert!(
+                    tunnel_lines(&app.tunnels, Duration::ZERO, false)[0].contains("port occupied")
+                );
+            }
+            for dark in [false, true] {
+                app.dark = dark;
+                let snapshot = simulator(&app).snapshot(&app.theme()).unwrap();
+                if let Some(dir) = std::env::var_os("FLEET_GUI_PREVIEW") {
+                    assert!(
+                        snapshot
+                            .matches_image(PathBuf::from(dir).join(format!(
+                                "tunnels-{state}-{}",
+                                if dark { "dark" } else { "light" }
+                            )))
+                            .unwrap()
+                    );
+                }
+            }
+        }
+    }
+    #[test]
     fn stale_refresh_never_appends_to_a_different_jobs_log() {
         let mut app = sample();
         app.selected = Some("new-job".into());
         let _ = app.update(Message::Refreshed(Ok(Box::new(Refresh {
+            tunnels: Value::Null,
+            tunnels_checked: std::time::Instant::now(),
             history_epoch: 0,
             selected_attempt: None,
             history: None,

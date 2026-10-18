@@ -420,6 +420,11 @@ pub fn run(options: Options) -> Result<()> {
             "/fleet service run --config /state/adapter-service.json",
         )?;
     }
+    ensure!(
+        lab.api(json!({"op":"wait_tunnels","revision":1,"timeout_seconds":20}))?["confirmed"]
+            == true,
+        "Garage routes committed but enforcement unconfirmed"
+    );
     let ids = (0..3)
         .map(|n| lab.exec(n, &["/garage", "node", "id"]))
         .collect::<Result<Vec<_>>>()?;
@@ -588,22 +593,20 @@ pub fn run(options: Options) -> Result<()> {
     // Removing all routes must actually terminate replication, not only change
     // a database field. A fresh PUT cannot obtain Garage's two-of-three quorum.
     lab.api(json!({"op":"replace_tunnels","request_id":"revoke","expected_revision":1,"topology":{"adapters":{},"services":{},"routes":[]}}))?;
-    for n in 0..3 {
-        wait(
-            || {
-                lab.exec(n, &["cat", "/state/adapter/policy.json"])
-                    .and_then(|s| Ok(serde_json::from_str(&s)?))
-            },
-            |v| v["revision"] == 2,
-            30,
-        )?;
-    }
+    let enforced = lab.api(json!({"op":"wait_tunnels","revision":2,"timeout_seconds":20}))?;
+    ensure!(
+        enforced["confirmed"] == true
+            && enforced["snapshot"]["adapters"]
+                .as_array()
+                .is_some_and(|rows| rows.len() == 3 && rows.iter().all(|r| r["retired"] == true)),
+        "removed adapters have not confirmed enforcement"
+    );
     ensure!(
         lab.s3(0, true, "must-fail-after-revocation", &payload)
             .is_err(),
         "Garage still replicated after all service access was revoked"
     );
-    let report = json!({"success":true,"garage_image":GARAGE,"runtime_image":RUNTIME,"fleet_sha256":digest(&options.linux_binary)?,"distinct_network_namespaces":3,"direct_rpc_blocked_pairs":6,"gossip_discovery":true,"garage_restart":true,"adapter_restart_without_controller":true,"revocation_breaks_quorum":true,"bytes":bytes.len(),"sha256":digest(&payload)?,"put_seconds":put,"get_seconds":get,"physical_failure_domains":1,"transport":"direct iroh; relay-only transport covered by Rust integration test"});
+    let report = json!({"success":true,"garage_image":GARAGE,"runtime_image":RUNTIME,"fleet_sha256":digest(&options.linux_binary)?,"distinct_network_namespaces":3,"direct_rpc_blocked_pairs":6,"gossip_discovery":true,"garage_restart":true,"adapter_restart_without_controller":true,"revocation_breaks_quorum":true,"enforcement_acknowledged_before_and_after_revocation":true,"bytes":bytes.len(),"sha256":digest(&payload)?,"put_seconds":put,"get_seconds":get,"physical_failure_domains":1,"transport":"direct iroh; relay-only transport covered by Rust integration test"});
     lab.collect_logs();
     lab.cleanup()?;
     save(&home.join("result.json"), &report)?;

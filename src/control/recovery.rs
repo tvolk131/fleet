@@ -157,6 +157,7 @@ pub async fn recover(
     // tombstones so adapters can read a denial, but require the operator to
     // review and reapply routes in the new authority explicitly.
     state.tunnels.topology = Default::default();
+    state.tunnels.observations.clear();
     state.tunnels.revision = state
         .tunnels
         .revision

@@ -6,8 +6,18 @@ use std::path::PathBuf;
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Read the committed service registry and its revision.
+    /// Read committed policy, application evidence and current enforcement freshness.
     Status,
+    /// Wait for recent application reports. A timeout never undoes a committed policy.
+    Wait {
+        #[arg(long)]
+        revision: u64,
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
+        /// Limit the confirmation scope to these exact adapter identities (repeatable).
+        #[arg(long = "identity")]
+        identities: Vec<iroh::EndpointId>,
+    },
     /// Atomically replace services, routes and permissions using a topology JSON file.
     Apply {
         topology: PathBuf,
@@ -42,6 +52,15 @@ pub enum Command {
 pub async fn run(command: Command) -> Result<Option<ApiRequest>> {
     Ok(match command {
         Command::Status => Some(ApiRequest::Tunnels),
+        Command::Wait {
+            revision,
+            timeout_seconds,
+            identities,
+        } => Some(ApiRequest::WaitTunnels {
+            revision,
+            timeout_seconds,
+            identities: identities.into_iter().collect(),
+        }),
         Command::Apply {
             topology,
             revision,
