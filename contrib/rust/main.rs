@@ -1,4 +1,5 @@
 #![allow(dead_code)] // Shared fixture functions are also used by the integration-test target.
+mod garage;
 mod host;
 mod multihost;
 mod rolling;
@@ -16,6 +17,7 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Commands {
+    Garage(garage::Options),
     Host,
     BuildUpgradeFixtures {
         #[arg(long)]
@@ -38,6 +40,7 @@ enum Commands {
 }
 fn main() {
     let result = match Cli::parse().command {
+        Commands::Garage(options) => garage::run(options),
         Commands::Host => host::stdin(),
         Commands::BuildUpgradeFixtures { output } => rolling::build(&output),
         Commands::RollingUpgrade {

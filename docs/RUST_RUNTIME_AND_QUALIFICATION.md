@@ -55,6 +55,7 @@ the launch session alive until its child exits. Local launchd mode uses disposab
 | Checkpoint retention and backup-only restore | `fleet-qualify checkpoint --fake --rolling --backup-restore` |
 | Portable jobs, attempt history and storage replacement/loss | `fleet-qualify portable --fake --storage-lifecycle` (optional `--baseline-binary`) |
 | Normal local/SSH services, membership and disaster recovery | `fleet-qualify normal-multihost --local` or `--inventory`; optional local `--launchd` |
+| Stock Garage over authenticated Fleet service tunnels | `fleet-qualify garage --linux-binary /absolute/path/to/fleet --home /tmp/fleet-control-garage-test`; three Docker namespaces, pinned Garage/runtime/curl images, internal bridge and no host ports |
 | Native/VM coexistence, live outputs/metrics, worker/leader failure and persistent VM lifecycle | `fleet-qualify normal-tart`; real mode requires explicit `--instances` and `--image-cache` |
 | Older standalone control-worker/recovery scripts | Consolidated into the normal Tart and multihost scenarios above; authenticated partition/minority refusal and old-authority fencing also remain in `tests/control.rs` and `tests/control/recovery.rs` |
 | Python Tart double and inline workload programs | `fleet-fake-tart` and `fleet-test-workload` binaries under `tests/fixtures` |
@@ -66,11 +67,10 @@ backup scenario uses Fleet's existing durable input bundle so both the executabl
 can be restored from the separate storage home after worker-cache removal. The portable scenario separately proves that executable and
 dataset backups survive loss of the original worker, client cache, and input paths.
 
-The immutable first rolling baseline contains historical scripted guest calls. The simulated Tart
-boundary recognizes those fixed request envelopes and implements them in Rust. No interpreter runs;
-this is a test-double adapter, not a production compatibility layer. Mixed native-binary qualification
-still runs the unmodified pinned previous executable. Simulated Tart checks do not claim to qualify
-the baseline's guest interpreter or the real hypervisor.
+The rolling baseline is an immutable previous source revision. Qualification runs its unmodified
+binary, activates its highest supported generation, and then installs the candidate. The simulated
+Tart boundary also recognizes fixed historical guest request envelopes in Rust; no interpreter runs.
+Simulated Tart checks do not claim to qualify the real hypervisor.
 
 CI runs on Linux and macOS without a Python setup step. Qualification reports contain hashes and
 results; fixture keys, journals, and job data are never uploaded. Actual multi-machine and real-Tart

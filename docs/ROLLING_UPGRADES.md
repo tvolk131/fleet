@@ -15,7 +15,7 @@ unchanged. Every mutation explicitly declares its minimum generation; ingress re
 must not be emitted early. A Raft/redb dependency or physical-layout change requires its own explicit
 compatibility qualification; this mechanism is not permission to silently change those contracts.
 
-The first qualified transition is generation 1 to 2. It exercises activation and the downgrade floor; it deliberately keeps existing job/storage semantics and schemas unchanged. The control protocol and worker/storage interfaces are unchanged throughout this first transition.
+The first qualified transition was generation 1 to 2. It exercises activation and the downgrade floor; it deliberately keeps existing job/storage semantics and schemas unchanged. The current release supports generations 2 and 3; activate generation 2 with the previous release before installing it. Generation 3 enables the [service tunnel catalog](SERVICE_TUNNELS.md). Its commands cannot enter Raft before every current member has installed and durably prepared a capable executable.
 Old baseline workers, supervisors, storage agents and clients may continue serving during replica
 replacement. Future workload features must gate dispatch on the required agent capabilities.
 
@@ -26,7 +26,7 @@ replacement. Future workload features must gate dispatch on the required agent c
    the leader last. A leader election may temporarily delay requests; clients retry with saved IDs.
    Fleet does not download binaries, change OS services, or automatically restart other machines.
 3. Once the desired binaries are installed, run
-   `fleet upgrade prepare 2 --revision 0 --request-id upgrade-prepare`. The actual revision is shown
+   `fleet upgrade prepare 3 --revision REVISION --request-id upgrade-prepare`. The actual revision is shown
    by `fleet versions`. This commits a pending operation and freezes membership changes. Preparation
    can wait for an offline/older member; normal jobs, storage transfers and other requests continue.
 4. Every current replica, including learners, writes a durable local preparation promise before
@@ -34,10 +34,10 @@ replacement. Future workload features must gate dispatch on the required agent c
    its database even if the acknowledgement has not reached quorum yet. Readiness survives crashes,
    snapshots and leader changes. `fleet versions` shows the pending members and ready set.
 5. When every member is ready, explicitly run
-   `fleet upgrade activate --revision 1 --request-id upgrade-activate`. The replicated transition
+   `fleet upgrade activate --revision REVISION --request-id upgrade-activate`, using the new revision shown after preparation. The replicated transition
    activates the next generation. It never happens merely because a binary starts.
 
-Before activation, `fleet upgrade abort --revision 1 --request-id upgrade-abort` clears preparation.
+Before activation, `fleet upgrade abort --revision REVISION --request-id upgrade-abort` clears preparation.
 Let every prepared replica apply the abort using the newer executable before rolling it back. An
 offline replica with a preparation promise still refuses the old executable until it catches up.
 After activation, an executable which cannot support the active generation is refused. Restoring an

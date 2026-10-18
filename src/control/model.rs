@@ -23,6 +23,14 @@ pub struct Command {
 /// Deterministic application commands. External effects are reconciled by workers after commit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Mutation {
+    TunnelReport {
+        report: super::tunnels::status::Report,
+        recorded_at_ms: u64,
+    },
+    ReplaceTunnels {
+        expected_revision: u64,
+        topology: super::tunnels::Topology,
+    },
     PrepareVersion {
         expected_revision: u64,
         target: u32,
@@ -162,6 +170,7 @@ impl Mutation {
     /// replication, so an older voter never needs to deserialize a newer command variant.
     pub(crate) fn minimum_generation(&self) -> u32 {
         match self {
+            Self::ReplaceTunnels { .. } | Self::TunnelReport { .. } => super::tunnels::GENERATION,
             Self::PrepareVersion { .. }
             | Self::ReplicaPrepared { .. }
             | Self::ActivateVersion { .. }
@@ -233,6 +242,8 @@ pub struct Receipt {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct State {
     #[serde(default)]
+    pub tunnels: super::tunnels::Catalog,
+    #[serde(default)]
     pub version: super::version::ClusterVersion,
     #[serde(default)]
     pub history: super::history::Catalog,
@@ -262,6 +273,7 @@ pub fn key(principal: &str, id: &str) -> String {
 impl State {
     pub fn new(cluster: String) -> Self {
         Self {
+            tunnels: Default::default(),
             // New clusters start at the binary's floor. Deserializing old metadata still
             // defaults to generation one, never silently to the running executable's version.
             version: super::version::ClusterVersion {
@@ -313,6 +325,7 @@ impl State {
         // observations converge without retaining an unbounded receipt per chunk or sample.
         // User mutations (including history policy and pins) retain normal request receipts.
         let diagnostic = match &request.mutation {
+            Mutation::TunnelReport { .. } => true,
             Mutation::HistoryReport(r) => self.history_reporter(&principal, r),
             Mutation::ArtifactReady(r) => {
                 matches!(r.manifest.kind, super::artifact::Kind::History { .. })
@@ -369,6 +382,14 @@ impl State {
             return Reply::rejected("operation requires an inactive cluster generation");
         }
         match mutation {
+            Mutation::TunnelReport {
+                report,
+                recorded_at_ms,
+            } => self.tunnel_report(principal, report, *recorded_at_ms),
+            Mutation::ReplaceTunnels {
+                expected_revision,
+                topology,
+            } => self.replace_tunnels(*expected_revision, topology),
             Mutation::PrepareVersion {
                 expected_revision,
                 target,

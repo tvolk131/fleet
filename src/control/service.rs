@@ -61,6 +61,8 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub client_home: Option<PathBuf>,
     #[serde(default)]
+    pub tunnel_home: Option<PathBuf>,
+    #[serde(default)]
     pub bootstrap: bool,
 }
 impl ServiceConfig {
@@ -69,14 +71,16 @@ impl ServiceConfig {
             self.controller_home.is_some()
                 || self.worker_home.is_some()
                 || self.client_home.is_some()
+                || self.tunnel_home.is_some()
                 || self.storage_home.is_some(),
-            "choose controller, worker, storage or client-staging roles"
+            "choose controller, worker, storage, tunnel or client-staging roles"
         );
         let mut homes = Vec::new();
         for home in [
             &self.controller_home,
             &self.worker_home,
             &self.client_home,
+            &self.tunnel_home,
             &self.storage_home,
         ]
         .into_iter()
@@ -159,17 +163,42 @@ pub async fn run(path: &Path) -> Result<()> {
             }
         })
     });
+    // Keep task ownership scoped even if another role fails during startup.
+    struct TunnelTask(Option<tokio::task::JoinHandle<Result<()>>>);
+    impl Drop for TunnelTask {
+        fn drop(&mut self) {
+            if let Some(task) = &self.0 {
+                task.abort();
+            }
+        }
+    }
+    let mut tunnel = TunnelTask(if let Some(home) = &config.tunnel_home {
+        let agent = super::tunnels::agent::Agent::start(home).await?;
+        Some(tokio::spawn(agent.run()))
+    } else {
+        None
+    });
+    let tunnel_stopped = async {
+        match &mut tunnel.0 {
+            Some(task) => task.await?,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(tunnel_stopped);
     let result = if let Some(home) = &config.worker_home {
         match admin::start_worker(home).await {
             Ok(mut w) => {
-                admin::run_worker(&mut w).await;
-                w.shutdown().await
+                let result = tokio::select! {
+                    _ = admin::run_worker(&mut w) => Ok(()),
+                    result = &mut tunnel_stopped => result,
+                };
+                w.shutdown().await?;
+                result
             }
             Err(e) => Err(e),
         }
     } else {
-        crate::shutdown_signal().await;
-        Ok(())
+        tokio::select! { _ = crate::shutdown_signal() => Ok(()), result = &mut tunnel_stopped => result }
     };
     let _ = storage_stop.send(true);
     if let Some(task) = storage {

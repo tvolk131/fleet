@@ -1,7 +1,7 @@
 use super::*;
 use fleet::control::recovery::{Manifest, accept_client, recover};
 
-pub(super) async fn restore(c: &mut Cluster, source: u64, name: &str) -> (PathBuf, Manifest) {
+pub(crate) async fn restore(c: &mut Cluster, source: u64, name: &str) -> (PathBuf, Manifest) {
     for (_, replica) in std::mem::take(&mut c.replicas) {
         replica.shutdown().await.unwrap();
     }

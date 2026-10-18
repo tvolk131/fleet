@@ -5,6 +5,33 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+const BASE: u32 = fleet::control::version::MIN;
+const NEXT: u32 = fleet::control::version::MAX;
+
+/// Use the previous executable for every preparation/activation before installing
+/// the candidate. Installing binaries must never silently upgrade stored behavior.
+pub fn activate_to(l: &Lab, target: u32) -> Result<()> {
+    let v = l.state()?["version"].clone();
+    if v["active"] == target {
+        return Ok(());
+    }
+    ensure!(
+        v["active"].as_u64() == Some(target as u64 - 1),
+        "baseline must activate one generation at a time"
+    );
+    l.request(json!({"op":"prepare_version","request_id":format!("baseline-prepare-{target}"),"expected_revision":v["revision"],"target":target}))?;
+    let v = wait(
+        || Ok(l.state()?["version"].clone()),
+        |v| v["pending"]["members"] == v["pending"]["ready"],
+        60,
+    )?;
+    l.request(json!({"op":"activate_version","request_id":format!("baseline-activate-{target}"),"expected_revision":v["revision"]}))?;
+    ensure!(
+        l.state()?["version"]["active"] == target,
+        "baseline activation failed"
+    );
+    Ok(())
+}
 
 fn inspect(l: &Lab, n: u64) -> Result<Value> {
     l.cli(&[
@@ -153,11 +180,18 @@ pub fn run(root: &Path, baseline: &Path, candidate: &Path, unsupported: &Path) -
         checked(baseline, &args)?;
         l.start(&name, Some(baseline))?;
     }
+    activate_to(&l, BASE)?;
+    let initial_revision = l.state()?["version"]["revision"].as_u64().unwrap();
     l.binary = current;
     caught(&l, &[1, 2, 3])?;
+    let denied=l.envelope(json!({"op":"replace_tunnels","request_id":"inactive-tunnels","expected_revision":0,"topology":{"adapters":{},"services":{},"routes":[]}}))?;
+    ensure!(
+        denied["ok"] == false && denied.to_string().contains("request was not accepted"),
+        "future variant reached an older leader: {denied}"
+    );
     for n in 1..=3 {
         ensure!(
-            inspect(&l, n)?["software"] == json!({"min":1,"max":1}),
+            inspect(&l, n)?["software"] == json!({"min":BASE-1,"max":BASE}),
             "baseline range changed"
         );
     }
@@ -194,7 +228,7 @@ pub fn run(root: &Path, baseline: &Path, candidate: &Path, unsupported: &Path) -
     let answer = api(
         unsupported,
         &l.root.join("client"),
-        json!({"op":"prepare_version","request_id":"future-write","expected_revision":0,"target":2}),
+        json!({"op":"prepare_version","request_id":"future-write","expected_revision":initial_revision,"target":NEXT}),
     )?;
     ensure!(
         answer["ok"] == false && answer.to_string().contains("compatib"),
@@ -210,10 +244,10 @@ pub fn run(root: &Path, baseline: &Path, candidate: &Path, unsupported: &Path) -
     );
     rejected(
         &l,
-        json!({"op":"prepare_version","request_id":"skip-generation","expected_revision":0,"target":3}),
+        json!({"op":"prepare_version","request_id":"skip-generation","expected_revision":initial_revision,"target":NEXT+1}),
     )?;
     ensure!(
-        l.state()?["version"]["active"] == 1,
+        l.state()?["version"]["active"] == BASE,
         "unexpected generation"
     );
     l.phase("unsupported_network_client_and_generation_jump_rejected");
@@ -253,7 +287,7 @@ pub fn run(root: &Path, baseline: &Path, candidate: &Path, unsupported: &Path) -
         ],
     )?;
     ensure!(
-        future["version"]["active"] == 3 && l.state()?["version"]["active"] == 1,
+        future["version"]["active"] == NEXT + 1 && l.state()?["version"]["active"] == BASE,
         "fresh cluster changed existing generation"
     );
     l.stop("node-4", false)?;
@@ -271,13 +305,13 @@ pub fn run(root: &Path, baseline: &Path, candidate: &Path, unsupported: &Path) -
     l.start(&name, None)?;
     caught(&l, &[1, 2, 3])?;
     ensure!(
-        inspect(&l, follower)?["software"] == json!({"min":1,"max":2})
+        inspect(&l, follower)?["software"] == json!({"min":BASE,"max":NEXT})
             && !inspect(&l, follower)?["snapshot"].is_null(),
         "mixed-version snapshot missing"
     );
     live(&l, &original, &submitted["reply"])?;
     l.phase("dirty_database_rejection_and_mixed_version_snapshot_catchup");
-    l.request(json!({"op":"prepare_version","request_id":"prepare-first","expected_revision":0,"target":2}))?;
+    l.request(json!({"op":"prepare_version","request_id":"prepare-first","expected_revision":initial_revision,"target":NEXT}))?;
     wait(
         || Ok(l.state()?["version"].clone()),
         |v| {
@@ -289,11 +323,11 @@ pub fn run(root: &Path, baseline: &Path, candidate: &Path, unsupported: &Path) -
     )?;
     rejected(
         &l,
-        json!({"op":"activate_version","request_id":"early-activate","expected_revision":1}),
+        json!({"op":"activate_version","request_id":"early-activate","expected_revision":initial_revision+1}),
     )?;
     l.stop(&name, true)?;
     unchanged(&l, follower, baseline)?;
-    l.request(json!({"op":"abort_version","request_id":"abort-first","expected_revision":1}))?;
+    l.request(json!({"op":"abort_version","request_id":"abort-first","expected_revision":initial_revision+1}))?;
     unchanged(&l, follower, baseline)?;
     l.start(&name, None)?;
     caught(&l, &[1, 2, 3])?;
@@ -315,7 +349,7 @@ pub fn run(root: &Path, baseline: &Path, candidate: &Path, unsupported: &Path) -
         live(&l, &original, &submitted["reply"])?;
     }
     let revision = l.state()?["version"]["revision"].as_u64().unwrap();
-    l.request(json!({"op":"prepare_version","request_id":"prepare-final","expected_revision":revision,"target":2}))?;
+    l.request(json!({"op":"prepare_version","request_id":"prepare-final","expected_revision":revision,"target":NEXT}))?;
     wait(
         || Ok(l.state()?["version"].clone()),
         |v| v["pending"]["ready"] == json!([1, 2, 3]),
@@ -329,8 +363,13 @@ pub fn run(root: &Path, baseline: &Path, candidate: &Path, unsupported: &Path) -
     l.start(&name, None)?;
     caught(&l, &[1, 2, 3])?;
     ensure!(
-        l.state()?["version"]["active"] == 2,
+        l.state()?["version"]["active"] == NEXT,
         "generation not activated"
+    );
+    ensure!(l.request(json!({"op":"replace_tunnels","request_id":"activated-tunnels","expected_revision":0,"topology":{"adapters":{},"services":{},"routes":[]}}))?["reply"]=="Recorded","activated tunnel mutation failed");
+    ensure!(
+        l.request(json!({"op":"tunnels"}))?["revision"] == 1,
+        "tunnel state not committed"
     );
     ensure!(
         api_result(
@@ -463,7 +502,7 @@ pub fn build(output_dir: &Path) -> Result<()> {
     let target = root.join("target");
     let build_one = |source: &Path, name: &str, all: bool| -> Result<()> {
         for args in [
-            vec!["clean", "-p", "fleet"],
+            vec!["clean", "-p", "fleet", "--profile", "dev"],
             if all {
                 vec!["build", "--all-features", "--bins", "--locked"]
             } else {
@@ -510,15 +549,15 @@ pub fn build(output_dir: &Path) -> Result<()> {
         let file = future.join("src/control/version.rs");
         let source = fs::read_to_string(&file)?;
         ensure!(
-            source.contains("pub const MIN: u32 = 1;")
-                && source.contains("pub const MAX: u32 = 2;"),
+            source.contains("pub const MIN: u32 = 2;")
+                && source.contains("pub const MAX: u32 = 3;"),
             "update unsupported build fixture for new baseline"
         );
         fs::write(
             file,
             source
-                .replace("pub const MIN: u32 = 1;", "pub const MIN: u32 = 3;")
-                .replace("pub const MAX: u32 = 2;", "pub const MAX: u32 = 4;"),
+                .replace("pub const MIN: u32 = 2;", "pub const MIN: u32 = 4;")
+                .replace("pub const MAX: u32 = 3;", "pub const MAX: u32 = 5;"),
         )?;
         build_one(&future, "fleet-unsupported", false)?;
         build_one(&root, "fleet-candidate", true)?;

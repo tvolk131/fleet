@@ -41,6 +41,11 @@ enum VersionCommand {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Authenticated host-local TCP services over iroh.
+    Tunnels {
+        #[command(subcommand)]
+        action: fleet::control::tunnels::cli::Command,
+    },
     /// Cluster generation and live replica compatibility diagnostics.
     Versions,
     /// Prepare, activate, or abort a rolling cluster generation change.
@@ -375,6 +380,8 @@ enum ServiceCommand {
         #[arg(long)]
         client_home: Option<PathBuf>,
         #[arg(long)]
+        tunnel_home: Option<PathBuf>,
+        #[arg(long)]
         bootstrap: bool,
     },
     Run {
@@ -458,6 +465,10 @@ fn main() -> Result<()> {
 async fn run(args: Args) -> Result<()> {
     let client_home = home(args.home)?;
     let api = match args.command {
+        Command::Tunnels { action } => match fleet::control::tunnels::cli::run(action).await? {
+            Some(api) => api,
+            None => return Ok(()),
+        },
         Command::Cluster { action } => return fleet::control::admin::run(action).await,
         Command::Client {
             action: ClientCommand::Import { config, key },
@@ -496,6 +507,7 @@ async fn run(args: Args) -> Result<()> {
                     worker_home,
                     storage_home,
                     client_home,
+                    tunnel_home,
                     bootstrap,
                 } => {
                     ensure!(!config.exists(), "service configuration already exists");
@@ -504,6 +516,7 @@ async fn run(args: Args) -> Result<()> {
                         worker_home,
                         storage_home,
                         client_home,
+                        tunnel_home,
                         bootstrap,
                     };
                     settings.validate()?;

@@ -45,6 +45,13 @@ jobs:
         run: cargo fmt --all --check
       - name: Build Fleet and control-plane qualification tools
         run: cargo build --all-features --bins --locked
+      - name: Stock Garage over Fleet service tunnels in separate network namespaces
+        if: runner.os == 'Linux'
+        run: |
+          # The namespace fixture intentionally has no desktop libraries.
+          cargo build --bin fleet --no-default-features --features control-plane --locked
+          target/debug/fleet-qualify garage --linux-binary "$PWD/target/debug/fleet" \
+            --home /tmp/fleet-control-garage-ci 2>&1 | tee garage-tunnels.log
       - name: Build real previous/candidate executables and incompatible fixture
         run: target/debug/fleet-qualify build-upgrade-fixtures --output /tmp/fleet-upgrade-binaries 2>&1 | tee upgrade-builds.log
       - name: Rolling upgrades, live work, rollback and incompatible-version refusal
@@ -90,6 +97,9 @@ jobs:
           fi
           if [ -f /tmp/fleet-upgrade-binaries/builds.json ]; then
             cp /tmp/fleet-upgrade-binaries/builds.json ci-evidence/upgrade-builds.json
+          fi
+          if [ -f /tmp/fleet-control-garage-ci/result.json ]; then
+            cp /tmp/fleet-control-garage-ci/result.json ci-evidence/garage-tunnels.json
           fi
           # Never upload fixture homes: they contain private identity keys and databases.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

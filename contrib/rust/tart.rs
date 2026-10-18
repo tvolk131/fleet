@@ -652,6 +652,9 @@ pub fn portable(mut a: Options) -> Result<()> {
     }
     l.start("control", None)?;
     l.start("backup", None)?;
+    if a.baseline_binary.is_some() {
+        super::rolling::activate_to(&l, fleet::control::version::MIN)?;
+    }
     for id in ["source", "destination"] {
         enroll(&l, id, false)?;
     }
@@ -720,7 +723,7 @@ pub fn portable(mut a: Options) -> Result<()> {
         l.stop("control", false)?;
         l.start("control", None)?;
         let v = l.request(json!({"op":"versions"}))?["version"].clone();
-        l.request(json!({"op":"prepare_version","expected_revision":v["revision"],"target":2,"request_id":"vm-upgrade-prepare"}))?;
+        l.request(json!({"op":"prepare_version","expected_revision":v["revision"],"target":fleet::control::version::MAX,"request_id":"vm-upgrade-prepare"}))?;
         let v = wait(
             || Ok(l.request(json!({"op":"versions"}))?["version"].clone()),
             |v| v["pending"]["ready"] == json!([1]),
@@ -738,7 +741,8 @@ pub fn portable(mut a: Options) -> Result<()> {
             );
         }
         ensure!(
-            l.request(json!({"op":"versions"}))?["version"]["active"] == 2,
+            l.request(json!({"op":"versions"}))?["version"]["active"]
+                == fleet::control::version::MAX,
             "generation not activated"
         );
         l.phase("rolling_vm_agent_upgrade_preserves_running_supervisor");

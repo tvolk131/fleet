@@ -20,6 +20,9 @@ is intentionally absent from the current contract are removed rather than recrea
 | VM shared budgets, admission, controller failure and guest file safety | `tests/instances.rs`, `tests/instances/guest.rs`, and current worker integration tests. |
 | Checkpoint suspension/resumption and backup recovery | `tests/control/checkpoints.rs`, `storage.rs`, and `fleet-qualify checkpoint --backup-restore`. |
 | GUI rendering, metrics, routed cancellation, checkpoint controls, stale responses | Current iced-m3 tests in `src/gui.rs`; retired dashboard dialogs and clocks are removed. |
+| Service tunnel authorization, revocation, controller outages, restarts and emergency rebinding | `tests/control/tunnels.rs` and `tests/tunnels.rs`, including local relay-only transport with direct networking disabled, large transfers, half-close and oversized-header rejection. |
+| Visible service-policy enforcement | `src/control/tunnels/status/tests.rs`, `tests/control/tunnels.rs`, `tests/tunnels.rs`, `tests/cli_contract.rs` and GUI tests cover acknowledgment after teardown, partial bind failure, authenticated/monotonic reports, durable evidence with term-local freshness, scoped waits/timeouts/supersession, restarts and stale GUI reports. |
+| Unmodified Garage peering over tunnels | `fleet-qualify garage` verifies discovery, six blocked direct RPC paths, S3 integrity, Garage/adapter restart, controller outage, acknowledged enforcement before/after revocation and revocation-induced loss of quorum in separate Docker namespaces. |
 | Direct scheduling fallback, native pause, automatic preemption/resume/migration, remembered background fetch destinations, run/sweep convenience commands | Removed with the retired client/scheduler. These are not part of the current public contract. |
 
 CI builds `fleet`, `fleet-guest`, `fleet-qualify`, the control-plane lab, and the isolated Rust Tart/workload fixtures. It runs Rust tests, headless iced-m3

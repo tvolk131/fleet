@@ -153,6 +153,16 @@ pub async fn recover(
     // The new authority preserves activated behavior, but old-cohort preparation is obsolete.
     state.version.pending = None;
     state.version.revision += 1;
+    // A recovered log may predate a service revocation. Preserve identity
+    // tombstones so adapters can read a denial, but require the operator to
+    // review and reapply routes in the new authority explicitly.
+    state.tunnels.topology = Default::default();
+    state.tunnels.observations.clear();
+    state.tunnels.revision = state
+        .tunnels
+        .revision
+        .checked_add(1)
+        .context("tunnel policy revision exhausted")?;
     let held = state
         .recovery
         .as_ref()
