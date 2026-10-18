@@ -84,6 +84,9 @@ pub enum Message {
     Read,
     /// Local diagnostics can be stale and never authorize worker action or a membership change.
     Inspect,
+    TunnelRead {
+        adapter: String,
+    },
     StorageRead {
         storage: String,
         incarnation: String,
@@ -128,6 +131,7 @@ pub enum Answer {
     Write(Result<Reply, ApiError>),
     Read(Result<Box<State>, ApiError>),
     Inspect(ReplicaStatus),
+    TunnelRead(Result<super::tunnels::View, ApiError>),
     WorkerRead(Result<super::workload::WorkerView, ApiError>),
     StorageRead(Result<super::artifact::View, ApiError>),
     AuthorizeArtifact(Result<bool, ApiError>),
@@ -458,6 +462,18 @@ impl Handler {
             return Answer::Refused("only the replica can acknowledge its preparation".into());
         }
         match frame.message {
+            Message::TunnelRead { adapter } => {
+                if let Err(e) = self.raft.ensure_linearizable().await {
+                    return Answer::TunnelRead(Err(ApiError {
+                        message: e.to_string(),
+                        leader: e.forward_to_leader().and_then(|f| f.leader_id),
+                    }));
+                }
+                match self.store.state().await {
+                    Ok(state) => Answer::TunnelRead(Ok(state.tunnel_view(&adapter, peer))),
+                    Err(e) => Answer::Refused(e.to_string()),
+                }
+            }
             Message::Append(rpc) if is_replica => {
                 Answer::Append(self.raft.append_entries(rpc).await)
             }
@@ -749,6 +765,7 @@ impl ProtocolHandler for Handler {
                 .map(|s| {
                     s.workers.values().any(|w| w.peer.identity == peer)
                         || s.storage.stores.values().any(|w| w.peer.identity == peer)
+                        || s.tunnels.known_identities.contains(&peer)
                 })
                 .unwrap_or(false)
         {
@@ -1100,6 +1117,7 @@ impl Client {
                         | Answer::Read(Err(e))
                         | Answer::WorkerRead(Err(e))
                         | Answer::StorageRead(Err(e))
+                        | Answer::TunnelRead(Err(e))
                         | Answer::AuthorizeArtifact(Err(e)),
                     )) => {
                         self.preferred = e.leader.filter(|id| self.peers.contains_key(id));

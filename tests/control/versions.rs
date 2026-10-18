@@ -18,7 +18,7 @@ async fn version_preparation_survives_leader_loss_and_lost_activation_reply() {
                     "prepare",
                     Mutation::PrepareVersion {
                         expected_revision: 0,
-                        target: 2,
+                        target: fleet::control::version::MAX,
                     }
                 ),
                 WAIT
@@ -64,7 +64,10 @@ async fn version_preparation_survives_leader_loss_and_lost_activation_reply() {
         c.client.write(activate, WAIT).await.unwrap(),
         Reply::Recorded
     );
-    assert_eq!(c.client.read(WAIT).await.unwrap().version.active, 2);
+    assert_eq!(
+        c.client.read(WAIT).await.unwrap().version.active,
+        fleet::control::version::MAX
+    );
     c.start(leader).await;
     c.close().await;
 }
@@ -79,7 +82,7 @@ async fn unsupported_snapshot_and_startup_leave_original_bytes_unchanged() {
     let original = store.state().await.unwrap();
     let mut snapshot = store.build_snapshot().await.unwrap();
     let mut future = original.clone();
-    future.version.active = 3;
+    future.version.active = fleet::control::version::MAX + 1;
     let bytes = serde_json::to_vec(&future).unwrap();
     snapshot.meta.snapshot_id = blake3::hash(&bytes).to_hex().to_string();
     snapshot.snapshot = Box::new(std::io::Cursor::new(bytes));
@@ -92,7 +95,7 @@ async fn unsupported_snapshot_and_startup_leave_original_bytes_unchanged() {
     assert_eq!(store.state().await.unwrap(), original);
     let stale = store.build_snapshot().await.unwrap();
     let mut upgraded = original.clone();
-    upgraded.version.active = 2;
+    upgraded.version.active = fleet::control::version::MAX;
     upgraded.version.revision = 2;
     let bytes = serde_json::to_vec(&upgraded).unwrap();
     let mut meta = stale.meta.clone();

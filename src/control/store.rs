@@ -710,12 +710,15 @@ mod version_tests {
                 "prepare",
                 Mutation::PrepareVersion {
                     expected_revision: 0,
-                    target: 2,
+                    target: crate::control::version::MAX,
                 },
             )])
             .await
             .unwrap();
-        store.prepare_version(1, 2).await.unwrap();
+        store
+            .prepare_version(1, crate::control::version::MAX)
+            .await
+            .unwrap();
         assert!(
             store
                 .state()
@@ -729,7 +732,10 @@ mod version_tests {
         );
         drop(store);
         let bytes = std::fs::read(&path).unwrap();
-        let old = Software { min: 1, max: 1 };
+        let old = Software {
+            min: crate::control::version::MIN - 1,
+            max: crate::control::version::MIN,
+        };
         assert!(Store::preflight_for(&path, "cluster", 1, old).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         let mut store = Store::open(&path, "cluster", 1).unwrap();

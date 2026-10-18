@@ -64,6 +64,7 @@ or public-internet-only networking policies remain unchanged.
 - [Emergency recovery and authority transitions](docs/CONTROL_PLANE_RECOVERY.md)
 - [Direct LAN deployment qualification](docs/CONTROL_PLANE_NETWORKING.md)
 - [Worker execution and Tart guarantees](docs/CONTROL_PLANE_WORKERS.md)
+- [Authenticated service tunnels and Garage](docs/SERVICE_TUNNELS.md)
 - [Current regression coverage](docs/TEST_COVERAGE.md)
 
 Testing: `cargo test --workspace --all-features --locked`;

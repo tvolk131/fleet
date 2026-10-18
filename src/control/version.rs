@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, time::Duration};
 
 pub const WIRE: u32 = 1;
-pub const MIN: u32 = 1;
-pub const MAX: u32 = 2;
+pub const MIN: u32 = 2;
+pub const MAX: u32 = 3;
 
 /// Inspect before opening the real database for writes. An unclean redb file needs
 /// repair; repair a private scratch copy under the source lock, never the source.
@@ -273,9 +273,12 @@ mod tests {
     #[test]
     fn activation_requires_every_persisted_promise_and_freezes_membership() {
         let mut s = state();
-        assert!(matches!(s.prepare_version(0, 3), Reply::Rejected { .. }));
+        assert!(matches!(
+            s.prepare_version(0, MAX + 1),
+            Reply::Rejected { .. }
+        ));
         assert_eq!(s.version.revision, 0);
-        assert_eq!(s.prepare_version(0, 2), Reply::Recorded);
+        assert_eq!(s.prepare_version(0, MAX), Reply::Recorded);
         assert!(matches!(s.activate_version(1), Reply::Rejected { .. }));
         assert!(matches!(
             s.replica_prepared("admin", 1, 1),
@@ -293,21 +296,21 @@ mod tests {
             );
         }
         assert_eq!(s.activate_version(1), Reply::Recorded);
-        assert_eq!(s.version.active, 2);
+        assert_eq!(s.version.active, MAX);
         assert!(matches!(s.abort_version(1), Reply::Rejected { .. }));
     }
     #[test]
     fn abort_invalidates_delayed_acknowledgements_and_allows_next_attempt() {
         let mut s = state();
         let principal = s.membership_view().peers[&1].identity.to_string();
-        assert_eq!(s.prepare_version(0, 2), Reply::Recorded);
+        assert_eq!(s.prepare_version(0, MAX), Reply::Recorded);
         assert_eq!(s.abort_version(1), Reply::Recorded);
-        assert_eq!(s.prepare_version(2, 2), Reply::Recorded);
+        assert_eq!(s.prepare_version(2, MAX), Reply::Recorded);
         assert!(matches!(
             s.replica_prepared(&principal, 1, 1),
             Reply::Rejected { .. }
         ));
-        assert_eq!(s.version.active, 1);
+        assert_eq!(s.version.active, MIN);
         assert!(s.version.pending.unwrap().ready.is_empty());
     }
     #[test]

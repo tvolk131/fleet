@@ -23,6 +23,7 @@ pub mod storage;
 pub mod storage_lifecycle;
 mod storage_status;
 pub mod store;
+pub mod tunnels;
 pub mod upgrade;
 pub mod version;
 pub mod workload;

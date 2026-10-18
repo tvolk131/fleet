@@ -400,10 +400,10 @@ async fn format_ten_upgrade_preserves_artifact_inventory_and_adds_active_storage
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn format_eleven_offline_upgrade_establishes_rolling_baseline_and_preserves_receipts() {
+async fn format_eleven_requires_the_previous_release_without_mutating_metadata() {
     let mut c = Cluster::new(1).await;
     let submitted = super::super::submit("baseline-submit", "baseline-job");
-    let accepted = c.client.write(submitted.clone(), WAIT).await.unwrap();
+    c.client.write(submitted.clone(), WAIT).await.unwrap();
     c.client
         .write(
             Request {
@@ -432,10 +432,15 @@ async fn format_eleven_offline_upgrade_establishes_rolling_baseline_and_preserve
     let bytes = std::fs::read(home.join("control.redb")).unwrap();
     assert!(Store::open(&home.join("control.redb"), "cluster", 1).is_err());
     assert_eq!(std::fs::read(home.join("control.redb")).unwrap(), bytes);
-    fleet::control::upgrade::run(&home, &[], &[]).unwrap();
-    assert!(home.join("control.redb.v11-backup").exists());
-    c.start(1).await;
-    assert_eq!(c.client.read(WAIT).await.unwrap().version.active, 1);
-    assert_eq!(c.client.write(submitted, WAIT).await.unwrap(), accepted);
+    // Pre-rolling generation one must first use the previous release to migrate
+    // and activate generation two. This release cannot silently skip that step.
+    assert!(
+        fleet::control::upgrade::run(&home, &[], &[])
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible")
+    );
+    assert_eq!(std::fs::read(home.join("control.redb")).unwrap(), bytes);
+    assert!(!home.join("control.redb.v11-backup").exists());
     c.close().await;
 }

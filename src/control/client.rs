@@ -21,6 +21,12 @@ const WAIT: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ApiRequest {
+    Tunnels,
+    ReplaceTunnels {
+        request_id: String,
+        expected_revision: u64,
+        topology: super::tunnels::Topology,
+    },
     Versions,
     PrepareVersion {
         request_id: String,
@@ -246,6 +252,7 @@ fn log_size() -> u32 {
 impl ApiRequest {
     pub fn request_id(&self) -> Option<&str> {
         match self {
+            Self::ReplaceTunnels { request_id, .. } => Some(request_id),
             Self::PrepareVersion { request_id, .. }
             | Self::ActivateVersion { request_id, .. }
             | Self::AbortVersion { request_id, .. }
@@ -362,6 +369,23 @@ impl AppClient {
             return self.send(prepared).await;
         }
         let mutation = match api {
+            ApiRequest::ReplaceTunnels {
+                expected_revision,
+                topology,
+                ..
+            } => {
+                // An older leader cannot deserialize a future enum variant.
+                // Query with the established Read message before sending it.
+                ensure!(
+                    self.read().await?.version.active >= super::tunnels::GENERATION,
+                    "tunnel policy requires active generation {}; request was not accepted",
+                    super::tunnels::GENERATION
+                );
+                Mutation::ReplaceTunnels {
+                    expected_revision: *expected_revision,
+                    topology: topology.clone(),
+                }
+            }
             ApiRequest::PrepareVersion {
                 expected_revision,
                 target,
@@ -746,6 +770,8 @@ impl AppClient {
     }
     pub async fn execute(&mut self, api: ApiRequest) -> Result<Value> {
         match &api {
+            ApiRequest::ReplaceTunnels { .. } => self.prepare_mutation(&api).await,
+            ApiRequest::Tunnels => Ok(json!(self.read().await?.tunnels)),
             ApiRequest::StoragePlan { storage } => {
                 let state = self.read().await?;
                 Ok(json!(

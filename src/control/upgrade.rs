@@ -360,7 +360,8 @@ pub fn run(
             (5..=11).contains(&source_format),
             "unsupported source format"
         );
-        super::version::Software::current().require(1)?;
+        let generation = raw["state"]["version"]["active"].as_u64().unwrap_or(1);
+        super::version::Software::current().require(u32::try_from(generation)?)?;
     }
     let controller_db =
         redb::Database::open(&controller_path).context("stop the controller before upgrading")?;

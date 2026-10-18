@@ -93,6 +93,7 @@ pub fn validate_service(root: &Path, args: &[String]) -> Result<()> {
         "worker_home",
         "storage_home",
         "client_home",
+        "tunnel_home",
     ] {
         if let Some(home) = config[key].as_str() {
             ensure!(

@@ -1,5 +1,5 @@
 {
-  "revision": "f21226a1f6d866ab588ccb330a2b88fdfdb184dc",
-  "generation": 1,
-  "description": "Immutable first rolling-capable baseline; later releases replace this with the previously shipped revision."
+  "revision": "e4cb80077d3a1e743a8b9b4aec2f39964a393c8d",
+  "generation": 2,
+  "description": "Previous 1..2 binary, activated to generation two before installing the 2..3 service-tunnel candidate."
 }

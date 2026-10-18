@@ -1539,5 +1539,7 @@ async fn simulation_place(client: &mut Client, job: &str) {
 #[path = "control/history_state.rs"]
 mod history_state;
 
+#[path = "control/tunnels.rs"]
+mod tunnels;
 #[path = "control/versions.rs"]
 mod versions;

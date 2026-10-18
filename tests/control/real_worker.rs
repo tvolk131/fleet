@@ -1034,7 +1034,7 @@ async fn missing_backend_or_worker_journal_cannot_reexecute_an_accepted_job() {
 }
 
 #[path = "recovery.rs"]
-mod recovery;
+pub(super) mod recovery;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn queued_native_jobs_schedule_once_and_dependencies_wait_for_success() {
