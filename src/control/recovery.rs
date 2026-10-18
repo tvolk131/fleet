@@ -156,6 +156,7 @@ pub async fn recover(
     // A recovered log may predate a service revocation. Preserve identity
     // tombstones so adapters can read a denial, but require the operator to
     // review and reapply routes in the new authority explicitly.
+    state.vm.recover(crate::jobs::now());
     state.tunnels.topology = Default::default();
     state.tunnels.observations.clear();
     state.tunnels.revision = state

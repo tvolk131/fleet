@@ -407,6 +407,84 @@ enum ServiceCommand {
 }
 #[derive(Subcommand)]
 enum InstanceCommand {
+    /// Inspect managed connections and durable guest operations.
+    Inspect {
+        id: String,
+    },
+    /// Replace this VM's connections using an explicit configuration revision.
+    Connections {
+        id: String,
+        config: PathBuf,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// Execute argv inside the VM; no shell is implied. Capture is limited to 8 MiB per stream.
+    Exec {
+        id: String,
+        #[arg(long)]
+        operation: Option<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long, default_value_t = 300)]
+        timeout_seconds: u64,
+        #[arg(long, default_value_t = 604800)]
+        retention_seconds: u64,
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
+    /// Create a guest file, or verify an identical existing file. Never overwrites different contents.
+    Upload {
+        id: String,
+        source: PathBuf,
+        path: String,
+        #[arg(long)]
+        executable: bool,
+        #[arg(long)]
+        operation: Option<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+        #[arg(long, default_value_t = 604800)]
+        retention_seconds: u64,
+    },
+    /// Capture a guest file now; retrieve the immutable result with instance fetch.
+    Download {
+        id: String,
+        path: String,
+        #[arg(long, default_value_t = 1073741824)]
+        max_bytes: u64,
+        #[arg(long)]
+        operation: Option<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+        #[arg(long, default_value_t = 604800)]
+        retention_seconds: u64,
+    },
+    Stage {
+        operation: String,
+    },
+    Fetch {
+        operation: String,
+        destination: PathBuf,
+    },
+    Logs {
+        operation: String,
+        #[arg(long)]
+        stderr: bool,
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+    },
+    Release {
+        operation: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+
     Create {
         id: String,
         #[arg(long)]
@@ -960,6 +1038,120 @@ async fn run(args: Args) -> Result<()> {
             drain: !resume,
         },
         Command::Instance { action } => match action {
+            InstanceCommand::Inspect { id } => ApiRequest::Vm { instance: Some(id) },
+            InstanceCommand::Connections {
+                id,
+                config,
+                revision,
+                request_id: rid,
+            } => ApiRequest::VmManage {
+                request_id: request_id(rid),
+                action: fleet::control::vm::Action::Connections {
+                    instance: id,
+                    expected_revision: revision,
+                    config: serde_json::from_slice(&std::fs::read(config)?)?,
+                },
+            },
+            InstanceCommand::Stage { operation } => ApiRequest::VmStage { id: operation },
+            InstanceCommand::Fetch {
+                operation,
+                destination,
+            } => ApiRequest::VmFetch {
+                id: operation,
+                destination,
+            },
+            InstanceCommand::Logs {
+                operation,
+                stderr,
+                from,
+            } => ApiRequest::VmLogs {
+                id: operation,
+                stderr,
+                from,
+            },
+            InstanceCommand::Release {
+                operation,
+                revision,
+                request_id: rid,
+            } => ApiRequest::VmManage {
+                request_id: request_id(rid),
+                action: fleet::control::vm::Action::Release {
+                    id: operation,
+                    expected_revision: revision,
+                },
+            },
+            InstanceCommand::Exec {
+                id,
+                operation,
+                request_id: rid,
+                cwd,
+                timeout_seconds,
+                retention_seconds,
+                argv,
+            } => {
+                let revision = instance_revision(&client_home, &id).await?;
+                ApiRequest::VmManage {
+                    request_id: request_id(rid),
+                    action: fleet::control::vm::Action::Start {
+                        id: operation.unwrap_or_else(|| request_id(None)),
+                        instance: id,
+                        expected_revision: revision,
+                        spec: fleet::instances::guest::Spec::Exec {
+                            argv,
+                            cwd,
+                            env: Default::default(),
+                            timeout_seconds,
+                        },
+                        retention_seconds,
+                    },
+                }
+            }
+            InstanceCommand::Upload {
+                id,
+                source,
+                path,
+                executable,
+                operation,
+                request_id: rid,
+                retention_seconds,
+            } => {
+                let expected_revision = instance_revision(&client_home, &id).await?;
+                ApiRequest::VmUpload {
+                    request_id: request_id(rid),
+                    id: operation.unwrap_or_else(|| request_id(None)),
+                    instance: id,
+                    expected_revision,
+                    source,
+                    path,
+                    executable,
+                    retention_seconds,
+                }
+            }
+            InstanceCommand::Download {
+                id,
+                path,
+                max_bytes,
+                operation,
+                request_id: rid,
+                retention_seconds,
+            } => {
+                let revision = instance_revision(&client_home, &id).await?;
+                ApiRequest::VmManage {
+                    request_id: request_id(rid),
+                    action: fleet::control::vm::Action::Start {
+                        id: operation.unwrap_or_else(|| request_id(None)),
+                        instance: id,
+                        expected_revision: revision,
+                        spec: fleet::instances::guest::Spec::Download {
+                            path,
+                            max_bytes,
+                            version: None,
+                        },
+                        retention_seconds,
+                    },
+                }
+            }
+
             InstanceCommand::Create {
                 id,
                 worker,
@@ -1034,4 +1226,15 @@ async fn run(args: Args) -> Result<()> {
         "historical request outcome unknown after recovery; not reexecuted"
     );
     Ok(())
+}
+
+async fn instance_revision(home: &std::path::Path, id: &str) -> Result<u64> {
+    client::call(home, ApiRequest::Instances)
+        .await?
+        .as_array()
+        .context("instances")?
+        .iter()
+        .find(|a| a["id"] == id)
+        .and_then(|a| a["revision"].as_u64())
+        .context("unknown persistent VM")
 }

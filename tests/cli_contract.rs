@@ -128,15 +128,17 @@ fn tunnel_cli_distinguishes_committed_policy_from_confirmed_enforcement() -> Res
         l.request(json!({"op":"tunnels"}))?["revision"] == 0,
         "initial catalog"
     );
-    l.request(json!({"op":"prepare_version","request_id":"tunnel-prepare","expected_revision":0,"target":fleet::control::tunnels::GENERATION}))?;
-    wait(
-        || l.request(json!({"op":"versions"})),
-        |v| v["version"]["pending"]["ready"] == json!([1]),
-        10,
-    )?;
-    l.request(
-        json!({"op":"activate_version","request_id":"tunnel-activate","expected_revision":1}),
-    )?;
+    if fleet::control::version::MIN < fleet::control::tunnels::GENERATION {
+        l.request(json!({"op":"prepare_version","request_id":"tunnel-prepare","expected_revision":0,"target":fleet::control::tunnels::GENERATION}))?;
+        wait(
+            || l.request(json!({"op":"versions"})),
+            |v| v["version"]["pending"]["ready"] == json!([1]),
+            10,
+        )?;
+        l.request(
+            json!({"op":"activate_version","request_id":"tunnel-activate","expected_revision":1}),
+        )?;
+    }
     let port = std::net::UdpSocket::bind("127.0.0.1:0")?;
     save(
         &l.root.join("network.json"),

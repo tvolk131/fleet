@@ -8,6 +8,9 @@ use tokio::{
 };
 
 async fn activate(c: &mut Cluster) {
+    if c.client.read(WAIT).await.unwrap().version.active >= tunnels::GENERATION {
+        return;
+    }
     assert_eq!(
         c.client
             .write(
@@ -328,7 +331,11 @@ async fn wait_reports_failure_timeout_success_scope_and_supersession_without_mut
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tunnel_catalog_is_gated_replicated_and_not_writable_by_adapters() {
     let mut c = Cluster::new(3).await;
-    let request = replace(Topology::default(), 0);
+    let request = Request {
+        origin: "cluster".into(),
+        id: "too-early-managed-vm".into(),
+        mutation: Mutation::Vm(fleet::control::vm::Action::Sweep { as_of: 1 }),
+    };
     assert!(
         c.client
             .write(request.clone(), WAIT)
@@ -344,10 +351,7 @@ async fn tunnel_catalog_is_gated_replicated_and_not_writable_by_adapters() {
             .unwrap()
             .receipts
             .values()
-            .any(|r| r
-                .command
-                .as_ref()
-                .is_some_and(|v| v.get("ReplaceTunnels").is_some()))
+            .any(|r| r.command.as_ref().is_some_and(|v| v.get("Vm").is_some()))
     );
     activate(&mut c).await;
     let adapter = descriptor(&c, "test-adapter").await;
@@ -413,16 +417,19 @@ async fn adapter_restart_and_controller_outage_preserve_durable_routes_then_revo
         loop {
             let (mut stream, _) = server.accept().await.unwrap();
             tokio::spawn(async move {
-                let mut bytes = Vec::new();
-                stream.read_to_end(&mut bytes).await.unwrap();
-                let _ = stream.write_all(&bytes).await;
+                let mut bytes = [0u8; 4096];
+                while let Ok(n) = stream.read(&mut bytes).await {
+                    if n == 0 || stream.write_all(&bytes[..n]).await.is_err() {
+                        break;
+                    }
+                }
             });
         }
     });
     let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listen = reserve.local_addr().unwrap();
     drop(reserve);
-    let topology = Topology {
+    let mut topology = Topology {
         adapters: BTreeMap::from([("a".into(), a), ("b".into(), b)]),
         services: BTreeMap::from([(
             "echo".into(),
@@ -439,7 +446,10 @@ async fn adapter_restart_and_controller_outage_preserve_durable_routes_then_revo
         }],
     };
     assert_eq!(
-        c.client.write(replace(topology, 0), WAIT).await.unwrap(),
+        c.client
+            .write(replace(topology.clone(), 0), WAIT)
+            .await
+            .unwrap(),
         Reply::Recorded
     );
     let mut a = Agent::start(&c.home.0.join("a")).await.unwrap();
@@ -447,6 +457,44 @@ async fn adapter_restart_and_controller_outage_preserve_durable_routes_then_revo
     a.tick().await.unwrap();
     b.tick().await.unwrap();
     echo(listen).await;
+    // An unrelated adapter changes the global catalog revision, but neither
+    // participant's filtered permissions. An established TCP stream must survive.
+    let mut live = TcpStream::connect(listen).await.unwrap();
+    live.write_all(b"before").await.unwrap();
+    let mut before = [0u8; 6];
+    live.read_exact(&mut before).await.unwrap();
+    assert_eq!(&before, b"before");
+    topology
+        .adapters
+        .insert("unrelated".into(), descriptor(&c, "unrelated").await);
+    assert_eq!(
+        c.client.write(replace(topology, 1), WAIT).await.unwrap(),
+        Reply::Recorded
+    );
+    let until = tokio::time::Instant::now() + WAIT;
+    loop {
+        a.tick().await.unwrap();
+        b.tick().await.unwrap();
+        let current = status(&mut c).await;
+        if current
+            .adapters
+            .iter()
+            .filter(|r| r.adapter == "a" || r.adapter == "b")
+            .all(|r| r.fresh && r.state == "applied")
+        {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < until);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    live.write_all(b"after!").await.unwrap();
+    let mut after = [0u8; 6];
+    tokio::time::timeout(WAIT, live.read_exact(&mut after))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&after, b"after!");
+    drop(live);
     c.replicas.remove(&1).unwrap().shutdown().await.unwrap();
     a.shutdown().await;
     let mut a = Agent::start(&c.home.0.join("a")).await.unwrap();
@@ -457,7 +505,7 @@ async fn adapter_restart_and_controller_outage_preserve_durable_routes_then_revo
     c.start(1).await;
     assert_eq!(
         c.client
-            .write(replace(Topology::default(), 1), WAIT)
+            .write(replace(Topology::default(), 2), WAIT)
             .await
             .unwrap(),
         Reply::Recorded
@@ -474,7 +522,7 @@ async fn adapter_restart_and_controller_outage_preserve_durable_routes_then_revo
     echo_server.abort();
     let cached: tunnels::View =
         serde_json::from_slice(&std::fs::read(c.home.0.join("a/policy.json")).unwrap()).unwrap();
-    assert_eq!(cached.revision, 2);
+    assert_eq!(cached.revision, 3);
     assert_eq!(cached.topology, Topology::default());
     c.close().await;
 }

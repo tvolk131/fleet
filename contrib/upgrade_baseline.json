@@ -1,5 +1,5 @@
 {
-  "revision": "e4cb80077d3a1e743a8b9b4aec2f39964a393c8d",
-  "generation": 2,
-  "description": "Previous 1..2 binary, activated to generation two before installing the 2..3 service-tunnel candidate."
+  "revision": "2c009f58dde89fc19ea3274949da1070417fb5df",
+  "generation": 3,
+  "description": "Previous 2..3 release, activated to generation three before installing the 3..4 managed VM candidate."
 }

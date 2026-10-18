@@ -574,15 +574,21 @@ pub fn build(output_dir: &Path) -> Result<()> {
         let file = future.join("src/control/version.rs");
         let source = fs::read_to_string(&file)?;
         ensure!(
-            source.contains("pub const MIN: u32 = 2;")
-                && source.contains("pub const MAX: u32 = 3;"),
+            source.contains(&format!("pub const MIN: u32 = {BASE};"))
+                && source.contains(&format!("pub const MAX: u32 = {NEXT};")),
             "update unsupported build fixture for new baseline"
         );
         fs::write(
             file,
             source
-                .replace("pub const MIN: u32 = 2;", "pub const MIN: u32 = 4;")
-                .replace("pub const MAX: u32 = 3;", "pub const MAX: u32 = 5;"),
+                .replace(
+                    &format!("pub const MIN: u32 = {BASE};"),
+                    &format!("pub const MIN: u32 = {};", NEXT + 1),
+                )
+                .replace(
+                    &format!("pub const MAX: u32 = {NEXT};"),
+                    &format!("pub const MAX: u32 = {};", NEXT + 2),
+                ),
         )?;
         build_one(&future, "fleet-unsupported", false)?;
         build_one(&root, "fleet-candidate", true)?;

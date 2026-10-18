@@ -51,7 +51,7 @@ an unknown outcome; create a fresh request only when you intend new work.
 Jobs support worker selection, required capability tags, priority, successful-job dependencies, CPU/RAM
 admission, native exclusive GPU reservations, VM GPU policies, logs, progress probes, and verified
 intermediate/final outputs. Native jobs are trusted host processes. Tart jobs run inside disposable
-macOS VMs and can explicitly suspend at an application checkpoint and resume in a new VM under the same job ID; persistent VMs expose create/start/stop/delete. Tart's CPU/GPU sharing limitations and offline
+macOS VMs and can explicitly suspend at an application checkpoint and resume in a new VM under the same job ID; persistent VMs expose lifecycle, private service connections, durable guest commands and regular-file transfers. Tart's CPU/GPU sharing limitations and offline
 or public-internet-only networking policies remain unchanged.
 
 - [Artifact backups, restore, retention, and storage roles](docs/ARTIFACT_STORAGE.md)
@@ -65,6 +65,7 @@ or public-internet-only networking policies remain unchanged.
 - [Direct LAN deployment qualification](docs/CONTROL_PLANE_NETWORKING.md)
 - [Worker execution and Tart guarantees](docs/CONTROL_PLANE_WORKERS.md)
 - [Authenticated service tunnels and Garage](docs/SERVICE_TUNNELS.md)
+- [Managed VM networking, commands and file transfers](docs/MANAGED_VMS.md)
 - [Private named services for Tart VMs](docs/VM_SERVICE_NETWORKING.md)
 - [Current regression coverage](docs/TEST_COVERAGE.md)
 

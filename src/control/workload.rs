@@ -148,6 +148,10 @@ pub struct Report {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerView {
+    #[serde(default)]
+    pub vm: super::vm::Catalog,
+    #[serde(default)]
+    pub generation: u32,
     pub history: BTreeMap<String, BTreeMap<crate::history::Stream, super::history::Progress>>,
     pub artifacts: Vec<super::artifact::Artifact>,
     pub stores: BTreeMap<String, super::artifact::Registration>,
@@ -552,7 +556,18 @@ impl State {
             return Reply::rejected(&e.to_string());
         }
         let revision = candidate.revision;
-        self.assignments.insert(id.into(), candidate);
+        let old = self
+            .assignments
+            .insert(id.into(), candidate)
+            .expect("known assignment");
+        if self.version.active >= super::vm::GENERATION
+            && desired.terminating()
+            && let Err(e) = self.refresh_vm_topology()
+        {
+            // Removing an endpoint only shrinks the compiled topology.
+            self.assignments.insert(id.into(), old);
+            return Reply::rejected(&format!("VM network reconciliation: {e}"));
+        }
         if let Some(recovery) = &mut self.recovery {
             recovery.held.remove(id);
         }

@@ -1,9 +1,8 @@
 # Internal guest operations
 
 Tart's guest channel supplies the execution and file-transfer backend for [VM jobs](VM_JOBS.md).
-It works for offline guests without granting host shares or application-network access. The current
-public Fleet client exposes persistent-instance lifecycle, but does not expose arbitrary persistent-guest
-commands, uploads, downloads or interactive shells. The retired CLI commands for those operations are removed.
+It works for offline guests without granting host shares or application-network access. Persistent instances expose durable commands and regular-file uploads/downloads through the replicated
+[managed VM API](MANAGED_VMS.md). Interactive shells are not provided.
 
 The internal backend retains durable operation IDs, immutable request specifications, readiness probes,
 argv/environment execution without an implicit host shell, regular-file transfers, and bounded log reads.
@@ -12,5 +11,5 @@ symlinks, path escapes, malformed manifests and unsafe guest output are rejected
 operations to stage inputs, sample metrics, capture outputs and checkpoints, and perform cleanup.
 
 Backend regression coverage remains in `tests/instances/guest.rs`; end-to-end workload coverage uses
-the replicated control-plane/worker interfaces. Exposing these operations publicly again would require
-a separate control-plane operation/authorization design, rather than restoring the retired direct-agent CLI.
+the replicated control-plane/worker interfaces. Public operations use generation-4 committed intent, worker capability checks, immutable target bindings and
+bounded worker-local result retention. They do not restore the retired direct-agent CLI.

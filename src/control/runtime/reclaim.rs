@@ -18,6 +18,17 @@ impl Worker {
         {
             candidates.extend(a.manifest.files.iter().map(|f| f.hash));
         }
+        for op in saved
+            .vm
+            .operations
+            .values()
+            .filter(|o| o.released && o.reclaimed)
+        {
+            candidates.extend(op.outcome.files.values().map(|f| f.hash));
+            if let instances::guest::Spec::Upload { hash, .. } = &op.spec {
+                candidates.insert(*hash);
+            }
+        }
         let mut protected = HashSet::new();
         // Include uncommitted local publications, shared hashes, and in-flight resume inputs.
         for m in saved

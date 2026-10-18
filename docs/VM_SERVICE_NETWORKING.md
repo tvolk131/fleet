@@ -32,6 +32,12 @@ an explicitly attached VM can additionally use its granted service channels.
 `public_internet` retains its existing LAN/host restrictions. For no application
 connectivity, use `offline` without a service attachment.
 
+## Worker-managed attachments
+
+Use [managed VM connections](MANAGED_VMS.md) for normal persistent VMs. The worker creates and runs
+their adapters automatically. The procedure below remains the low-level manual attachment interface
+for operators and transport qualification; do not attach both mechanisms to one VM.
+
 ## Prepare and operate
 
 Create a persistent instance normally, then prepare an adapter on its worker.

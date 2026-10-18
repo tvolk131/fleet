@@ -575,6 +575,7 @@ impl Handler {
             Message::Write(request)
                 if is_admin
                     || matches!(&request.mutation, super::Mutation::ReplicaPrepared {node, ..} if peers.get(node).is_some_and(|p|p.identity==peer))
+                    || matches!(&request.mutation, super::Mutation::VmReport(r) if self.store.state().await.ok().is_some_and(|s| s.vm_reporter(&peer.to_string(),r)))
                     || matches!(&request.mutation, super::Mutation::HistoryReport(r) if self.store.state().await.ok().is_some_and(|s| s.history_reporter(&peer.to_string(),r)))
                     || matches!(&request.mutation,
                 super::Mutation::WorkerReport(report) if self.store.state().await.ok().and_then(|s| s.workers.get(&report.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == report.incarnation))
@@ -639,7 +640,19 @@ impl Handler {
                     .lock()
                     .expect("presence")
                     .insert(worker.clone(), std::time::Instant::now());
+                let mut vm = state.vm.clone();
+                vm.operations.retain(|_, op| op.worker == worker);
+                vm.networks.retain(|id, _| {
+                    state
+                        .assignments
+                        .get(id)
+                        .is_some_and(|a| a.worker == worker)
+                });
+                vm.bindings.retain(|_, b| b.worker == worker);
+                vm.hosts = None;
                 Answer::WorkerRead(Ok(super::workload::WorkerView {
+                    vm,
+                    generation: state.version.active,
                     history: state
                         .history
                         .attempts

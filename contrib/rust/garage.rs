@@ -371,13 +371,15 @@ pub fn run(options: Options) -> Result<()> {
         |v| v["version"]["active"] == fleet::control::version::MIN,
         60,
     )?;
-    lab.api(json!({"op":"prepare_version","request_id":"prepare","expected_revision":0,"target":fleet::control::tunnels::GENERATION}))?;
-    wait(
-        || lab.api(json!({"op":"versions"})),
-        |v| v["version"]["pending"]["ready"] == json!([1]),
-        60,
-    )?;
-    lab.api(json!({"op":"activate_version","request_id":"activate","expected_revision":1}))?;
+    if fleet::control::version::MIN < fleet::control::tunnels::GENERATION {
+        lab.api(json!({"op":"prepare_version","request_id":"prepare","expected_revision":0,"target":fleet::control::tunnels::GENERATION}))?;
+        wait(
+            || lab.api(json!({"op":"versions"})),
+            |v| v["version"]["pending"]["ready"] == json!([1]),
+            60,
+        )?;
+        lab.api(json!({"op":"activate_version","request_id":"activate","expected_revision":1}))?;
+    }
     let mut topology = json!({"adapters":{},"services":{},"routes":[]});
     for (n, ip) in ips.iter().enumerate() {
         let id = format!("node-{n}");

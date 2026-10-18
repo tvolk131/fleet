@@ -415,6 +415,25 @@ pub fn spawn(raft: Raft, store: Store, presence: Presence) -> tokio::task::JoinH
                     })
                     .await?;
                 }
+                if state.version.active >= super::vm::GENERATION
+                    && state.vm.operations.values().any(|o| {
+                        !o.released
+                            && o.outcome.phase.terminal()
+                            && o.outcome
+                                .finished_at
+                                .is_some_and(|t| t.saturating_add(o.retention_seconds) <= now)
+                    })
+                {
+                    raft.client_write(Command {
+                        principal: "vm-maintenance".into(),
+                        request: Request {
+                            origin: state.cluster.clone(),
+                            id: format!("vm-sweep-{now}"),
+                            mutation: Mutation::Vm(super::vm::Action::Sweep { as_of: now }),
+                        },
+                    })
+                    .await?;
+                }
                 let live: BTreeSet<_> = presence
                     .lock()
                     .expect("presence")
