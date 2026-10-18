@@ -9,6 +9,7 @@ use std::{
 };
 
 pub mod agent;
+pub mod attachment;
 pub mod cli;
 pub mod status;
 pub mod transport;

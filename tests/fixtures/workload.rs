@@ -3,7 +3,7 @@ use anyhow::{Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::Path,
     sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
@@ -73,6 +73,73 @@ fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = args.first().map(String::as_str).unwrap_or("checkpoint");
     match mode {
+        "service-echo" => {
+            let listener = std::net::TcpListener::bind(&args[1])?;
+            listener.set_nonblocking(true)?;
+            println!("service-ready");
+            let deadline = Instant::now() + Duration::from_secs(600);
+            let active = std::sync::Arc::new(AtomicUsize::new(0));
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        // Darwin inherits O_NONBLOCK from the listening socket.
+                        // The fixture uses blocking copy with explicit timeouts.
+                        socket.set_nonblocking(false)?;
+                        if active.load(Ordering::SeqCst) >= 64 {
+                            continue;
+                        }
+                        active.fetch_add(1, Ordering::SeqCst);
+                        let active = active.clone();
+                        std::thread::spawn(move || {
+                            let _ = socket.set_read_timeout(Some(Duration::from_secs(60)));
+                            let _ = socket.set_write_timeout(Some(Duration::from_secs(60)));
+                            if let Ok(mut read) = socket.try_clone() {
+                                let _ = std::io::copy(&mut read, &mut socket);
+                            }
+                            active.fetch_sub(1, Ordering::SeqCst);
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => sleep(10),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        "service-roundtrip" | "service-denied" => {
+            let address = args[1].parse()?;
+            let result = (|| -> Result<()> {
+                let mut socket =
+                    std::net::TcpStream::connect_timeout(&address, Duration::from_secs(3))?;
+                socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+                socket.set_write_timeout(Some(Duration::from_secs(10)))?;
+                let mut write = socket.try_clone()?;
+                let expected = vec![0x81; 1024 * 1024];
+                let data = expected.clone();
+                let task = std::thread::spawn(move || -> std::io::Result<()> {
+                    write.write_all(&data)?;
+                    write.shutdown(std::net::Shutdown::Write)
+                });
+                let mut received = Vec::new();
+                let read_result = (&mut socket)
+                    .take(2 * 1024 * 1024)
+                    .read_to_end(&mut received);
+                let write_result = task.join().expect("writer panic");
+                read_result?;
+                write_result?;
+                ensure!(
+                    received == expected,
+                    "echo bytes differ: expected {}, received {}",
+                    expected.len(),
+                    received.len()
+                );
+                Ok(())
+            })();
+            if mode == "service-roundtrip" {
+                result?;
+            } else {
+                ensure!(result.is_err(), "unauthorized service succeeded");
+            }
+            println!("verified {mode}");
+        }
         "graceful" | "stubborn" | "descendant" => {
             if mode == "descendant" {
                 let pid = unsafe { libc::fork() };

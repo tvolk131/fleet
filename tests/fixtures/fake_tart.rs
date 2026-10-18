@@ -208,6 +208,15 @@ fn run() -> Result<()> {
                     "guest helper disappeared after reboot"
                 );
             }
+            if args.get(4).is_some_and(|arg| arg == "--services") {
+                let error = Command::new(helper)
+                    .args([
+                        "--services",
+                        args.last().context("service configuration required")?,
+                    ])
+                    .exec();
+                return Err(error.into());
+            }
             let mut request: Value =
                 serde_json::from_str(args.last().context("request required")?)?;
             if legacy && request["kind"] == "ready" {

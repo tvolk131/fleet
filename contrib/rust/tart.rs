@@ -42,7 +42,7 @@ pub fn rolling_reclaimed(status: &Value, input_bytes: u64) -> bool {
             })
     })
 }
-fn real_guard(a: &Options) -> Result<()> {
+pub(super) fn real_guard(a: &Options) -> Result<()> {
     if a.fake {
         return Ok(());
     }
@@ -92,7 +92,7 @@ fn real_guard(a: &Options) -> Result<()> {
     }
     Ok(())
 }
-fn settings(l: &Lab, a: &Options) -> Result<Value> {
+pub(super) fn settings(l: &Lab, a: &Options) -> Result<Value> {
     let mut s = if a.fake {
         fs::write(
             l.root.join("softnet"),
@@ -108,7 +108,7 @@ fn settings(l: &Lab, a: &Options) -> Result<Value> {
     s["min_free_disk_gb"] = 5.into();
     Ok(s)
 }
-fn worker(l: &Lab, a: &Options, id: &str, settings: &Value) -> Result<()> {
+pub(super) fn worker(l: &Lab, a: &Options, id: &str, settings: &Value) -> Result<()> {
     save(&l.root.join(format!("{id}-instances.json")), settings)?;
     l.cli(&[
         "cluster",
@@ -120,11 +120,7 @@ fn worker(l: &Lab, a: &Options, id: &str, settings: &Value) -> Result<()> {
         "--id",
         id,
         "--cpu-slots",
-        if a.fake && settings["memory_budget_mb"] != 8192 {
-            "1"
-        } else {
-            "4"
-        },
+        if a.fake { "1" } else { "4" },
         "--memory-mb",
         &settings["memory_budget_mb"].to_string(),
         "--instances",
@@ -180,7 +176,7 @@ fn storage(l: &Lab, id: &str) -> Result<()> {
     ])?;
     Ok(())
 }
-fn enroll(l: &Lab, id: &str, store: bool) -> Result<()> {
+pub(super) fn enroll(l: &Lab, id: &str, store: bool) -> Result<()> {
     let mut args = vec!["--home".into(), l.s("client")];
     if store {
         args.push("storage".into());

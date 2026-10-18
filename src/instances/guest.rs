@@ -431,7 +431,7 @@ fn channel(home: &Path, id: &str) -> Result<Command> {
     Ok(cmd)
 }
 
-fn command(home: &Path, id: &str) -> Result<Command> {
+pub(crate) fn command(home: &Path, id: &str) -> Result<Command> {
     let path = helper_guest_path()?;
     let base = directory(home, id)?;
     let revision = info(home, id)?.record.revision;

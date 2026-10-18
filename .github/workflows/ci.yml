@@ -54,6 +54,11 @@ jobs:
             --home /tmp/fleet-control-garage-ci 2>&1 | tee garage-tunnels.log
       - name: Build real previous/candidate executables and incompatible fixture
         run: target/debug/fleet-qualify build-upgrade-fixtures --output /tmp/fleet-upgrade-binaries 2>&1 | tee upgrade-builds.log
+      - name: VM service attachments, permissions, revocation and cached-policy restarts
+        run: |
+          target/debug/fleet-qualify vm-services --fake --binary "$PWD/target/debug/fleet" \
+            --baseline-binary /tmp/fleet-upgrade-binaries/fleet-service-baseline \
+            --home /tmp/fleet-control-vm-services-ci 2>&1 | tee vm-services.log
       - name: Rolling upgrades, live work, rollback and incompatible-version refusal
         run: |
           target/debug/fleet-qualify rolling-upgrade --baseline /tmp/fleet-upgrade-binaries/fleet-baseline \
@@ -100,6 +105,9 @@ jobs:
           fi
           if [ -f /tmp/fleet-control-garage-ci/result.json ]; then
             cp /tmp/fleet-control-garage-ci/result.json ci-evidence/garage-tunnels.json
+          fi
+          if [ -f /tmp/fleet-control-vm-services-ci/qualification.json ]; then
+            cp /tmp/fleet-control-vm-services-ci/qualification.json ci-evidence/vm-services.json
           fi
           # Never upload fixture homes: they contain private identity keys and databases.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

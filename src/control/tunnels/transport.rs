@@ -1,4 +1,5 @@
 //! One TCP connection per authenticated QUIC connection; no byte replay on failure.
+use super::attachment::{Attachment, Guest};
 use super::status::TransportStatus;
 use super::{Topology, View};
 use anyhow::{Context, Result, ensure};
@@ -9,7 +10,7 @@ use iroh::{
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{Semaphore, watch},
     task::JoinSet,
@@ -76,13 +77,40 @@ impl Drop for Close {
     }
 }
 
+trait Socket: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Socket for T {}
+type LocalStream = Box<dyn Socket>;
+#[derive(Clone)]
+enum Connector {
+    Host,
+    Guest {
+        handle: fleet_guest::tunnel::Handle,
+        targets: std::collections::BTreeMap<String, u32>,
+    },
+}
+impl Connector {
+    async fn connect(&self, id: &str, address: SocketAddr) -> Result<LocalStream> {
+        match self {
+            Self::Host => {
+                let tcp = TcpStream::connect(address).await?;
+                tcp.set_nodelay(true)?;
+                Ok(Box::new(tcp))
+            }
+            Self::Guest { handle, targets } => Ok(Box::new(
+                handle
+                    .open(*targets.get(id).context("unbound guest service")?)
+                    .await?,
+            )),
+        }
+    }
+}
+
 async fn bridge(
-    tcp: TcpStream,
+    tcp: LocalStream,
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
 ) -> Result<()> {
-    tcp.set_nodelay(true)?;
-    let (mut read, mut write) = tcp.into_split();
+    let (mut read, mut write) = tokio::io::split(tcp);
     // copy uses fixed buffers and awaits backpressure. Each direction independently
     // propagates EOF; receiving a FIN must not truncate the response direction.
     tokio::try_join!(
@@ -102,7 +130,7 @@ async fn bridge(
     Ok(())
 }
 
-async fn incoming(connection: Connection, view: Arc<View>) -> Result<()> {
+async fn incoming(connection: Connection, view: Arc<View>, connector: Connector) -> Result<()> {
     let connection = Close(connection);
     let peer = connection.0.remote_id();
     let (tcp, send, recv) = tokio::time::timeout(HANDSHAKE, async {
@@ -127,7 +155,7 @@ async fn incoming(connection: Connection, view: Arc<View>) -> Result<()> {
                     .is_some_and(|a| a.endpoint.id == peer)),
             "service access denied"
         );
-        let tcp = TcpStream::connect(service.target).await?;
+        let tcp = connector.connect(&hello.service, service.target).await?;
         send.write_all(&[1]).await?;
         Ok::<_, anyhow::Error>((tcp, send, recv))
     })
@@ -137,7 +165,7 @@ async fn incoming(connection: Connection, view: Arc<View>) -> Result<()> {
 
 async fn outgoing(
     endpoint: Endpoint,
-    tcp: TcpStream,
+    tcp: LocalStream,
     view: Arc<View>,
     service_id: String,
 ) -> Result<()> {
@@ -192,19 +220,81 @@ struct Session {
     slots: Arc<Semaphore>,
     tasks: JoinSet<Result<()>>,
     listeners: JoinSet<Result<()>>,
-    rx: tokio::sync::mpsc::Receiver<(TcpStream, String)>,
-    _tx: tokio::sync::mpsc::Sender<(TcpStream, String)>,
+    rx: tokio::sync::mpsc::Receiver<(LocalStream, String)>,
+    _tx: tokio::sync::mpsc::Sender<(LocalStream, String)>,
+    connector: Connector,
+    guest: Option<Guest>,
 }
 impl Session {
-    async fn bind(endpoint: Endpoint, view: View) -> Result<Self> {
+    async fn bind(endpoint: Endpoint, view: View, attachment: &Attachment) -> Result<Self> {
         view.topology.validate()?;
         let view = Arc::new(view);
         let slots = Arc::new(Semaphore::new(MAX_STREAMS));
         let tasks = JoinSet::new();
         let mut listeners = JoinSet::new();
+        let (tx, rx) = tokio::sync::mpsc::channel::<(LocalStream, String)>(1);
+        let mut guest = None;
+        let mut connector = Connector::Host;
+        for route in &view.topology.routes {
+            ensure!(
+                route.adapter == view.adapter,
+                "foreign route in adapter view"
+            );
+        }
+        if !attachment.is_host() && view.topology.adapters.contains_key(&view.adapter) {
+            let mut vm = attachment.start(&view).await?;
+            connector = Connector::Guest {
+                handle: vm.handle.clone(),
+                targets: vm.targets.clone(),
+            };
+            let (channel, read, write) = vm.channel.take().expect("new channel");
+            listeners.spawn(channel.run(read, write));
+            let stderr = vm.stderr.take().expect("new stderr");
+            listeners.spawn(async move {
+                let mut bytes = Vec::new();
+                let mut stderr = stderr.take(1024);
+                loop {
+                    let mut chunk = [0; 128];
+                    let n = stderr.read(&mut chunk).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                let detail: String = String::from_utf8_lossy(&bytes)
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(128)
+                    .collect();
+                tracing::debug!(%detail,"guest service helper stopped");
+                anyhow::bail!("guest service helper stopped: {detail}")
+            });
+            listeners.spawn(Guest::monitor(
+                vm.attachment.clone(),
+                vm.cluster.clone(),
+                vm.revision,
+            ));
+            let mut inbound = vm.incoming.take().expect("new receiver");
+            let routes = vm.routes.clone();
+            let tx = tx.clone();
+            listeners.spawn(async move {
+                while let Some((index, stream)) = inbound.recv().await {
+                    let service = routes
+                        .get(index as usize)
+                        .context("unbound guest route")?
+                        .clone();
+                    match tx.try_send((Box::new(stream), service)) {
+                        Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => (),
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                    }
+                }
+                anyhow::bail!("guest route channel stopped")
+            });
+            guest = Some(vm);
+        }
         // Bind the entire policy before accepting traffic. A collision fails closed.
         let mut bound = Vec::new();
-        for route in &view.topology.routes {
+        for route in view.topology.routes.iter().filter(|_| attachment.is_host()) {
             ensure!(
                 route.adapter == view.adapter,
                 "foreign route in adapter view"
@@ -214,14 +304,14 @@ impl Session {
                 route.service.clone(),
             ));
         }
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
         for (listener, service) in bound {
             let tx = tx.clone();
             listeners.spawn(async move {
                 loop {
                     let (socket, _) = listener.accept().await?;
+                    socket.set_nodelay(true)?;
                     // Never accumulate an unbounded queue of accepted local sockets.
-                    match tx.try_send((socket, service.clone())) {
+                    match tx.try_send((Box::new(socket) as LocalStream, service.clone())) {
                         Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                     }
@@ -238,6 +328,8 @@ impl Session {
             listeners,
             rx,
             _tx: tx,
+            connector,
+            guest,
         })
     }
     async fn serve(&mut self) -> Result<()> {
@@ -248,6 +340,7 @@ impl Session {
             tasks,
             listeners,
             rx,
+            connector,
             ..
         } = self;
         loop {
@@ -263,6 +356,7 @@ impl Session {
                 Some(incoming_conn) = endpoint.accept() => {
                     let Ok(permit) = slots.clone().try_acquire_owned() else { incoming_conn.refuse(); continue; };
                     let view = view.clone();
+                    let connector = connector.clone();
                     tasks.spawn(async move {
                         let _permit = permit;
                         let conn = tokio::time::timeout(HANDSHAKE, incoming_conn).await??;
@@ -270,7 +364,7 @@ impl Session {
                             conn.close(1u32.into(), b"unauthorized adapter");
                             return Ok(());
                         }
-                        incoming(conn, view).await
+                        incoming(conn, view, connector).await
                     });
                 }
                 Some((tcp, service)) = rx.recv() => {
@@ -292,6 +386,9 @@ impl Session {
         // replacement, so no task holding an old permission/socket remains alive.
         while self.listeners.join_next().await.is_some() {}
         while self.tasks.join_next().await.is_some() {}
+        if let Some(guest) = &mut self.guest {
+            guest.shutdown().await;
+        }
     }
 }
 
@@ -302,15 +399,23 @@ pub async fn run(endpoint: Endpoint, policies: watch::Receiver<View>) {
 
 pub async fn run_observed(
     endpoint: Endpoint,
+    policies: watch::Receiver<View>,
+    status: watch::Sender<TransportStatus>,
+) {
+    run_attached(endpoint, policies, status, Attachment::Host).await;
+}
+pub async fn run_attached(
+    endpoint: Endpoint,
     mut policies: watch::Receiver<View>,
     status: watch::Sender<TransportStatus>,
+    attachment: Attachment,
 ) {
     loop {
         let view = policies.borrow_and_update().clone();
         let revision = view.revision;
         status.send_replace(TransportStatus::Applying { revision });
         let binding = tokio::select! {
-            result = Session::bind(endpoint.clone(), view) => result,
+            result = Session::bind(endpoint.clone(), view, &attachment) => result,
             changed = policies.changed() => { if changed.is_err() { break; } else { continue; } }
         };
         let error = match binding {

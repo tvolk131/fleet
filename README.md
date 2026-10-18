@@ -65,6 +65,7 @@ or public-internet-only networking policies remain unchanged.
 - [Direct LAN deployment qualification](docs/CONTROL_PLANE_NETWORKING.md)
 - [Worker execution and Tart guarantees](docs/CONTROL_PLANE_WORKERS.md)
 - [Authenticated service tunnels and Garage](docs/SERVICE_TUNNELS.md)
+- [Private named services for Tart VMs](docs/VM_SERVICE_NETWORKING.md)
 - [Current regression coverage](docs/TEST_COVERAGE.md)
 
 Testing: `cargo test --workspace --all-features --locked`;
