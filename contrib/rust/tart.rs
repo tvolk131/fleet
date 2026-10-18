@@ -120,11 +120,7 @@ pub(super) fn worker(l: &Lab, a: &Options, id: &str, settings: &Value) -> Result
         "--id",
         id,
         "--cpu-slots",
-        if a.fake && settings["memory_budget_mb"] != 8192 {
-            "1"
-        } else {
-            "4"
-        },
+        if a.fake { "1" } else { "4" },
         "--memory-mb",
         &settings["memory_budget_mb"].to_string(),
         "--instances",

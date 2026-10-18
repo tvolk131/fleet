@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use fleet::instances::{self, guest};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -16,9 +16,30 @@ use std::{
 fn port() -> Result<String> {
     Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.to_string())
 }
-fn state(l: &Lab, id: &str, phase: &str) -> Result<Value> {
+struct Vm {
+    id: &'static str,
+    worker: &'static str,
+}
+fn backend(l: &Lab, vm: &Vm) -> std::path::PathBuf {
+    l.root.join(vm.worker).join("backend")
+}
+fn state(l: &mut Lab, id: &str, phase: &str) -> Result<Value> {
     wait(
-        || l.request(json!({"op":"instances"})),
+        || {
+            for (name, process) in &mut l.processes {
+                if name.starts_with("worker")
+                    && let Some(status) = process.child.try_wait()?
+                {
+                    let log =
+                        fs::read_to_string(l.root.join(format!("{name}.log"))).unwrap_or_default();
+                    anyhow::bail!(
+                        "fixture {name} exited ({status}): {}",
+                        log.chars().take(2048).collect::<String>()
+                    );
+                }
+            }
+            l.request(json!({"op":"instances"}))
+        },
         |rows| {
             rows.as_array().is_some_and(|r| {
                 r.iter().any(|r| {
@@ -31,9 +52,9 @@ fn state(l: &Lab, id: &str, phase: &str) -> Result<Value> {
         180,
     )
 }
-fn operation(l: &Lab, id: &str, name: &str, spec: guest::Spec, finish: bool) -> Result<()> {
-    let backend = l.root.join("worker/backend");
-    let vm = format!("vm-{id}");
+fn operation(l: &Lab, vm: &Vm, name: &str, spec: guest::Spec, finish: bool) -> Result<()> {
+    let backend = backend(l, vm);
+    let vm = format!("vm-{}", vm.id);
     let revision = instances::info(&backend, &vm)?.record.revision;
     guest::start(&backend, &vm, name, revision, spec, &l.binary)?;
     if finish {
@@ -58,29 +79,29 @@ fn operation(l: &Lab, id: &str, name: &str, spec: guest::Spec, finish: bool) -> 
 fn executable(l: &Lab, id: &str) -> String {
     l.s(&format!("guest-{id}/workload"))
 }
-fn upload(l: &Lab, id: &str, name: &str) -> Result<()> {
+fn upload(l: &Lab, vm: &Vm, name: &str) -> Result<()> {
     // Tart reports a running hypervisor before the guest agent has booted.
     // Only this side-effect-free readiness probe is retried, never the upload.
     wait(
         || {
             Ok(serde_json::to_value(guest::readiness(
-                &l.root.join("worker/backend"),
-                &format!("vm-{id}"),
+                &backend(l, vm),
+                &format!("vm-{}", vm.id),
             )?)?)
         },
         |r| r["ready"] == true,
         180,
     )?;
     let bytes = fs::read(l.root.join("fleet-test-workload"))?;
-    let dir = guest::operation_dir(&l.root.join("worker/backend"), &format!("vm-{id}"), name)?;
+    let dir = guest::operation_dir(&backend(l, vm), &format!("vm-{}", vm.id), name)?;
     fs::create_dir_all(&dir)?;
     fs::write(dir.join("input"), &bytes)?;
     operation(
         l,
-        id,
+        vm,
         name,
         guest::Spec::Upload {
-            path: executable(l, id),
+            path: executable(l, vm.id),
             hash: iroh_blobs::Hash::new(&bytes),
             size: bytes.len() as u64,
             sha256: digest(&l.root.join("fleet-test-workload"))?,
@@ -89,13 +110,13 @@ fn upload(l: &Lab, id: &str, name: &str) -> Result<()> {
         true,
     )
 }
-fn exec(l: &Lab, id: &str, name: &str, mode: &str, address: &str, finish: bool) -> Result<()> {
+fn exec(l: &Lab, vm: &Vm, name: &str, mode: &str, address: &str, finish: bool) -> Result<()> {
     operation(
         l,
-        id,
+        vm,
         name,
         guest::Spec::Exec {
-            argv: vec![executable(l, id), mode.into(), address.into()],
+            argv: vec![executable(l, vm.id), mode.into(), address.into()],
             cwd: None,
             env: BTreeMap::new(),
             timeout_seconds: if finish { 40 } else { 600 },
@@ -103,8 +124,8 @@ fn exec(l: &Lab, id: &str, name: &str, mode: &str, address: &str, finish: bool) 
         finish,
     )?;
     if mode == "service-echo" && !finish {
-        let path = guest::operation_dir(&l.root.join("worker/backend"), &format!("vm-{id}"), name)?
-            .join("stdout");
+        let path =
+            guest::operation_dir(&backend(l, vm), &format!("vm-{}", vm.id), name)?.join("stdout");
         wait(
             || Ok(json!(fs::read_to_string(&path).unwrap_or_default())),
             |v| v.as_str().is_some_and(|s| s.contains("service-ready")),
@@ -113,8 +134,8 @@ fn exec(l: &Lab, id: &str, name: &str, mode: &str, address: &str, finish: bool) 
     }
     Ok(())
 }
-fn probe(l: &Lab, id: &str, name: &str, address: &str) -> Result<()> {
-    exec(l, id, name, "service-roundtrip", address, true)
+fn probe(l: &Lab, vm: &Vm, name: &str, address: &str) -> Result<()> {
+    exec(l, vm, name, "service-roundtrip", address, true)
 }
 fn confirmed(l: &Lab, revision: u64) -> Result<()> {
     let result =
@@ -156,15 +177,31 @@ pub fn run(a: tart::Options) -> Result<()> {
     )?;
     l.request(json!({"op":"activate_version","request_id":"activate","expected_revision":1}))?;
     let mut settings = tart::settings(&l, &a)?;
-    settings["memory_budget_mb"] = 8192.into();
-    tart::worker(&l, &a, "worker", &settings)?;
-    tart::enroll(&l, "worker", false)?;
-    l.start("worker", None)?;
+    settings["memory_budget_mb"] = if a.fake { 4096 } else { 8192 }.into();
+    // Fake VMs allocate no RAM. Separate small logical workers let CI exercise
+    // their network identities without relaxing real host admission checks.
+    let vms = [
+        Vm {
+            id: "a",
+            worker: if a.fake { "worker-a" } else { "worker" },
+        },
+        Vm {
+            id: "b",
+            worker: if a.fake { "worker-b" } else { "worker" },
+        },
+    ];
+    let [vm_a, vm_b] = &vms;
+    for worker in vms.iter().map(|vm| vm.worker).collect::<BTreeSet<_>>() {
+        tart::worker(&l, &a, worker, &settings)?;
+        tart::enroll(&l, worker, false)?;
+        l.start(worker, None)?;
+    }
     save(
         &l.root.join("vm.json"),
-        &json!({"image":"macos","cpus":2,"memory_mb":4096,"disk_gb":50,"network":"offline","gpu":"shared"}),
+        &json!({"image":"macos","cpus":if a.fake {1} else {2},"memory_mb":4096,"disk_gb":50,"network":"offline","gpu":"shared"}),
     )?;
-    for id in ["a", "b"] {
+    for vm in &vms {
+        let id = vm.id;
         l.instances.push(id.into());
         l.cli(&[
             "--home",
@@ -173,14 +210,14 @@ pub fn run(a: tart::Options) -> Result<()> {
             "create",
             id,
             "--worker",
-            "worker",
+            vm.worker,
             "--spec",
             &l.s("vm.json"),
             "--request-id",
             &format!("create-{id}"),
         ])?;
-        state(&l, id, "Running")?;
-        upload(&l, id, "upload")?;
+        state(&mut l, id, "Running")?;
+        upload(&l, vm, "upload")?;
     }
     let host_target = port()?;
     let a_target = port()?;
@@ -196,8 +233,8 @@ pub fn run(a: tart::Options) -> Result<()> {
         .stderr(Stdio::null())
         .spawn()?;
     l.processes.insert("host-echo".into(), Process { child });
-    exec(&l, "a", "echo", "service-echo", &a_target, false)?;
-    exec(&l, "b", "echo", "service-echo", &b_target, false)?;
+    exec(&l, vm_a, "echo", "service-echo", &a_target, false)?;
+    exec(&l, vm_b, "echo", "service-echo", &b_target, false)?;
     let mut topology = json!({"adapters":{},"services":{
         "host-echo":{"owner":"host","target":host_target,"allowed":["a"]},
         "a-echo":{"owner":"a","target":a_target,"allowed":["b"]},
@@ -227,9 +264,10 @@ pub fn run(a: tart::Options) -> Result<()> {
             l.s(&format!("{id}-network.json")),
         ];
         if id != "host" {
+            let vm = vms.iter().find(|vm| vm.id == id).unwrap();
             args.extend([
                 "--worker-home".into(),
-                l.s("worker"),
+                l.s(vm.worker),
                 "--instance".into(),
                 format!("vm-{id}"),
             ]);
@@ -246,9 +284,9 @@ pub fn run(a: tart::Options) -> Result<()> {
         l.start(&format!("adapter-{id}"), None)?;
     }
     apply(&l, &topology, 0)?;
-    probe(&l, "a", "vm-to-vm", &a_to_b)?;
-    probe(&l, "b", "reverse-vm-to-vm", &b_to_a)?;
-    probe(&l, "a", "vm-to-host", &a_to_host)?;
+    probe(&l, vm_a, "vm-to-vm", &a_to_b)?;
+    probe(&l, vm_b, "reverse-vm-to-vm", &b_to_a)?;
+    probe(&l, vm_a, "vm-to-host", &a_to_host)?;
     let local = output(
         &l.root.join("fleet-test-workload"),
         &["service-roundtrip".into(), host_to_b.clone()],
@@ -263,7 +301,7 @@ pub fn run(a: tart::Options) -> Result<()> {
             TcpListener::bind(&a_to_host).context("VM route leaked a host listener")?;
         exec(
             &l,
-            "b",
+            vm_b,
             "other-vm-port-denied",
             "service-denied",
             &a_to_host,
@@ -272,7 +310,7 @@ pub fn run(a: tart::Options) -> Result<()> {
         // The physical host's service is absent from VM loopback without a grant.
         exec(
             &l,
-            "b",
+            vm_b,
             "host-port-denied",
             "service-denied",
             &host_target,
@@ -312,7 +350,7 @@ pub fn run(a: tart::Options) -> Result<()> {
         "--network",
         &l.s("shadow-network.json"),
         "--worker-home",
-        &l.s("worker"),
+        &l.s(vm_a.worker),
         "--instance",
         "vm-a",
     ])?;
@@ -362,7 +400,7 @@ pub fn run(a: tart::Options) -> Result<()> {
         // Tart may keep the old guest command's stdin open after the host dies.
         // Allow its heartbeat expiry and the replacement adapter's bind retry.
         std::thread::sleep(fleet_guest::tunnel::DEADLINE + Duration::from_secs(5));
-        probe(&l, "a", "cached-policy-restart", &a_to_b)?;
+        probe(&l, vm_a, "cached-policy-restart", &a_to_b)?;
         Ok(())
     })();
     // Restore the fixture controller even on failure so Lab can delete its VMs.
@@ -394,24 +432,24 @@ pub fn run(a: tart::Options) -> Result<()> {
     );
     exec(
         &l,
-        "a",
+        vm_a,
         "revoked-port-denied",
         "service-denied",
         &a_to_b,
         true,
     )?;
-    probe(&l, "a", "other-service-still-allowed", &a_to_host)?;
+    probe(&l, vm_a, "other-service-still-allowed", &a_to_host)?;
     l.phase("confirmed_revocation_closes_existing_connections_and_unbinds_route");
     let conflict = port()?;
     exec(
         &l,
-        "a",
+        vm_a,
         "conflicting-listener",
         "service-echo",
         &conflict,
         false,
     )?;
-    probe(&l, "a", "conflict-ready", &conflict)?;
+    probe(&l, vm_a, "conflict-ready", &conflict)?;
     topology["routes"]
         .as_array_mut()
         .unwrap()
@@ -434,7 +472,7 @@ pub fn run(a: tart::Options) -> Result<()> {
     );
     exec(
         &l,
-        "a",
+        vm_a,
         "partial-bind-denied",
         "service-denied",
         &a_to_host,
@@ -445,7 +483,7 @@ pub fn run(a: tart::Options) -> Result<()> {
         .unwrap()
         .retain(|r| r["listen"] != conflict);
     apply(&l, &topology, 3)?;
-    probe(&l, "a", "after-bind-repair", &a_to_host)?;
+    probe(&l, vm_a, "after-bind-repair", &a_to_host)?;
     l.phase("partial_guest_bind_fails_closed_and_recovers_after_policy_repair");
     l.cli(&[
         "--home",
@@ -456,7 +494,7 @@ pub fn run(a: tart::Options) -> Result<()> {
         "--request-id",
         "stop-a",
     ])?;
-    state(&l, "a", "Stopped")?;
+    state(&mut l, "a", "Stopped")?;
     wait(
         || l.request(json!({"op":"tunnels"})),
         |s| {
@@ -476,10 +514,10 @@ pub fn run(a: tart::Options) -> Result<()> {
         "--request-id",
         "restart-a",
     ])?;
-    state(&l, "a", "Running")?;
+    state(&mut l, "a", "Running")?;
     confirmed(&l, 4)?;
-    upload(&l, "a", "upload-after-restart")?;
-    probe(&l, "a", "after-vm-restart", &a_to_host)?;
+    upload(&l, vm_a, "upload-after-restart")?;
+    probe(&l, vm_a, "after-vm-restart", &a_to_host)?;
     l.phase("vm_stop_fails_closed_and_restart_reattaches");
     l.cli(&[
         "--home",
@@ -490,7 +528,7 @@ pub fn run(a: tart::Options) -> Result<()> {
         "--request-id",
         "stop-a-final",
     ])?;
-    state(&l, "a", "Stopped")?;
+    state(&mut l, "a", "Stopped")?;
     apply(&l, &json!({"adapters":{},"services":{},"routes":[]}), 4)?;
     l.phase("retired_stopped_vm_acknowledges_empty_policy");
     l.report(json!({"success":true,"real_tart":!a.fake,"isolated_guest_namespaces":!a.fake,"service_protocol":"fleet-service-channel-1","physical_failure_domain":"one machine","all_fixture_vms_deleted":true}))

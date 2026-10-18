@@ -54,6 +54,11 @@ jobs:
             --home /tmp/fleet-control-garage-ci 2>&1 | tee garage-tunnels.log
       - name: Build real previous/candidate executables and incompatible fixture
         run: target/debug/fleet-qualify build-upgrade-fixtures --output /tmp/fleet-upgrade-binaries 2>&1 | tee upgrade-builds.log
+      - name: VM service attachments, permissions, revocation and cached-policy restarts
+        run: |
+          target/debug/fleet-qualify vm-services --fake --binary "$PWD/target/debug/fleet" \
+            --baseline-binary /tmp/fleet-upgrade-binaries/fleet-service-baseline \
+            --home /tmp/fleet-control-vm-services-ci 2>&1 | tee vm-services.log
       - name: Rolling upgrades, live work, rollback and incompatible-version refusal
         run: |
           target/debug/fleet-qualify rolling-upgrade --baseline /tmp/fleet-upgrade-binaries/fleet-baseline \
@@ -70,11 +75,6 @@ jobs:
             --home /tmp/fleet-control-portable-ci 2>&1 | tee portable-client.log
       - name: Rust tests (including Raft, redb, workers, and headless M3 GUI)
         run: cargo test --workspace --all-features --locked --no-fail-fast -- --test-threads=2 2>&1 | tee rust-tests.log
-      - name: VM service attachments, permissions, revocation and cached-policy restarts
-        run: |
-          target/debug/fleet-qualify vm-services --fake --binary "$PWD/target/debug/fleet" \
-            --baseline-binary /tmp/fleet-upgrade-binaries/fleet-service-baseline \
-            --home /tmp/fleet-control-vm-services-ci 2>&1 | tee vm-services.log
       - name: Worker library without the optional control plane
         run: cargo check --no-default-features --lib --locked
       - name: Clippy

@@ -127,11 +127,13 @@ isolation from resource contention.
 control plane and adapters: VM/host services, large transfers, active revocation,
 cached-policy restart, VM lifecycle and retired-identity acknowledgment. CI runs
 on Linux and macOS. The fake backend shares host namespaces and does not prove
-hypervisor or network isolation.
+hypervisor or network isolation. It models two small logical workers so the
+fixture fits CI host admission limits; fake VMs do not allocate guest RAM.
 
 Omit `--fake` and provide `--instances` and `--image-cache` for two real offline
 Tart VMs. This uses private clones, refuses active installed jobs, checks that
 guest listeners do not bind on the host or appear in another VM, and deletes only
-fixture VMs. `--baseline-binary` tests the previous host-only adapter against a
+fixture VMs. Both real VMs run on one worker with sufficient CPU and RAM budgets.
+`--baseline-binary` tests the previous host-only adapter against a
 stopped VM adapter home. Publish only the safe `qualification.json`; raw fixture
 homes contain test keys.
