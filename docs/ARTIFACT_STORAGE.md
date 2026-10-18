@@ -285,7 +285,7 @@ authentication, interrupted staging, corruption/peer repair, signed recovery/rev
 The JSON CLI/service scenario is also run in CI on Linux and macOS:
 
 ```sh
-python3 contrib/qualify_checkpoint_tart.py --fake --backup-restore \
+target/debug/fleet-qualify checkpoint --fake --backup-restore \
   --binary "$PWD/target/debug/fleet" --home /tmp/fleet-control-storage-ci
 ```
 
@@ -300,7 +300,7 @@ The portable CLI scenario exercises replacement and retirement of inputs, checkp
 and outputs, then repair from a surviving backup after explicit agent loss:
 
 ```sh
-python3 contrib/qualify_portable_tart.py --fake --storage-lifecycle \
+target/debug/fleet-qualify portable --fake --storage-lifecycle \
   --binary "$PWD/target/debug/fleet" --home /tmp/fleet-control-storage-lifecycle
 ```
 

@@ -16,8 +16,8 @@ later grow cooperatively to three physical replicas.
 Build the normal binary, then choose a fresh home and unused ports:
 
 ```sh
-cargo build --locked --bin fleet
-python3 contrib/qualify_normal_multihost.py --local --binary "$PWD/target/debug/fleet" \
+cargo build --locked --bins
+target/debug/fleet-qualify normal-multihost --local --binary "$PWD/target/debug/fleet" \
   --home /tmp/fleet-control-local-example --port 29300
 ```
 

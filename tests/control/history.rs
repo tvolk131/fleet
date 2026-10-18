@@ -224,7 +224,10 @@ async fn vm_metric_files_capture_every_declared_record_and_large_logs_do_not_fai
     spec.vm = Some(vm_spec());
     spec.shutdown_grace_seconds = None;
     spec.metric_files = vec!["metrics.jsonl".into()];
-    spec.argv=vec!["/usr/bin/python3".into(),"-c".into(),"import json,sys; f=open('metrics.jsonl','w'); [f.write(json.dumps({'step':i,'loss':1/(i+1)})+'\\n') for i in range(2000)]; f.close(); sys.stdout.write('x'*(9<<20))".into()];
+    spec.argv = vec![
+        env!("CARGO_BIN_EXE_fleet-test-workload").into(),
+        "metrics".into(),
+    ];
     let mut request = super::super::submit("vm-history-submit", "vm-history");
     if let Mutation::Enqueue(s) = &mut request.mutation {
         s.workload = Workload::Job {

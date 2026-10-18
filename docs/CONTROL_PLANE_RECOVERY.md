@@ -185,12 +185,13 @@ of automatic backend repair during recovery. Tart fixture tests do not claim add
 
 A separate process canary uses the actual CLI, three controller processes, worker SIGKILL, a deliberately
 stale recovery source, a tiny native job, explicit client/worker rebinding, cancellation and verified
-output capture. It only creates its own new directory and never opens installed Fleet state:
+output capture. It writes only within its own new directory and reads installed Fleet records only to
+compare preservation hashes:
 
 ```sh
-python3 contrib/qualify_control_recovery.py \
-  --binary /absolute/path/to/fleet/target/debug/fleet-control-lab \
-  --home /tmp/fleet-recovery-canary-new
+target/debug/fleet-qualify normal-multihost --local \
+  --binary /absolute/path/to/fleet/target/debug/fleet \
+  --home /tmp/fleet-control-recovery-canary-new
 ```
 
 The canary records its binary hash and results in `qualification.json` and stops its fixture processes.

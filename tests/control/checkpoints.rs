@@ -9,19 +9,18 @@ pub(super) fn resumable() -> Workload {
     spec.vm = Some(vm_spec());
     spec.shutdown_grace_seconds = None;
     spec.max_seconds = Some(180);
-    spec.argv = vec!["/usr/bin/python3".into(), "-c".into(), r#"
-import hashlib,json,pathlib,time
-p=pathlib.Path('cp/one'); p.mkdir(parents=True)
-data=b'7'; (p/'state').write_bytes(data)
-m={'version':1,'position':7,'files':{'state':{'size':len(data),'sha256':hashlib.sha256(data).hexdigest()}}}
-(p/'ready.tmp').write_text(json.dumps(m)); (p/'ready.tmp').rename(p/'fleet.json')
-print('initial-once',flush=True)
-time.sleep(150)
-"#.into()];
+    spec.argv = vec![
+        env!("CARGO_BIN_EXE_fleet-test-workload").into(),
+        "checkpoint".into(),
+    ];
     spec.checkpoint = Some(fleet::checkpoint::Policy {
         retention: None,
         manifests: "cp/*/fleet.json".into(),
-        resume_argv: vec!["/usr/bin/python3".into(), "-c".into(), "import pathlib,sys; n=int(pathlib.Path(sys.argv[1]).read_text()); pathlib.Path('result.txt').write_text(str(n+1)); print('resumed-once',flush=True)".into(), "{checkpoint}/state".into()],
+        resume_argv: vec![
+            env!("CARGO_BIN_EXE_fleet-test-workload").into(),
+            "resume".into(),
+            "{checkpoint}/state".into(),
+        ],
     });
     Workload::Job {
         spec: Box::new(spec),
@@ -259,15 +258,10 @@ async fn incomplete_or_corrupt_checkpoints_never_publish_or_block_a_later_valid_
     let Workload::Job { spec, .. } = &mut workload else {
         unreachable!()
     };
-    spec.argv[2]=r#"
-import hashlib,json,pathlib,time
-for name,contents,declared in [('a-bad',b'bad',b'yes'),('b-partial',b'',b'complete'),('c-good',b'9',b'9')]:
-    p=pathlib.Path('cp')/name; p.mkdir(parents=True); (p/'state').write_bytes(contents)
-    m={'version':1,'position':9,'files':{'state':{'size':len(declared),'sha256':hashlib.sha256(declared).hexdigest()}}}
-    (p/'fleet.json').write_text(json.dumps(m))
-print('still-running',flush=True)
-time.sleep(150)
-"#.into();
+    spec.argv = vec![
+        env!("CARGO_BIN_EXE_fleet-test-workload").into(),
+        "corrupt-checkpoints".into(),
+    ];
     queued(&mut c, workload).await;
     let end = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
@@ -891,17 +885,11 @@ async fn rolling_capture_reclaims_beyond_sixteen_preserves_pin_and_resumes_after
     let Workload::Job { spec, .. } = &mut work else {
         unreachable!()
     };
-    spec.argv = vec!["/usr/bin/python3".into(), "-c".into(), r#"
-import hashlib,json,pathlib,time
-for n in range(1,29):
- p=pathlib.Path('cp/%03d'%n); p.mkdir(parents=True)
- data=(str(n)+'\n').encode()+b'x'*(65536-len(str(n))-1)
- (p/'state').write_bytes(data)
- m={'version':1,'position':n,'files':{'state':{'size':len(data),'sha256':hashlib.sha256(data).hexdigest()}}}
- (p/'ready.tmp').write_text(json.dumps(m)); (p/'ready.tmp').rename(p/'fleet.json')
-print('initial-once',flush=True)
-time.sleep(150)
-"#.into()];
+    spec.argv = vec![
+        env!("CARGO_BIN_EXE_fleet-test-workload").into(),
+        "rolling".into(),
+        "28".into(),
+    ];
     let policy = spec.checkpoint.as_mut().unwrap();
     policy.retention = Some(fleet::checkpoint::Rolling {
         keep_last: 2,
@@ -909,8 +897,11 @@ time.sleep(150)
         max_live_bytes: 2 << 20,
         transfer_bytes_per_hour: 8 << 20,
     });
-    policy.resume_argv = vec!["/usr/bin/python3".into(),"-c".into(),
-        "import pathlib,sys; n=int(pathlib.Path(sys.argv[1]).read_text().splitlines()[0]); pathlib.Path('result.txt').write_text(str(n+1))".into(),"{checkpoint}/state".into()];
+    policy.resume_argv = vec![
+        env!("CARGO_BIN_EXE_fleet-test-workload").into(),
+        "resume".into(),
+        "{checkpoint}/state".into(),
+    ];
     queued(&mut c, work).await;
     let unrelated = w.store.blobs().add_slice(b"unrelated cache").await.unwrap();
     w.store.tags().delete(unrelated.name).await.unwrap();

@@ -39,7 +39,7 @@ impl Fixture {
         let home = std::env::temp_dir().join(format!("fleet-vm-{:016x}", rand::random::<u64>()));
         fs::create_dir_all(&home).unwrap();
         let tart = home.join("tart");
-        fs::write(&tart, include_str!("fixtures/fake_tart.py")).unwrap();
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_fleet-fake-tart"), &tart).unwrap();
         fs::set_permissions(&tart, fs::Permissions::from_mode(0o700)).unwrap();
         let softnet = home.join("softnet");
         fs::write(&softnet, "#!/bin/sh\necho 'softnet 0.24.0-test'\n").unwrap();

@@ -13,7 +13,7 @@ Keep existing work under its old installation until it drains, then transfer tha
 See [setup, operations, and handoff](docs/NORMAL_FLEET.md).
 
 ```sh
-cargo build --release --features gui --bin fleet  # omit gui on headless hosts
+cargo build --release --features gui --bin fleet --bin fleet-guest  # omit gui on headless hosts
 fleet --home /absolute/client-home status
 fleet --home /absolute/client-home submit job.json --gpu --requires os:macos --requires gpu:metal
 fleet --home /absolute/client-home queue
@@ -66,8 +66,9 @@ or public-internet-only networking policies remain unchanged.
 - [Worker execution and Tart guarantees](docs/CONTROL_PLANE_WORKERS.md)
 - [Current regression coverage](docs/TEST_COVERAGE.md)
 
-Testing: `cargo test --all-features --locked`; `cargo clippy --all-features --all-targets --locked -- -D warnings`;
-`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s contrib -p 'test_*.py'` after building all feature binaries.
+Testing: `cargo test --workspace --all-features --locked`;
+`cargo clippy --workspace --all-features --all-targets --locked -- -D warnings`.
+The suite includes the public JSON CLI contracts. The guest helper, test workloads, and qualification runner are also Rust binaries.
 `fleet-control-lab` is retained for fault qualification. The retired CLI, GUI, standalone daemon,
 and their installers are removed. Normal clients always use the replicated control plane.
 
@@ -77,3 +78,5 @@ Rolling checkpoint retention is opt-in; see [rolling storage](docs/ROLLING_STORA
 compatibility and cooperative resume on another worker after confirmed suspension.
 
 Job logs, metrics, attempt selection and their retention are documented in [Durable job history](docs/DURABLE_HISTORY.md). History uses the existing storage role; configure history destinations explicitly for worker-independent reads.
+
+Guest packaging and the Rust qualification commands are described in [Rust runtime and qualification](docs/RUST_RUNTIME_AND_QUALIFICATION.md).

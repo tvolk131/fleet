@@ -119,7 +119,7 @@ async fn prepare_named(
         std::fs::create_dir_all(&backend).unwrap();
         let fake = backend.join("tart");
         let softnet = backend.join("softnet");
-        std::fs::write(&fake, include_str!("../fixtures/fake_tart.py")).unwrap();
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_fleet-fake-tart"), &fake).unwrap();
         std::fs::write(&softnet, "#!/bin/sh\necho 'softnet 0.24.0-test'\n").unwrap();
         for p in [&fake, &softnet] {
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).unwrap();

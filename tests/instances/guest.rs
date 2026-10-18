@@ -13,11 +13,21 @@ fn boot() -> Fixture {
 }
 fn command(code: &str) -> S {
     S::Exec {
-        argv: vec!["/usr/bin/python3".into(), "-c".into(), code.into()],
+        argv: vec![
+            env!("CARGO_BIN_EXE_fleet-test-workload").into(),
+            code.into(),
+        ],
         cwd: None,
         env: BTreeMap::new(),
         timeout_seconds: 10,
     }
+}
+fn command_args(args: &[&str]) -> S {
+    let mut spec = command(args[0]);
+    if let S::Exec { argv, .. } = &mut spec {
+        argv.extend(args[1..].iter().map(|s| s.to_string()));
+    }
+    spec
 }
 fn start(f: &Fixture, id: &str, spec: S) -> Operation {
     guest::start(
@@ -101,11 +111,10 @@ fn validation_and_protocol_refuse_unsafe_or_unsupported_guest_requests() {
 #[test]
 fn guest_readiness_exec_streams_and_idempotency_are_separate_from_vm_lifecycle() {
     let f = boot();
-    assert!(guest::readiness(&f.home, "guest").unwrap().ready);
+    let readiness = guest::readiness(&f.home, "guest").unwrap();
+    assert!(readiness.ready, "{readiness:?}");
     assert!(guest::owned(&f.home, "guest", "stranger").is_err());
-    let mut s = command(
-        "import os,sys; open('count','ab').write(b'x'); assert os.environ['LITERAL']=='$(touch bad); x'; sys.stdout.buffer.write(bytes(range(256))*300); sys.stderr.write('error stream'); sys.exit(23)",
-    );
+    let mut s = command("streams");
     if let S::Exec { cwd, env, .. } = &mut s {
         *cwd = Some(f.home.to_string_lossy().into());
         env.insert("LITERAL".into(), "$(touch bad); x".into());
@@ -176,7 +185,7 @@ fn guest_readiness_exec_streams_and_idempotency_are_separate_from_vm_lifecycle()
 #[test]
 fn command_timeout_output_caps_and_concurrent_admission_are_bounded() {
     let f = boot();
-    let mut spec = command("import time; time.sleep(10)");
+    let mut spec = command("sleep");
     if let S::Exec {
         timeout_seconds, ..
     } = &mut spec
@@ -185,11 +194,7 @@ fn command_timeout_output_caps_and_concurrent_admission_are_bounded() {
     }
     start(&f, "timeout", spec);
     assert_eq!(done(&f, "timeout").exit_code, Some(124));
-    start(
-        &f,
-        "excess",
-        command("import sys; sys.stdout.buffer.write(b'x'*(9<<20)); sys.stdout.flush()"),
-    );
+    start(&f, "excess", command("excess"));
     let op = done(&f, "excess");
     assert_eq!(op.state, O::Interrupted);
     assert!(op.error.unwrap().contains("byte limit"));
@@ -204,11 +209,7 @@ fn command_timeout_output_caps_and_concurrent_admission_are_bounded() {
         guest::MAX_LOG
     );
     for n in 0..4 {
-        start(
-            &f,
-            &format!("parallel-{n}"),
-            command("import time; time.sleep(1)"),
-        );
+        start(&f, &format!("parallel-{n}"), command_args(&["sleep", "1"]));
     }
     assert!(
         guest::start(
@@ -231,11 +232,7 @@ fn command_timeout_output_caps_and_concurrent_admission_are_bounded() {
 fn interrupted_supervisor_is_not_replayed_but_unattempted_records_recover() {
     let f = boot();
     let marker = f.home.join("once-count");
-    let code = format!(
-        "import time; open({},'ab').write(b'x'); time.sleep(1)",
-        serde_json::to_string(&marker).unwrap()
-    );
-    let spec = command(&code);
+    let spec = command_args(&["once", marker.to_str().unwrap()]);
     // A launcher that exits models an agent dying after recording but before launch.
     guest::start(
         &f.home,
@@ -270,7 +267,7 @@ fn interrupted_supervisor_is_not_replayed_but_unattempted_records_recover() {
         "guest",
         "pending",
         2,
-        command("print('recovered')"),
+        command_args(&["print", "recovered"]),
         Path::new("/usr/bin/true"),
     )
     .unwrap();
@@ -505,5 +502,38 @@ fn a_version_checked_download_rejects_same_size_replacement() {
     start(&f, "changed", spec);
     assert_eq!(done(&f, "changed").exit_code, Some(75));
     assert!(guest::output(&f.home, "guest", "changed").is_err());
+    stop(&f);
+}
+
+#[test]
+fn helper_installation_is_reused_and_recovers_after_guest_temporary_files_disappear() {
+    let f = boot();
+    assert!(guest::readiness(&f.home, "guest").unwrap().ready);
+    let history = f.home.join("instance-tart/history");
+    let installs = || {
+        fs::read_to_string(&history)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("fleet-guest-install"))
+            .count()
+    };
+    assert_eq!(installs(), 1);
+    start(
+        &f,
+        "once",
+        command_args(&["once", f.home.join("once-count").to_str().unwrap()]),
+    );
+    assert_eq!(done(&f, "once").state, O::Succeeded);
+    assert!(guest::readiness(&f.home, "guest").unwrap().ready);
+    assert_eq!(installs(), 1);
+    fs::remove_dir_all(f.home.join("instance-tart/vms/fleet-guest/guest-helpers")).unwrap();
+    assert!(!guest::readiness(&f.home, "guest").unwrap().ready);
+    assert!(guest::readiness(&f.home, "guest").unwrap().ready);
+    assert_eq!(installs(), 2);
+    assert_eq!(fs::read(f.home.join("once-count")).unwrap(), b"x");
+    assert_eq!(
+        guest::inspect(&f.home, "guest", "once").unwrap().state,
+        O::Succeeded
+    );
     stop(&f);
 }

@@ -32,14 +32,10 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       RUST_BACKTRACE: 1
       ICED_BACKEND: tiny-skia
-      PYTHONDONTWRITEBYTECODE: 1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # Build the pinned previous compatibility baseline from this history.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
       - name: Linux GUI build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libudev-dev libfontconfig1-dev libegl1-mesa-dev
@@ -50,32 +46,30 @@ jobs:
       - name: Build Fleet and control-plane qualification tools
         run: cargo build --all-features --bins --locked
       - name: Build real previous/candidate executables and incompatible fixture
-        run: python3 contrib/build_upgrade_fixtures.py --output /tmp/fleet-upgrade-binaries 2>&1 | tee upgrade-builds.log
+        run: target/debug/fleet-qualify build-upgrade-fixtures --output /tmp/fleet-upgrade-binaries 2>&1 | tee upgrade-builds.log
       - name: Rolling upgrades, live work, rollback and incompatible-version refusal
         run: |
-          python3 contrib/qualify_rolling_upgrade.py --baseline /tmp/fleet-upgrade-binaries/fleet-baseline \
+          target/debug/fleet-qualify rolling-upgrade --baseline /tmp/fleet-upgrade-binaries/fleet-baseline \
             --candidate /tmp/fleet-upgrade-binaries/fleet-candidate --unsupported /tmp/fleet-upgrade-binaries/fleet-unsupported \
             --home /tmp/fleet-control-rolling-ci 2>&1 | tee rolling-upgrade.log
       - name: Rolling checkpoint retention, backup and restore JSON CLI lifecycle with isolated Tart backend
         run: |
-          python3 contrib/qualify_checkpoint_tart.py --fake --rolling --backup-restore --binary "$PWD/target/debug/fleet" \
+          target/debug/fleet-qualify checkpoint --fake --rolling --backup-restore --binary "$PWD/target/debug/fleet" \
             --home /tmp/fleet-control-checkpoint-ci 2>&1 | tee checkpoint-client.log
       - name: Portable Tart jobs, storage replacement/loss, and durable attempt history
         run: |
-          python3 contrib/qualify_portable_tart.py --fake --storage-lifecycle --binary "$PWD/target/debug/fleet" \
+          target/debug/fleet-qualify portable --fake --storage-lifecycle --binary "$PWD/target/debug/fleet" \
             --baseline-binary /tmp/fleet-upgrade-binaries/fleet-baseline \
             --home /tmp/fleet-control-portable-ci 2>&1 | tee portable-client.log
       - name: Rust tests (including Raft, redb, workers, and headless M3 GUI)
-        run: cargo test --all-features --locked --no-fail-fast -- --test-threads=2 2>&1 | tee rust-tests.log
+        run: cargo test --workspace --all-features --locked --no-fail-fast -- --test-threads=2 2>&1 | tee rust-tests.log
       - name: Worker library without the optional control plane
         run: cargo check --no-default-features --lib --locked
       - name: Clippy
-        run: cargo clippy --all-features --all-targets --locked -- -D warnings
-      - name: JSON CLI contracts and fixture safeguards
-        run: python3 -m unittest discover -s contrib -p 'test_*.py' -v 2>&1 | tee python-tests.log
+        run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
       - name: Three-replica CLI/service failure scenarios
         run: |
-          python3 contrib/qualify_normal_multihost.py --local --binary "$PWD/target/debug/fleet" \
+          target/debug/fleet-qualify normal-multihost --local --binary "$PWD/target/debug/fleet" \
             --home /tmp/fleet-control-ci --port 29300 2>&1 | tee local-three.log
       - name: Collect safe evidence
         if: always()
