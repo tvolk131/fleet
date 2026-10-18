@@ -88,7 +88,7 @@ async fn artifact_authorization_follows_role_discovery_after_every_bootstrap_rep
     backup.shutdown().await.unwrap();
     // Original on-disk configs still name 1/2/3. The authority-scoped discovery cache survives.
     let mut w = Worker::start(&home, config.clone(), hello()).await.unwrap();
-    let mut backup = fleet::control::storage::Agent::start(&backup_home, backup_config.clone())
+    let mut backup = super::storage::start(&backup_home, backup_config.clone())
         .await
         .unwrap();
     w.tick().await.unwrap();
@@ -210,7 +210,7 @@ async fn replacement_survives_leader_loss_restarts_and_revokes_stale_data_access
     new.tick().await.unwrap();
     // Restart the destination and verify its committed files before old-copy cleanup.
     new.shutdown().await.unwrap();
-    let mut new = fleet::control::storage::Agent::start(&new_home, new_config.clone())
+    let mut new = super::storage::start(&new_home, new_config.clone())
         .await
         .unwrap();
     new.tick().await.unwrap();
@@ -289,9 +289,7 @@ async fn replacement_survives_leader_loss_restarts_and_revokes_stale_data_access
     );
     assert!(old.tick().await.is_err());
     old.shutdown().await.unwrap();
-    let mut old = fleet::control::storage::Agent::start(&old_home, old_config)
-        .await
-        .unwrap();
+    let mut old = super::storage::start(&old_home, old_config).await.unwrap();
     assert!(old.tick().await.is_err());
     let state = c.client.read(WAIT).await.unwrap();
     assert_eq!(state.storage_lifecycle("old-store").phase, Phase::Retired);
@@ -432,7 +430,7 @@ async fn lost_agent_is_fenced_without_claiming_erasure_or_recovery_of_unavailabl
         "loss must not pretend to erase an unreachable disk"
     );
     lost.shutdown().await.unwrap();
-    let mut lost = fleet::control::storage::Agent::start(&lost_home, lost_config)
+    let mut lost = super::storage::start(&lost_home, lost_config)
         .await
         .unwrap();
     assert!(lost.tick().await.is_err());
@@ -504,9 +502,7 @@ async fn revoked_storage_observations_survive_explicit_disaster_recovery_review(
     fleet::control::storage::accept_recovery(&new_home, &manifest).unwrap();
     let config =
         serde_json::from_slice(&std::fs::read(new_home.join("storage.json")).unwrap()).unwrap();
-    let mut new = fleet::control::storage::Agent::start(&new_home, config)
-        .await
-        .unwrap();
+    let mut new = super::storage::start(&new_home, config).await.unwrap();
     new.tick().await.unwrap();
     Worker::accept_recovery(&home, &manifest).unwrap();
     let config = serde_json::from_slice(&std::fs::read(home.join("worker.json")).unwrap()).unwrap();
@@ -535,9 +531,7 @@ async fn revoked_storage_observations_survive_explicit_disaster_recovery_review(
     assert_eq!(state.storage_lifecycle("old-store").phase, Phase::Lost);
     assert!(old_home.join("objects").join(&a.manifest.id).exists());
     // An old service config cannot cross the recovery authority, much less regain a revoked role.
-    let mut old = fleet::control::storage::Agent::start(&old_home, old_config)
-        .await
-        .unwrap();
+    let mut old = super::storage::start(&old_home, old_config).await.unwrap();
     assert!(old.tick().await.is_err());
     old.shutdown().await.unwrap();
     new.shutdown().await.unwrap();

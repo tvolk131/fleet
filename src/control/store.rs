@@ -31,6 +31,7 @@ pub const MAX_SNAPSHOT: usize = 64 << 20;
 
 #[derive(Debug, Clone)]
 pub struct Store {
+    _startup_lock: Arc<std::fs::File>,
     db: Arc<Database>,
     // Held inside the blocking task, even if the awaiting future is cancelled.
     writes: Arc<tokio::sync::Mutex<()>>,
@@ -61,6 +62,62 @@ fn put<T: Serialize>(table: &mut redb::Table<&str, &[u8]>, key: &str, value: &T)
 }
 
 impl Store {
+    pub fn preflight(path: &Path, cluster: &str, node: u64) -> Result<()> {
+        Self::preflight_for(path, cluster, node, super::version::Software::current())
+    }
+    fn preflight_for(
+        path: &Path,
+        cluster: &str,
+        node: u64,
+        software: super::version::Software,
+    ) -> Result<()> {
+        if let Some(raw) = super::version::preflight(path, "meta")? {
+            ensure!(
+                raw["identity"] == serde_json::json!([FORMAT, cluster, node]),
+                "database identity or format mismatch; explicit baseline migration required"
+            );
+            let version: super::version::ClusterVersion =
+                serde_json::from_value(raw["state"]["version"].clone())?;
+            software.require(version.required(node))?;
+            if let Some(p) = version.pending
+                && raw["version_prepared"] == serde_json::json!([version.revision, p.target])
+            {
+                software.require(p.target)?;
+            }
+        } else {
+            software.require(software.min)?;
+        }
+        Ok(())
+    }
+    /// This durable promise is written before the replica publishes its readiness acknowledgement.
+    pub async fn prepare_version(
+        &self,
+        revision: u64,
+        target: u32,
+    ) -> Result<(), StorageError<u64>> {
+        self.blocking(true, move |db| {
+            super::version::Software::current().require(target)?;
+            let mut tx = db.begin_write()?;
+            tx.set_durability(Durability::Immediate)?;
+            {
+                let mut table = tx.open_table(META)?;
+                let state: State = read(&table, "state")?.context("missing state")?;
+                ensure!(
+                    state.version.revision == revision
+                        && state
+                            .version
+                            .pending
+                            .as_ref()
+                            .is_some_and(|p| p.target == target),
+                    "version preparation changed"
+                );
+                put(&mut table, "version_prepared", &(revision, target))?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
     /// Convert an idle singleton at its applied boundary. Historical log bytes remain in the backup;
     /// the new snapshot anchors the same term/index, identity, membership, receipts, and worker IDs.
     pub(crate) fn upgrade_v5(db: &Database, path: &Path, preview: bool) -> Result<State> {
@@ -69,9 +126,11 @@ impl Store {
         let identity: (u32, String, u64) =
             read(&table, "identity")?.context("missing controller identity")?;
         if identity.0 == FORMAT {
-            return read(&table, "state")?.context("missing state");
+            let state: State = read(&table, "state")?.context("missing state")?;
+            super::version::Software::current().require(state.version.required(identity.2))?;
+            return Ok(state);
         }
-        ensure!(matches!(identity.0, 5..=10), "unsupported source format");
+        ensure!(matches!(identity.0, 5..=11), "unsupported source format");
         let state = super::upgrade::state(read(&table, "state")?.context("missing state")?)?;
         let applied = state
             .last_applied
@@ -93,6 +152,7 @@ impl Store {
                 .is_none_or(|(index, _)| index.value() <= applied.index),
             "unapplied log suffix; let the old singleton settle before upgrading"
         );
+        super::version::Software::current().require(state.version.active)?;
         let data = serde_json::to_vec(&state)?;
         ensure!(
             data.len() <= MAX_SNAPSHOT,
@@ -135,6 +195,7 @@ impl Store {
     /// Acquire redb's exclusive process lock without creating or initializing a missing source.
     /// Only the applied image is exported; a locally present log suffix is not proof of commit.
     pub fn recovery_source(path: &Path, cluster: &str, node: u64, backup: &Path) -> Result<State> {
+        Self::preflight(path, cluster, node)?;
         let db = Database::open(path)?;
         let tx = db.begin_read()?;
         let table = tx.open_table(META)?;
@@ -163,6 +224,7 @@ impl Store {
     /// Seed a NEW Raft history from a validated application image before bootstrap.
     pub async fn seed_recovery(&self, state: State) -> Result<(), StorageError<u64>> {
         self.blocking(true, move |db| {
+            super::version::Software::current().require(state.version.active)?;
             let mut tx = db.begin_write()?;
             tx.set_durability(Durability::Immediate)?;
             {
@@ -193,6 +255,17 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Serialize preflight and writable open across Fleet processes. redb retains its own lock.
+        let startup_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("startup.lock"))?;
+        startup_lock
+            .try_lock()
+            .context("controller database is already in use")?;
+        Self::preflight(path, cluster, node)?;
         let db = Database::create(path)?;
         let mut tx = db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
@@ -213,6 +286,7 @@ impl Store {
         }
         tx.commit()?;
         Ok(Self {
+            _startup_lock: Arc::new(startup_lock),
             db: Arc::new(db),
             writes: Arc::new(tokio::sync::Mutex::new(())),
             fail_state_commit: Arc::new(AtomicBool::new(false)),
@@ -428,6 +502,17 @@ impl RaftStateMachine<TypeConfig> for Store {
                             EntryPayload::Blank => Reply::Recorded,
                         });
                     }
+                    let (_, _, node): (u32, String, u64) =
+                        read(&table, "identity")?.context("missing identity")?;
+                    super::version::Software::current().require(state.version.required(node))?;
+                    // Abort/activation and the local promise change in the same transaction.
+                    let prepared: Option<(u64, u32)> = read(&table, "version_prepared")?;
+                    if prepared.is_some_and(|(r, t)| {
+                        state.version.revision != r
+                            || state.version.pending.as_ref().is_none_or(|p| p.target != t)
+                    }) {
+                        table.remove("version_prepared")?;
+                    }
                     put(&mut table, "state", &state)?;
                     replies
                 };
@@ -477,9 +562,24 @@ impl RaftStateMachine<TypeConfig> for Store {
             tx.set_durability(Durability::Immediate)?;
             {
                 let mut table = tx.open_table(META)?;
-                let (_, cluster, _): (u32, String, u64) =
+                let (_, cluster, node): (u32, String, u64) =
                     read(&table, "identity")?.context("missing identity")?;
                 ensure!(cluster == state.cluster, "snapshot cluster mismatch");
+                let old: State = read(&table, "state")?.context("missing state")?;
+                ensure!(
+                    state.version.active >= old.version.active
+                        && state.version.revision >= old.version.revision,
+                    "snapshot cannot roll back the cluster generation or upgrade revision"
+                );
+                super::version::Software::current().require(state.version.required(node))?;
+                // A snapshot carries committed readiness. Preserve any still-current local promise.
+                let prepared: Option<(u64, u32)> = read(&table, "version_prepared")?;
+                if prepared.is_some_and(|(r, t)| {
+                    state.version.revision != r
+                        || state.version.pending.as_ref().is_none_or(|p| p.target != t)
+                }) {
+                    table.remove("version_prepared")?;
+                }
                 put(&mut table, "state", &state)?;
                 put(
                     &mut table,
@@ -562,5 +662,88 @@ impl RaftSnapshotBuilder<TypeConfig> for Store {
             })
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+    use crate::control::{Command, Mutation, Request, network::Peer, version::Software};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[tokio::test]
+    async fn unacknowledged_preparation_blocks_old_binary_until_abort_is_applied() {
+        let home = std::env::temp_dir().join(format!(
+            "fleet-control-version-promise-{:032x}",
+            rand::random::<u128>()
+        ));
+        let path = home.join("control.redb");
+        let mut store = Store::open(&path, "cluster", 1).unwrap();
+        let log = |index| LogId::new(openraft::CommittedLeaderId::new(1, 1), index);
+        let peer = Peer {
+            identity: iroh::SecretKey::generate().public(),
+            address: "127.0.0.1:19001".parse().unwrap(),
+        };
+        store
+            .apply([Entry {
+                log_id: log(1),
+                payload: EntryPayload::Membership(openraft::Membership::new(
+                    vec![BTreeSet::from([1])],
+                    BTreeMap::from([(1, peer.node())]),
+                )),
+            }])
+            .await
+            .unwrap();
+        let command = |id: &str, mutation| Entry {
+            log_id: log(if id == "prepare" { 2 } else { 3 }),
+            payload: EntryPayload::Normal(Command {
+                principal: "admin".into(),
+                request: Request {
+                    origin: "cluster".into(),
+                    id: id.into(),
+                    mutation,
+                },
+            }),
+        };
+        store
+            .apply([command(
+                "prepare",
+                Mutation::PrepareVersion {
+                    expected_revision: 0,
+                    target: 2,
+                },
+            )])
+            .await
+            .unwrap();
+        store.prepare_version(1, 2).await.unwrap();
+        assert!(
+            store
+                .state()
+                .await
+                .unwrap()
+                .version
+                .pending
+                .unwrap()
+                .ready
+                .is_empty()
+        );
+        drop(store);
+        let bytes = std::fs::read(&path).unwrap();
+        let old = Software { min: 1, max: 1 };
+        assert!(Store::preflight_for(&path, "cluster", 1, old).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let mut store = Store::open(&path, "cluster", 1).unwrap();
+        store
+            .apply([command(
+                "abort",
+                Mutation::AbortVersion {
+                    expected_revision: 1,
+                },
+            )])
+            .await
+            .unwrap();
+        drop(store);
+        Store::preflight_for(&path, "cluster", 1, old).unwrap();
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

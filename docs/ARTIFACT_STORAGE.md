@@ -272,11 +272,11 @@ The normal `fleet api` interface exposes `storage`, `artifacts`, `enroll_storage
 `review_storage_recovery`. Mutations require an explicit request ID and applicable revision/fingerprint.
 Use `retry` after an unknown mutation outcome; do not invent a new request ID to bypass uncertainty.
 
-The current protocol/metadata format is 11. Mixed versions are refused. The explicit offline singleton upgrade
-accepts idle formats 5–10; formats 6–10 may include suspended jobs. It preserves checkpoint metadata and
+The physical metadata format is 12, with wire protocol 1 and explicit [rolling generation upgrades](ROLLING_UPGRADES.md). The explicit offline singleton upgrade
+accepts idle formats 5–11; formats 6–11 may include suspended jobs. It preserves checkpoint metadata and
 receipts, registers existing checkpoints as source artifacts, and creates versioned backups. It refuses
 recovery-bound old-format installations pending a separately reviewed migration. See
-[the upgrade procedure](CHECKPOINT_JOBS.md#explicit-format-5678910-upgrade).
+[the upgrade procedure](CHECKPOINT_JOBS.md#explicit-format-567891011-upgrade).
 
 Rust qualification additionally covers replacement across leader loss, restart and stale access, explicit lost data, identity reuse rejection, copy-count preservation, and format-10 upgrade.
 Rust qualification covers three-replica checkpoint backup/export/resume with the original worker payloads

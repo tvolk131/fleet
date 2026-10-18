@@ -79,6 +79,9 @@ impl State {
         if self.configuration.revision == 0 {
             return reject("cluster is not initialized");
         }
+        if self.version.pending.is_some() {
+            return reject("finish or abort the version preparation before changing membership");
+        }
         if self.configuration.active.is_some() {
             return reject("another membership operation is active");
         }

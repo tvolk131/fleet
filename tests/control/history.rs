@@ -102,9 +102,7 @@ async fn diagnostic_archives_survive_source_loss_and_expire_without_erasing_job_
     worker.shutdown().await.unwrap();
     std::fs::rename(home.join("backend"), home.join("unavailable-backend")).unwrap();
     store.shutdown().await.unwrap();
-    // iroh releases its UDP socket when the final internal Endpoint clone drops.
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let mut store = fleet::control::storage::Agent::start(&storage_home, storage_config)
+    let mut store = super::storage::start(&storage_home, storage_config)
         .await
         .unwrap();
     store.tick().await.unwrap();

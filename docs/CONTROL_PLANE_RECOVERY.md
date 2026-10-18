@@ -6,7 +6,7 @@ membership changes. It creates a new controller identity and wire incarnation, p
 logical Fleet identity in a signed recovery record, and requires explicit client and worker rebinding.
 Installed Fleet services and training records remain outside this workflow.
 
-The normal queue and recovery use protocol and storage format 11. See the [checkpoint/upgrade guide](CHECKPOINT_JOBS.md) for the current model. Recovery-bound format-5/6/7/8/9/10 state is deliberately refused by that upgrade; earlier lab formats and the SQLite coordinator are not imported. The recovery command
+The normal queue and recovery use wire protocol 1 and physical storage format 12. See the [checkpoint/upgrade guide](CHECKPOINT_JOBS.md) for the current model. Recovery-bound format-5/6/7/8/9/10/11 state is deliberately refused by that upgrade; earlier lab formats and the SQLite coordinator are not imported. The recovery command
 accepts a concrete loopback or LAN address. See [multi-machine deployment](CONTROL_PLANE_NETWORKING.md)
 for the network configuration and physical-host qualification.
 

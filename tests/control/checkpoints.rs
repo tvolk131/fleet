@@ -415,7 +415,7 @@ async fn checkpoint_backup_restores_without_worker_payloads_and_retention_preser
             Reply::Recorded
         );
     }
-    let mut storage = storage::Agent::start(&storage_home, storage_config.clone())
+    let mut storage = super::storage::start(&storage_home, storage_config.clone())
         .await
         .unwrap();
     let mut w = Worker::start(&home, config.clone(), hello()).await.unwrap();
@@ -507,7 +507,7 @@ async fn checkpoint_backup_restores_without_worker_payloads_and_retention_preser
     let before_history = state.assignments[&original.id].clone();
     // A fresh storage process verifies its retained copy; exporting works with the worker offline.
     storage.shutdown().await.unwrap();
-    let mut storage = storage::Agent::start(&storage_home, storage_config)
+    let mut storage = super::storage::start(&storage_home, storage_config)
         .await
         .unwrap();
     storage.tick().await.unwrap();

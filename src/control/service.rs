@@ -61,6 +61,18 @@ impl ServiceConfig {
 pub async fn run(path: &Path) -> Result<()> {
     let config: ServiceConfig = serde_json::from_slice(&std::fs::read(path)?)?;
     config.validate()?;
+    if let Some(home) = &config.controller_home {
+        let cfg: Config = serde_json::from_slice(&std::fs::read(home.join("config.json"))?)?;
+        super::Store::preflight(&home.join("control.redb"), &cfg.cluster, cfg.id)?;
+    }
+    if let Some(home) = &config.worker_home
+        && let Some(raw) = super::version::preflight(&home.join("worker.redb"), "worker_journal")?
+    {
+        ensure!(
+            raw["state"]["format"] == super::FORMAT,
+            "worker metadata needs explicit baseline migration"
+        );
+    }
     let replica = if let Some(home) = &config.controller_home {
         let cfg: Config = serde_json::from_slice(&std::fs::read(home.join("config.json"))?)?;
         let r = Replica::start(home, cfg.clone()).await?;

@@ -4,6 +4,32 @@ use fleet::control::{
     artifact_io, storage,
 };
 
+pub(super) async fn start(
+    home: &std::path::Path,
+    config: storage::Config,
+) -> anyhow::Result<storage::Agent> {
+    let address = config.registration.peer.address;
+    // These fixtures restart inside one process. Iroh can finish logical shutdown before
+    // the last socket owner is dropped; wait for actual release, not an arbitrary sleep.
+    // A leaked owner still fails at the deadline instead of being hidden by a bind retry.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        match UdpSocket::bind(address) {
+            Ok(socket) => {
+                drop(socket);
+                break;
+            }
+            Err(error) => assert!(
+                error.kind() == std::io::ErrorKind::AddrInUse
+                    && tokio::time::Instant::now() < deadline,
+                "storage socket {address} was not released: {error}"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    storage::Agent::start(home, config).await
+}
+
 pub(super) async fn backup(
     c: &mut Cluster,
     id: &str,
@@ -44,7 +70,7 @@ pub(super) async fn backup(
             .unwrap(),
         Reply::Recorded
     );
-    let agent = storage::Agent::start(&home, config.clone()).await.unwrap();
+    let agent = start(&home, config.clone()).await.unwrap();
     (home, config, agent)
 }
 
@@ -224,7 +250,7 @@ async fn storage_quota_corruption_restart_and_peer_repair_are_visible_and_verifi
     )
     .unwrap();
     w.shutdown().await.unwrap();
-    let mut a = storage::Agent::start(&a_home, a_config).await.unwrap();
+    let mut a = start(&a_home, a_config).await.unwrap();
     assert!(!a_home.join("staging/interrupted").exists());
     a.tick().await.unwrap();
     assert_eq!(
@@ -325,7 +351,7 @@ async fn storage_recovery_requires_rebinding_inventory_and_explicit_cleanup_revi
     );
     let updated: storage::Config =
         serde_json::from_slice(&std::fs::read(storage_home.join("storage.json")).unwrap()).unwrap();
-    let mut backup = storage::Agent::start(&storage_home, updated).await.unwrap();
+    let mut backup = start(&storage_home, updated).await.unwrap();
     backup.tick().await.unwrap();
     assert!(
         artifact_io::fetch(

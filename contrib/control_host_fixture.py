@@ -22,7 +22,7 @@ def validate_service(root, command):
     config_path = Path(command[command.index('--config') + 1]).resolve()
     assert config_path.is_relative_to(root.resolve()), 'service configuration escapes fixture'
     config = json.loads(config_path.read_text())
-    homes = [config.get(k) for k in ('controller_home', 'worker_home', 'client_home')]
+    homes = [config.get(k) for k in ('controller_home', 'worker_home', 'storage_home', 'client_home')]
     assert any(homes), 'service has no roles'
     assert all(Path(h).is_absolute() and Path(h).resolve().is_relative_to(root.resolve())
                for h in homes if h), 'service role escapes fixture'
