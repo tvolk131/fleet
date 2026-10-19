@@ -1,6 +1,6 @@
 # Permanent request receipts and indexed metadata
 
-Fleet retains a request's identity indefinitely. There is no expiring request namespace, automatic
+Fleet retains an admitted client request's identity indefinitely. There is no expiring request namespace, automatic
 receipt TTL, or permission to execute an old request again because its response was discarded.
 The key is the existing `(authenticated principal, request ID)` pair. Its record contains the
 original authority incarnation, mutation fingerprint, decision, resource reference and applied
@@ -8,6 +8,9 @@ Raft index. A conflicting payload or origin under that key is rejected. An expli
 can discard the command and response bodies; the remaining record still prevents replay and
 returns `Expired` with its resource reference. Payload retention is independent: logs, metrics,
 checkpoints and VM transfer contents retain their existing policies.
+Internal diagnostic observations retain their existing producer-cursor deduplication instead of
+creating a receipt per sample. Authentication, compatibility and size refusals before Raft admission
+do not create receipts or authorize execution.
 
 ## Where the abstractions live
 
@@ -93,6 +96,10 @@ tables and snapshot metadata together. The current safety bounds are 16 MiB per 
 retained snapshot; streaming bounds memory, not disk usage or the duration of an install transaction.
 Snapshot RPCs have a separate two-minute installation deadline. Half-open streams and ordinary
 server requests retain their five-second bounds; heartbeat/election timing is unchanged.
+Automatic snapshots now occur after 10,000 applied log entries, replacing the old 100-entry lab
+cadence. This trades a longer retained Raft log for fewer full-history scans and disk rewrites.
+Snapshots still cost time and disk proportional to retained history; the point-read measurements
+below do not measure that amortized background work or promise unlimited write throughput.
 
 Install the binary on replicas first, then prepare and activate generation five using the existing
 rolling-upgrade commands. Before activation, both the state and saved snapshot remain readable by

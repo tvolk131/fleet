@@ -1047,7 +1047,9 @@ impl Replica {
             max_payload_entries: 32,
             snapshot_max_chunk_size: 256 << 10,
             install_snapshot_timeout: SNAPSHOT_INSTALL_TIMEOUT.as_millis() as u64,
-            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(100),
+            // Snapshots include permanent history. The old 100-entry lab cadence would turn
+            // every small burst of observations into a full-history disk rewrite.
+            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(10_000),
             max_in_snapshot_log_to_keep: 0,
             purge_batch_size: 1,
             ..Default::default()

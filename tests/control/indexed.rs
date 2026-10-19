@@ -393,10 +393,6 @@ async fn indexed_history_scale_smoke() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn indexed_queries_and_receipts_survive_network_snapshot_and_leader_loss() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("openraft=warn,fleet::control::network=debug")
-        .with_test_writer()
-        .try_init();
     let mut c = Cluster::new(3).await;
     assert!(
         c.client
