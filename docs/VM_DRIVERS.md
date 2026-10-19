@@ -213,5 +213,20 @@ What this settles:
    handle it (macOS guests do). `StopMode::Graceful` means "ask the agent, then the power button,
    then force after a deadline", decided by the driver, not the caller.
 
-Still open: a stalled or closed host end of the network card, disks (raw images, `clonefile`), a
+### Network card under stress
+
+| Check | Result |
+| --- | --- |
+| Throughput | The guest pushed 1514-byte frames at about 1.4 GB/s with Fleet reading; every frame the guest's stack accepted arrived. |
+| Fleet stalls | With Fleet not reading, the guest's sends hit back-pressure (`EAGAIN` on a non-blocking send) after about 4 MB, the socket buffer. Nothing already accepted was lost: all of it arrived when Fleet resumed. vsock and the VM were unaffected. |
+| Handover | A separate process received a duplicate of the host end over the runner's control socket (`SCM_RIGHTS`), exchanged frames with the guest, closed it and exited; the runner's own copy kept working. |
+| Fleet closes its end | The VM keeps running and the guest sees no link change: its sends succeed and vanish. |
+
+So the runner holds the host end for the VM's whole life, and the worker's network agent borrows a
+duplicate over `runner.sock` and asks for a new one after it restarts. A worker restart then costs
+the guest a pause in traffic (buffered up to the socket size, then back-pressure), not a dead card.
+Because a closed end is invisible to the guest, "the card is not connected" has to be Fleet's own
+state, reported in `Observed`, never inferred from the guest.
+
+Still open: disks (raw images, `clonefile`), a
 macOS guest and its IPSW install (question 2), restore on a different host, and everything `krun`.

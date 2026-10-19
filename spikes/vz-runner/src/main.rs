@@ -10,7 +10,7 @@
 use std::{
     io::{BufRead, BufReader, Read, Write},
     os::{
-        fd::{FromRawFd, OwnedFd, RawFd},
+        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
@@ -33,6 +33,11 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("run") => run(&args[1..]),
+        Some("grab") => {
+            let dir = PathBuf::from(args.get(1).context("grab <dir> <seconds>")?);
+            let seconds: u64 = args.get(2).map_or(Ok(3), |s| s.parse())?;
+            grab(&dir, seconds)
+        }
         Some("ctl") => {
             let dir = PathBuf::from(args.get(1).context("ctl <dir> <command>")?);
             let mut stream = UnixStream::connect(dir.join("control.sock"))?;
@@ -202,7 +207,9 @@ fn parse(args: &[String]) -> Result<Options> {
 
 /// Host end of the guest's only network card: one datagram is one Ethernet frame.
 struct Nic {
-    host: OwnedFd,
+    /// The runner keeps the host end for the VM's lifetime; a worker borrows a duplicate.
+    host: std::sync::atomic::AtomicI32,
+    paused: std::sync::atomic::AtomicBool,
     frames_in: AtomicU64,
     bytes_in: AtomicU64,
     largest_in: AtomicU64,
@@ -233,10 +240,22 @@ fn socketpair() -> Result<(OwnedFd, OwnedFd)> {
 }
 
 fn nic_reader(nic: Arc<Nic>) {
-    use std::os::fd::AsRawFd;
     let mut buf = vec![0u8; 65536];
     loop {
-        let n = unsafe { libc::recv(nic.host.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        let fd = nic.host.load(Ordering::Relaxed);
+        if fd < 0 {
+            let _ = writeln!(nic.log.lock().unwrap(), "host end closed; reader exits");
+            return;
+        }
+        if nic.paused.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        if unsafe { libc::poll(&mut pfd, 1, 100) } <= 0 {
+            continue;
+        }
+        let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
         if n <= 0 {
             let _ = writeln!(
                 nic.log.lock().unwrap(),
@@ -272,13 +291,12 @@ fn mac(b: &[u8]) -> String {
 const GUEST_MAC: [u8; 6] = [0x02, 0xf1, 0xee, 0x70, 0x00, 0x01];
 
 fn nic_send(nic: &Nic, text: &str) -> Result<()> {
-    use std::os::fd::AsRawFd;
     let mut frame = Vec::new();
     frame.extend_from_slice(&GUEST_MAC);
     frame.extend_from_slice(&[0x02, 0xf1, 0xee, 0x70, 0x00, 0xfe]);
     frame.extend_from_slice(&0x88b5u16.to_be_bytes());
     frame.extend_from_slice(text.as_bytes());
-    let n = unsafe { libc::send(nic.host.as_raw_fd(), frame.as_ptr().cast(), frame.len(), 0) };
+    let n = unsafe { libc::send(nic.host.load(Ordering::Relaxed), frame.as_ptr().cast(), frame.len(), 0) };
     if n < 0 {
         bail!("send: {}", std::io::Error::last_os_error());
     }
@@ -373,7 +391,8 @@ fn run(args: &[String]) -> Result<()> {
     std::fs::create_dir_all(&o.dir)?;
     let (guest_end, host_end) = socketpair()?;
     let nic = Arc::new(Nic {
-        host: host_end,
+        host: std::sync::atomic::AtomicI32::new(std::os::fd::IntoRawFd::into_raw_fd(host_end)),
+        paused: std::sync::atomic::AtomicBool::new(false),
         frames_in: AtomicU64::new(0),
         bytes_in: AtomicU64::new(0),
         largest_in: AtomicU64::new(0),
@@ -503,6 +522,28 @@ fn handle(vm: &Vm, nic: &Nic, save: &Path, stream: &UnixStream) -> Result<String
             nic_send(nic, &words.collect::<Vec<_>>().join(" "))?;
             "sent".into()
         }
+        "netpause" => {
+            nic.paused.store(true, Ordering::Relaxed);
+            "reader paused".into()
+        }
+        "netresume" => {
+            nic.paused.store(false, Ordering::Relaxed);
+            "reader resumed".into()
+        }
+        "netclose" => {
+            let fd = nic.host.swap(-1, Ordering::Relaxed);
+            unsafe { libc::close(fd) };
+            "host end closed".into()
+        }
+        "netgrab" => {
+            // Simulates a restarted worker taking over the network card from the runner.
+            nic.paused.store(true, Ordering::Relaxed);
+            send_fd(stream, nic.host.load(Ordering::Relaxed))?;
+            let mut done = String::new();
+            BufReader::new(stream).read_line(&mut done)?;
+            nic.paused.store(false, Ordering::Relaxed);
+            format!("worker returned the card: {}", done.trim())
+        }
         "netstats" => format!(
             "in: {} frames, {} bytes, largest {}; out: {} frames",
             nic.frames_in.load(Ordering::Relaxed),
@@ -513,4 +554,78 @@ fn handle(vm: &Vm, nic: &Nic, save: &Path, stream: &UnixStream) -> Result<String
         other => bail!("unknown command {other:?}"),
     };
     Ok(format!("{result}  ({:?})", started.elapsed()))
+}
+
+fn send_fd(stream: &UnixStream, fd: RawFd) -> Result<()> {
+    unsafe {
+        let mut byte = [b'F'];
+        let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
+        let mut space = vec![0u8; libc::CMSG_SPACE(size_of::<RawFd>() as u32) as usize];
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = space.as_mut_ptr().cast();
+        msg.msg_controllen = space.len() as _;
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as _;
+        std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>(), fd);
+        if libc::sendmsg(stream.as_raw_fd(), &msg, 0) < 0 {
+            bail!("sendmsg: {}", std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn recv_fd(stream: &UnixStream) -> Result<OwnedFd> {
+    unsafe {
+        let mut byte = [0u8];
+        let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
+        let mut space = vec![0u8; libc::CMSG_SPACE(size_of::<RawFd>() as u32) as usize];
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = space.as_mut_ptr().cast();
+        msg.msg_controllen = space.len() as _;
+        if libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) <= 0 {
+            bail!("recvmsg: {}", std::io::Error::last_os_error());
+        }
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null() || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
+            bail!("no descriptor received");
+        }
+        Ok(OwnedFd::from_raw_fd(std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>())))
+    }
+}
+
+/// A separate process standing in for a restarted worker: borrow the card, use it, hand it back.
+fn grab(dir: &Path, seconds: u64) -> Result<()> {
+    let mut stream = UnixStream::connect(dir.join("control.sock"))?;
+    writeln!(stream, "netgrab")?;
+    let fd = recv_fd(&stream)?;
+    println!("worker pid {} holds the card as fd {}", std::process::id(), fd.as_raw_fd());
+    let mut frame = GUEST_MAC.to_vec();
+    frame.extend_from_slice(&[0x02, 0xf1, 0xee, 0x70, 0x00, 0xfd]);
+    frame.extend_from_slice(&0x88b5u16.to_be_bytes());
+    frame.extend_from_slice(format!("hello from worker pid {}", std::process::id()).as_bytes());
+    unsafe { libc::send(fd.as_raw_fd(), frame.as_ptr().cast(), frame.len(), 0) };
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let (mut frames, mut buf) = (0, vec![0u8; 65536]);
+    while Instant::now() < deadline {
+        let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        if unsafe { libc::poll(&mut pfd, 1, 100) } > 0 {
+            let n = unsafe { libc::recv(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+            if n > 14 && buf[12..14] == [0x88, 0xb5] {
+                frames += 1;
+                println!("worker got: {}", String::from_utf8_lossy(&buf[14..n as usize]));
+            }
+        }
+    }
+    drop(fd);
+    writeln!(stream, "{frames} frames read, descriptor closed")?;
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply)?;
+    print!("{reply}");
+    Ok(())
 }

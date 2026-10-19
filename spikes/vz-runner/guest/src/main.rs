@@ -12,6 +12,9 @@ use std::{
 };
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
+/// The raw eth0 socket and MAC, once the network is up, so vsock commands can flood frames.
+static RAW: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static MAC: std::sync::Mutex<[u8; 6]> = std::sync::Mutex::new([0; 6]);
 
 fn log(msg: impl AsRef<str>) {
     let mut out = std::io::stdout().lock();
@@ -84,6 +87,8 @@ fn network() -> std::io::Result<()> {
     )?;
 
     let rx = raw.as_raw_fd();
+    MAC.lock().unwrap().copy_from_slice(&mac);
+    RAW.store(rx, Ordering::Relaxed);
     std::thread::spawn(move || {
         let mut buf = [0u8; 65536];
         loop {
@@ -129,6 +134,12 @@ fn vsock() -> std::io::Result<()> {
         let n = stream.read(&mut buf).unwrap_or(0);
         let msg = String::from_utf8_lossy(&buf[..n]).trim().to_owned();
         log(format!("vsock request: {msg:?}"));
+        if let Some(args) = msg.strip_prefix("flood ") {
+            let mut it = args.split_whitespace().map(|v| v.parse::<usize>().unwrap_or(0));
+            let (count, size) = (it.next().unwrap_or(0), it.next().unwrap_or(64).max(14));
+            let _ = stream.write_all(flood(count, size).as_bytes());
+            continue;
+        }
         if msg == "poweroff" {
             let _ = stream.write_all(b"powering off");
             let _ = stream.flush();
@@ -141,6 +152,31 @@ fn vsock() -> std::io::Result<()> {
             format!("guest-echo tick={} uptime={}: {msg}", TICKS.load(Ordering::Relaxed), uptime()).as_bytes(),
         );
     }
+}
+
+/// Sends `count` frames of `size` bytes as fast as possible; reports what the stack did with them.
+fn flood(count: usize, size: usize) -> String {
+    let fd = RAW.load(Ordering::Relaxed);
+    if fd < 0 {
+        return "network not up".into();
+    }
+    let mut frame = vec![0xffu8; 6];
+    frame.extend_from_slice(&*MAC.lock().unwrap());
+    frame.extend_from_slice(&0x88b5u16.to_be_bytes());
+    frame.resize(size, b'f');
+    let started = std::time::Instant::now();
+    let (mut ok, mut errors) = (0usize, std::collections::BTreeMap::<String, usize>::new());
+    for _ in 0..count {
+        let n = unsafe { libc::send(fd, frame.as_ptr().cast(), frame.len(), libc::MSG_DONTWAIT) };
+        if n < 0 {
+            *errors.entry(std::io::Error::last_os_error().to_string()).or_default() += 1;
+        } else {
+            ok += 1;
+        }
+    }
+    let msg = format!("flood {count}x{size}: {ok} sent, errors {errors:?}, {:?}", started.elapsed());
+    log(&msg);
+    msg
 }
 
 fn main() {
