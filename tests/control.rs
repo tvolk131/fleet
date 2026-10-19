@@ -19,6 +19,8 @@ use std::{
     time::Duration,
 };
 
+#[path = "control/lifecycle_hardening.rs"]
+mod lifecycle_hardening;
 #[path = "control/simulated.rs"]
 mod simulated;
 use simulated::SimulatedWorker;

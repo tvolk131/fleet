@@ -122,6 +122,40 @@ pub struct Observation {
     pub detail: Option<String>,
 }
 
+pub const MAX_OBSERVATION_DETAIL: usize = 4096;
+pub const DETAIL_TOO_LARGE: &str = "observation detail too large";
+
+impl Observation {
+    /// Diagnostics must never make a durable lifecycle report impossible to deliver.
+    pub fn normalize(&mut self) {
+        if let Some(detail) = &mut self.detail {
+            let mut end = detail.len().min(MAX_OBSERVATION_DETAIL);
+            while !detail.is_char_boundary(end) {
+                end -= 1;
+            }
+            detail.truncate(end);
+        }
+    }
+}
+
+impl Report {
+    pub fn request_id(&self) -> String {
+        format!("observation-{}-{}", self.incarnation, self.sequence)
+    }
+
+    /// Only the diagnostic changes. Lifecycle identity, ordering and outcome stay intact.
+    pub fn corrected_detail(&self) -> Option<(Self, String)> {
+        let mut corrected = self.clone();
+        corrected.observation.normalize();
+        if &corrected == self {
+            return None;
+        }
+        let digest = blake3::hash(&serde_json::to_vec(&corrected).expect("report serializes"));
+        let id = format!("observation-correction-{}", digest.to_hex());
+        Some((corrected, id))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Assignment {
     pub id: String,
@@ -488,7 +522,7 @@ impl State {
             return Reply::rejected(&e.to_string());
         }
         if matches!(workload, Workload::Job { .. }) {
-            let mut job = super::queue::Submission {
+            let submission = super::queue::Submission {
                 inputs: None,
                 id: id.into(),
                 workload: workload.clone(),
@@ -496,8 +530,11 @@ impl State {
                 priority: 0,
                 requires: BTreeSet::new(),
                 after: BTreeSet::new(),
-            }
-            .job(0);
+            };
+            let mut job = match self.admit_submission(&submission, 0) {
+                Ok(job) => job,
+                Err(error) => return Reply::rejected(&error.to_string()),
+            };
             job.attempts.push(id.into());
             job.phase = super::queue::JobPhase::Active;
             self.jobs.insert(id.into(), job);
@@ -669,9 +706,9 @@ impl State {
             .observation
             .detail
             .as_ref()
-            .is_some_and(|d| d.len() > 4096)
+            .is_some_and(|d| d.len() > MAX_OBSERVATION_DETAIL)
         {
-            return Reply::rejected("observation detail too large");
+            return Reply::rejected(DETAIL_TOO_LARGE);
         }
         // Consume superseded reports without allowing their old intent to release a current reservation.
         if report.revision < a.revision {

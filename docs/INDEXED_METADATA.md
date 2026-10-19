@@ -38,7 +38,8 @@ The deterministic resource state machine remains shared with the in-memory model
 cross-resource scheduling and retention checks still hydrate the resource catalog. This milestone
 removes request-history-sized reads and rewrites from that path; it does not claim that scheduler
 work is independent of the number of jobs or artifacts. Only changed resource rows are rewritten.
-Existing VM metadata admission limits and worker-view size limits still apply.
+Existing VM metadata admission limits still apply. Worker synchronization uses bounded snapshot/change
+pages, so accumulated worker history no longer has to fit in one response; see [worker synchronization](CONTROL_PLANE_WORKERS.md#bounded-synchronization).
 
 Workers store native and guest execution markers in `execution_markers`, keyed by execution domain
 and ID. Marker lookups/writes avoid loading marker history. The offline baseline importer preserves

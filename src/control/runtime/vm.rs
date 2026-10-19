@@ -399,7 +399,7 @@ mod tests {
             "released":false,"reclaimed":false
         })).unwrap();
         view.vm.operations.insert(op.id.clone(), op);
-        j.accept(view.clone()).unwrap();
+        j.accept(view.clone(), None).unwrap();
         j.mark_attempted(true, "once", true).unwrap();
         assert_eq!(j.read().unwrap().format, crate::control::FORMAT);
         drop(j);
@@ -407,16 +407,16 @@ mod tests {
         assert!(j.attempted(true, "once").unwrap());
         let mut bad = view.clone();
         bad.generation = 0;
-        assert!(j.accept(bad).is_err());
+        assert!(j.accept(bad, None).is_err());
         let mut bad = view.clone();
         bad.vm.operations.get_mut("once").unwrap().outcome.phase = Phase::Running;
-        assert!(j.accept(bad).is_err());
+        assert!(j.accept(bad, None).is_err());
         let o = view.vm.operations.get_mut("once").unwrap();
         o.released = true;
         o.revision += 1;
-        j.accept(view.clone()).unwrap();
+        j.accept(view.clone(), None).unwrap();
         view.vm.operations.get_mut("once").unwrap().released = false;
-        assert!(j.accept(view).is_err());
+        assert!(j.accept(view, None).is_err());
         assert!(j.read().unwrap().vm.operations["once"].released);
         // Both execution domains survive reopen; marker writes avoid the resource journal.
         let mut view = serde_json::from_value::<WorkerView>(json!({
@@ -425,7 +425,7 @@ mod tests {
             "held":[],"registration":cfg.registration,"assignments":[],"acknowledged":0
         })).unwrap();
         j.mark_attempted(false, "native-before", true).unwrap();
-        j.accept(view.clone()).unwrap();
+        j.accept(view.clone(), None).unwrap();
         assert_eq!(
             j.read().unwrap().format,
             crate::control::store::indexed::FORMAT
@@ -434,7 +434,7 @@ mod tests {
         j.mark_attempted(false, "not-published", true).unwrap();
         j.mark_attempted(false, "not-published", false).unwrap();
         view.generation = 0;
-        assert!(j.accept(view.clone()).is_err());
+        assert!(j.accept(view.clone(), None).is_err());
         // Emergency rebinding resets the observed authority generation. A surviving older
         // controller image must not downgrade the worker's physical execution-fence format.
         j.change(|s| {
@@ -443,7 +443,7 @@ mod tests {
         })
         .unwrap();
         view.generation = 1;
-        j.accept(view).unwrap();
+        j.accept(view, None).unwrap();
         assert_eq!(
             j.read().unwrap().format,
             crate::control::store::indexed::FORMAT

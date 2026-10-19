@@ -26,6 +26,7 @@ pub mod store;
 pub mod tunnels;
 pub mod version;
 pub mod vm;
+pub mod worker_sync;
 pub mod workload;
 
 pub use model::{Command, Mutation, Reply, Request, State};

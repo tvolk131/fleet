@@ -33,7 +33,7 @@ The closed command enum adds `EnrollStorage`, `StoragePolicy`, `ArtifactReady`, 
 uses `ReplaceStorage`, `RetireStorage`, `FinishStorageRetirement`, and `DeclareStorageLost`.
 `CheckpointReady` also registers the corresponding artifact. History adds `HistoryReport`, `HistoryPolicy`
 and `SweepHistory`, reusing the artifact copy/retention commands. Applying these commands changes only
-metadata. Authenticated `StorageRead` and `WorkerRead` return quorum-confirmed intent. The storage and
+metadata. Authenticated `StorageRead` and `WorkerSync` return quorum-confirmed intent. The storage and
 worker reconcilers perform transfers/deletion afterward, then propose versioned observations.
 `AuthorizeArtifact` is a quorum-confirmed read that checks the current identities and assignment before
 each new transfer; it does not add a request receipt or a consensus command. Disk IO,

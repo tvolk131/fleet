@@ -48,3 +48,13 @@ mismatched and unapplied source images without changing source bytes. A three-re
 leader, splits large catch-up batches and verifies idempotent retry and quorum-read refusal.
 The explicit million-receipt test reports lookup, reopen, snapshot and restore costs without using
 installed service homes.
+
+Worker synchronization tests (`src/control/worker_sync/tests.rs`, `src/control/runtime/sync_tests.rs`,
+and `tests/control/bounded_sync.rs`) cover a worker view larger than 8 MiB, cancellation during frozen
+pagination, bounded deltas, base eviction, replica-cache loss, worker restart, corrupt/out-of-order pages,
+cursor rollback and atomic cursor/intent persistence. They also exercise a persisted legacy poisoned
+outbox through the actual worker on three local replicas. `tests/control/lifecycle_hardening.rs` verifies
+shared portable-input/reserved-path admission and immutable rejection/correction receipts through redb
+reopen. Existing native/Tart, checkpoint, storage, recovery and membership scenarios run through the same
+new worker synchronization path. Fixtures use independent temporary homes; they do not open installed
+Fleet state or existing training runs.

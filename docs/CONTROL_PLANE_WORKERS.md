@@ -16,13 +16,16 @@ requires explicit recovery; it is not equivalent to restarting the worker proces
 
 The normal client enqueues a stable logical job. The controller commits placement and a separate
 execution attempt when an eligible worker has capacity. `Assign` also supports explicit placement,
-including persistent instances. `Desire` changes lifecycle intent with an expected revision.
+including persistent instances. Job construction in both paths uses the same admission validator;
+portable jobs require an immutable input bundle and configured storage targets, so they must use
+the queue submission interface that carries that bundle. Direct assignment cannot bypass those rules.
+`Desire` changes lifecycle intent with an expected revision.
 Acceptance means the intent is durable, not that the process or VM is already running.
 [Checkpoint continuation](CHECKPOINT_JOBS.md) creates a new attempt on the original worker; it does
 not move a live process or VM between hosts.
 
-The worker initiates an authenticated `WorkerRead`. A replica must establish a linearizable read before
-returning that worker's assignments. Workers follow the same authenticated membership discovery as
+The worker initiates an authenticated `WorkerSync`. A replica must establish a linearizable read before
+returning a snapshot, change batch, continuation page or head confirmation. Workers follow the same authenticated membership discovery as
 clients and retain it on disk. Removed replicas have no push-command channel to the worker. An isolated
 old leader cannot supply new work without a quorum. This pull design replaces the earlier proposed
 leader-to-worker takeover handshake; there is no additional lease or caller-supplied term to trust.
@@ -32,6 +35,47 @@ reconciles durable backend records using stable execution IDs. Its numbered obse
 restart. The control plane authenticates the enrolled key/incarnation and applies each contiguous report
 and cursor atomically. Confirmed cursor progress allows the worker to discard acknowledged outbox entries.
 Control-plane report receipts are retained under the existing receipt policy.
+
+### Bounded synchronization
+
+The worker durably saves a complete accepted image and cursor in `worker.redb`, atomically with the
+accepted intent and observation acknowledgments. The cursor contains the committed revision and a
+content digest. Polls request changes since that image. Unchanged resource records, including old
+assignments and managed VM operations, are not retransmitted. Initial synchronization, or an evicted
+base, transfers a complete snapshot. Both snapshots and changes are split into 64 KiB byte pages;
+even a single large resource can span pages without exceeding the 8 MiB wire frame bound.
+
+Pages belong to an immutable transfer, scoped to the authenticated worker incarnation. The receiver
+checks offsets, transfer hash, resulting image hash and monotonic revision. It assembles changes without
+executing intermediate entries, then polls the current head again. Changes committed during pagination,
+including cancellation or recovery holds, are incorporated before the worker accepts the resulting image.
+Missing pages, controller replacement, worker restart and cache eviction cannot authorize partial effects.
+A durable pending-sync marker also survives a crash during transfer: on restart the agent waits for a
+complete fresh image rather than initiating effects from its older accepted view while disconnected.
+Each tick handles at most eight exchanges. Detached supervisors continue while a replacement image is
+being downloaded; the agent defers new reconciliation effects until synchronization completes.
+
+Delivery caches are disposable, not a second replicated log: each replica retains at most three recent
+images and two transfer bodies per worker incarnation. Eviction or replica restart falls back to a
+snapshot. Workers keep their last accepted image across restart and discard incomplete downloads.
+Emergency authority rebinding clears the delivery cursor while preserving execution markers and the
+existing explicit recovery inventory/hold protocol. Request receipts do not depend on delivery-cache retention.
+
+The wire and per-tick work are bounded; complete projections and transfer bodies still occupy memory
+proportional to resource history. Projection construction, local journal reads and archival scans still
+hydrate resource metadata. This is not incremental database hydration or removal of historical records.
+Finished execution is excluded from repeated backend reconciliation once its terminal observation is
+durable locally. Artifact/history publication and reclamation continue separately.
+
+### Diagnostic delivery
+
+Lifecycle diagnostics are normalized to at most 4,096 UTF-8 bytes before change detection, sequence
+assignment and outbox persistence. A pre-fix oversized outbox entry is retried unchanged until the
+control plane definitively returns its specific diagnostic-size rejection. Only then may the worker
+submit the same sequence, assignment, revision and lifecycle outcome with a shortened diagnostic and
+a new deterministic request ID. The original rejection receipt remains immutable. Timeouts retain an
+unknown outcome and never authorize correction, skipping a sequence or discarding a lifecycle observation.
+The corrected request can be retried after lost replies and worker restart.
 
 Accepted workloads continue during control-plane outages, including local completion and cleanup.
 Cancellation accepted during an outage takes effect when the worker receives it. Unreachable or uncertain

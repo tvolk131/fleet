@@ -116,9 +116,10 @@ pub enum Message {
         artifact: String,
         upload: bool,
     },
-    WorkerRead {
+    WorkerSync {
         worker: String,
         incarnation: String,
+        request: super::worker_sync::Request,
     },
 }
 
@@ -155,7 +156,7 @@ pub enum Answer {
     TunnelRead(Result<super::tunnels::View, ApiError>),
     TunnelObserve(Result<Reply, ApiError>),
     TunnelStatus(Result<super::tunnels::status::Snapshot, ApiError>),
-    WorkerRead(Result<super::workload::WorkerView, ApiError>),
+    WorkerSync(Result<super::worker_sync::Reply, ApiError>),
     StorageRead(Result<super::artifact::View, ApiError>),
     AuthorizeArtifact(Result<bool, ApiError>),
     Refused(String),
@@ -439,6 +440,7 @@ struct Handler {
     blocked: Blocked,
     drop_write_reply: Arc<AtomicBool>,
     presence: super::queue::Presence,
+    worker_sync: Arc<Mutex<super::worker_sync::Cache>>,
     tunnel_presence: super::tunnels::status::Presence,
 }
 
@@ -658,20 +660,47 @@ impl Handler {
                         }),
                 )
             }
-            Message::WorkerRead {
+            Message::WorkerSync {
                 worker,
                 incarnation,
+                request,
             } => {
                 if let Err(e) = self.raft.ensure_linearizable().await {
-                    return Answer::WorkerRead(Err(ApiError {
+                    return Answer::WorkerSync(Err(ApiError {
                         message: e.to_string(),
                         leader: e.forward_to_leader().and_then(|f| f.leader_id),
                     }));
                 }
+                // Continuation pages only need a point authorization read, not a catalog scan.
+                if let super::worker_sync::Request::Page { token, offset } = &request {
+                    let registration = self
+                        .store
+                        .query(super::store::query::Query::Get {
+                            collection: super::store::indexed::Collection::Workers,
+                            key: worker.clone(),
+                        })
+                        .await
+                        .ok()
+                        .and_then(|value| {
+                            serde_json::from_value::<super::workload::Registration>(value).ok()
+                        });
+                    let Some(registration) = registration
+                        .filter(|r| r.peer.identity == peer && r.incarnation == incarnation)
+                    else {
+                        return Answer::Refused(
+                            "worker identity or incarnation is not enrolled".into(),
+                        );
+                    };
+                    return Answer::WorkerSync(Ok(self
+                        .worker_sync
+                        .lock()
+                        .expect("worker sync cache")
+                        .continuation(&registration.cursor(), token, *offset)));
+                }
                 let state = match self.store.view().await {
                     Ok(s) => s,
                     Err(e) => {
-                        return Answer::WorkerRead(Err(ApiError {
+                        return Answer::WorkerSync(Err(ApiError {
                             message: e.to_string(),
                             leader: None,
                         }));
@@ -700,7 +729,7 @@ impl Handler {
                 });
                 vm.bindings.retain(|_, b| b.worker == worker);
                 vm.hosts = None;
-                Answer::WorkerRead(Ok(super::workload::WorkerView {
+                let view = super::workload::WorkerView {
                     vm,
                     generation: state.version.active,
                     history: state
@@ -769,7 +798,24 @@ impl Handler {
                         .filter(|a| a.worker == worker)
                         .cloned()
                         .collect(),
-                }))
+                };
+                let cache = self.worker_sync.clone();
+                let key = registration.cursor();
+                let revision = state.last_applied.map_or(0, |id| id.index);
+                let answer = tokio::task::spawn_blocking(move || {
+                    cache
+                        .lock()
+                        .expect("worker sync cache")
+                        .answer(&key, revision, &view, request)
+                })
+                .await;
+                Answer::WorkerSync(match answer {
+                    Ok(Ok(reply)) => Ok(reply),
+                    other => Err(ApiError {
+                        message: format!("worker synchronization failed: {other:?}"),
+                        leader: None,
+                    }),
+                })
             }
             Message::StorageRead {
                 storage,
@@ -1089,6 +1135,7 @@ impl Replica {
                     store: store.clone(),
                     config,
                     presence,
+                    worker_sync: Default::default(),
                     tunnel_presence: super::tunnels::status::Presence::default(),
                     blocked: blocked.clone(),
                     drop_write_reply: drop_write_reply.clone(),
@@ -1302,7 +1349,7 @@ impl Client {
                         Answer::Write(Err(e))
                         | Answer::Read(Err(e))
                         | Answer::Query(Err(e))
-                        | Answer::WorkerRead(Err(e))
+                        | Answer::WorkerSync(Err(e))
                         | Answer::StorageRead(Err(e))
                         | Answer::TunnelRead(Err(e))
                         | Answer::TunnelObserve(Err(e))

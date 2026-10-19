@@ -13,6 +13,12 @@ fingerprints, producer sequences, resource revisions and Raft positions are not 
 CLI and GUI still share one durable request journal and replicated API. Incremental resource access
 is a separate future change: resource invariants still hydrate the catalog inside atomic transactions.
 
+The pre-cutover baseline now uses bounded `WorkerSync` delivery in place of `WorkerRead`. Install
+matching controller and worker executables during the pending baseline import; earlier baseline
+development builds are not mixed-version participants for this interface change. The sole normal
+installation remains on the pre-baseline family until that explicit cutover. The delivery cursor and
+pending-transfer marker are additional worker-journal keys, independent of request and execution identity.
+
 ## One-time import of the existing installation
 
 The separate, unpublished `fleet-tools` package contains `fleet-import-baseline`. It supports exactly
