@@ -228,5 +228,57 @@ the guest a pause in traffic (buffered up to the socket size, then back-pressure
 Because a closed end is invisible to the guest, "the card is not connected" has to be Fleet's own
 state, reported in `Observed`, never inferred from the guest.
 
-Still open: disks (raw images, `clonefile`), a
-macOS guest and its IPSW install (question 2), restore on a different host, and everything `krun`.
+Still open for `vz`: disks (raw images, `clonefile`), a macOS guest and its IPSW install
+(question 2), and restore on a different host.
+
+## Findings: `krun` spike, 2026-10-19
+
+Same host, and the **same guest**: the Kata kernel also has virtio-mmio, so libkrun boots the
+identical kernel and initramfs through `krun_set_kernel`. libkrun 1.19.6 from the `slp/krun`
+Homebrew tap, runner ad-hoc signed with only `com.apple.security.hypervisor`, run as a normal user.
+
+| Check | `krun` | `vz` for comparison |
+| --- | --- | --- |
+| No root | Passes | Passes |
+| Boot to `/init` | 24 ms after the kernel starts; the runner enters the VM 0.3 ms after launch | 80 ms start plus 58 ms |
+| Processes and memory | One process, 88 MB RSS for a 512 MB guest | Runner 11 MB plus XPC service 88 MB |
+| Network card | `krun_add_net_unixgram` with Fleet's socketpair fd: frames both ways, one per datagram | Same |
+| Throughput | About 0.96 GB/s of 1514-byte frames | About 1.4 GB/s |
+| Fleet stalls | Identical: back-pressure after about 4 MB, everything delivered on resume, vsock unaffected | Same |
+| vsock | Host connects to a Unix socket libkrun listens on (`krun_add_vsock_port2(listen=true)`); 0.3 ms round trip | Host calls `connectToPort` on the device; about 1 ms |
+| Graceful stop | `krun_get_shutdown_eventfd` written; this guest ignores it | `requestStop`; ignored |
+| Guest power-off | libkrun calls `exit(0)`; the runner is gone | `stopped`, runner exits 0 |
+| Force stop | Exit the process | `stop`, 1.4 ms |
+| Save/restore | None in the API | Works |
+| MTU | No API; 1500 | Configurable to 65535 |
+
+Licensing: libkrun (Apache-2.0) links only system frameworks, libepoxy and virglrenderer (both MIT).
+It `dlopen`s libkrunfw (GPL/LGPL, the bundled kernel) only when no kernel is supplied; Fleet always
+supplies its own. The guest kernel is GPL under either backend: Fleet ships it as a separate
+artifact with its source reference, as every VM product does.
+
+## What the two spikes mean for the trait
+
+The hypothesis held. Both backends fit one shape, and the differences are capabilities, not
+structure:
+
+- **One runner process per VM, everywhere.** `krun` makes it unavoidable (`krun_start_enter` owns
+  the process); `vz` makes it natural (the VM dies with its process). The worker supervises runners
+  over `runner.sock` and never links a hypervisor.
+- **One runner protocol, two runner implementations.** `status`, `stop`, `kill`, network card
+  handover and a guest stream are the same commands for both. `save` exists only where advertised.
+  The `Driver` trait in the worker is mostly backend-independent runner supervision, plus per-backend
+  `prepare` (image layout) and capabilities.
+- **The network card contract is exactly the same**: a unix datagram socketpair, frame per
+  datagram, identical back-pressure. One host network agent serves both.
+- **The guest channel differs underneath but not above**: `connect_guest(port)` returns a stream
+  either way; the runner hides `connectToPort` versus a Unix socket.
+- **Graceful stop is the guest agent's job** on both. The backends' own mechanisms (power button,
+  shutdown eventfd) are fallbacks for guests that support them.
+- **Capabilities that really differ**: save/restore and macOS guests (`vz` only), configurable MTU
+  (`vz` only), Linux hosts (`krun` only).
+
+Trait changes from the draft above: `Phase` gains `Lost`; `InstanceSpec` gains `mtu`; `StopMode` is
+`Graceful { deadline }` or `Force`, with the driver choosing the escalation; the network card is
+created and held by the runner, and the worker borrows it (`network_card(id) -> OwnedFd`) instead of
+passing one into `start`.
