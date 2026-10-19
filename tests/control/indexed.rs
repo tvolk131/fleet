@@ -584,7 +584,17 @@ async fn indexed_queries_and_receipts_survive_network_snapshot_and_leader_loss()
     // Prefer the survivor with the older snapshot. Its initial catch-up AppendEntries can exceed
     // the frame budget even though every individual command fits; it must split and make progress.
     c.replicas[&successor].raft.trigger().elect().await.unwrap();
-    let retried = c.client.write(request.clone(), WAIT).await;
+    // Reconciliation may walk the 70+ MiB retained log before the new leader can commit. A short
+    // client deadline is allowed to expire with an unknown outcome; it is not a failover SLO.
+    match c
+        .client
+        .write(request.clone(), Duration::from_millis(750))
+        .await
+    {
+        Ok(reply) => assert_eq!(reply, accepted),
+        Err(error) => assert!(error.to_string().contains("outcome is unknown")),
+    }
+    let retried = c.client.write(request.clone(), WAIT * 3).await;
     if retried.is_err() {
         for (id, replica) in &c.replicas {
             eprintln!("replica {id}: {:?}", *replica.raft.metrics().borrow());
