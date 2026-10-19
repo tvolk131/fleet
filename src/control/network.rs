@@ -32,7 +32,7 @@ use super::discovery::save_cache;
 use super::membership::{MembershipView, spawn_reconciler};
 use super::{Command, Raft, Reply, Request, State, Store, TypeConfig, store::snapshot::MAX_STREAM};
 
-pub const ALPN: &[u8] = b"fleet/control/rolling/1";
+pub const ALPN: &[u8] = b"fleet/baseline/control/1";
 const MAX_FRAME: usize = 8 << 20;
 // Leave room for the Raft entry, vote and protocol envelopes around an admitted command.
 const MAX_COMMAND: usize = 7 << 20;
@@ -605,7 +605,7 @@ impl Handler {
             Message::Vote(rpc) if is_replica => Answer::Vote(self.raft.vote(rpc).await),
             Message::Snapshot(rpc) if is_replica => {
                 if rpc.offset.saturating_add(rpc.data.len() as u64) > MAX_STREAM {
-                    return Answer::Refused("snapshot exceeds lab limit".into());
+                    return Answer::Refused("snapshot exceeds size limit".into());
                 }
                 Answer::Snapshot(self.raft.install_snapshot(rpc).await)
             }
@@ -861,15 +861,6 @@ impl Handler {
                         leader: e.forward_to_leader().and_then(|f| f.leader_id),
                     }));
                 }
-                match self.store.header().await {
-                    Ok(state) if state.version.active >= super::store::indexed::GENERATION => (),
-                    Ok(_) => {
-                        return Answer::Refused(
-                            "indexed queries require active generation 5".into(),
-                        );
-                    }
-                    Err(e) => return Answer::Refused(e.to_string()),
-                }
                 match self.store.query(query).await {
                     Ok(value) => Answer::Query(Ok(value)),
                     Err(e) => Answer::Refused(e.to_string()),
@@ -972,13 +963,13 @@ impl ProtocolHandler for Handler {
                         answer,
                         discovery: handler.store.header().await?.routing_view(),
                     })?;
-                    ensure!(bytes.len() <= MAX_FRAME, "response exceeds lab limit");
+                    ensure!(bytes.len() <= MAX_FRAME, "response exceeds frame limit");
                     send.write_all(&bytes).await?;
                     send.finish()?;
                     Ok::<_, anyhow::Error>(())
                 };
                 if let Ok(Err(error)) = tokio::time::timeout(timeout, operation).await {
-                    tracing::debug!(%error, "control lab stream ended");
+                    tracing::debug!(%error, "control stream ended");
                 }
             });
         }
@@ -1015,7 +1006,7 @@ impl Replica {
         );
         ensure!(
             !config.administrators.is_empty(),
-            "lab requires an administrator"
+            "control plane requires an administrator"
         );
         ensure!(
             config
@@ -1354,24 +1345,11 @@ impl Client {
         }
     }
 
-    /// Inspect is only capability discovery; Query subsequently obtains a quorum read barrier.
-    pub async fn indexed_queries(&mut self, deadline: Duration) -> Result<bool> {
-        match self.call(Message::Inspect, deadline).await? {
-            Answer::Inspect(status) => {
-                Ok(status.version.active >= super::store::indexed::GENERATION)
-            }
-            other => bail!("unexpected inspect reply: {other:?}"),
-        }
-    }
     pub async fn view(&mut self, deadline: Duration) -> Result<State> {
-        if self.indexed_queries(deadline).await? {
-            Ok(serde_json::from_value(
-                self.query(super::store::query::Query::View, deadline)
-                    .await?,
-            )?)
-        } else {
-            self.read(deadline).await
-        }
+        Ok(serde_json::from_value(
+            self.query(super::store::query::Query::View, deadline)
+                .await?,
+        )?)
     }
 
     /// Inspect exactly one pinned replica, without following leader hints or claiming a strong read.

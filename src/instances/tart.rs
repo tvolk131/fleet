@@ -420,7 +420,7 @@ pub fn run_controller(home: &Path, id: &str) -> Result<()> {
                     return Ok(false);
                 }
                 // Native submissions see desired=running and cannot race this start.
-                let capacity: crate::proto::Hello =
+                let capacity: crate::worker_data::Hello =
                     match crate::jobs::read_json(&home.join("instance-capacity.json"))? {
                         Some(current) => current,
                         None => crate::jobs::read_json(&dir.join("capacity.json"))?

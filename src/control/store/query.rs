@@ -63,24 +63,17 @@ impl Store {
                     Ok(value)
                 }
                 Query::Stats => {
-                    let indexed = format == indexed::FORMAT;
-                    let receipts = if indexed { tx.open_table(RECEIPTS)?.len()? } else { header.receipts.len() as u64 };
-                    let resources = if indexed { tx.open_table(ROWS)?.len()? } else { 0 };
-                    Ok(serde_json::json!({"cluster":header.cluster,"applied":header.last_applied,"physical_format":format,"indexed":indexed,"receipts":receipts,"resource_rows":resources,"receipt_retention":"indefinite"}))
+                    let receipts = tx.open_table(RECEIPTS)?.len()?;
+                    let resources = tx.open_table(ROWS)?.len()?;
+                    Ok(serde_json::json!({"cluster":header.cluster,"applied":header.last_applied,"physical_format":format,"indexed":true,"receipts":receipts,"resource_rows":resources,"receipt_retention":"indefinite"}))
                 }
                 Query::Get { collection, key } => {
-                    if format == indexed::FORMAT {
-                        Ok(tx.open_table(ROWS)?.get((collection as u8, key.as_str()))?
+                    Ok(tx.open_table(ROWS)?.get((collection as u8, key.as_str()))?
                             .map(|r| serde_json::from_slice(r.value())).transpose()?.unwrap_or(serde_json::Value::Null))
-                    } else {
-                        Ok(serde_json::to_value(header)?.pointer(collection.path()).and_then(|m| m.get(key)).cloned().unwrap_or(serde_json::Value::Null))
-                    }
                 }
                 Query::Receipt { principal, request_id } => {
                     let key = super::super::model::key(&principal, &request_id);
-                    if format == indexed::FORMAT {
-                        Ok(read::<serde_json::Value>(&tx.open_table(RECEIPTS)?, &key)?.unwrap_or(serde_json::Value::Null))
-                    } else { Ok(serde_json::to_value(header.receipts.get(&key))?) }
+                    Ok(read::<serde_json::Value>(&tx.open_table(RECEIPTS)?, &key)?.unwrap_or(serde_json::Value::Null))
                 }
                 Query::Page { collection, cursor, limit } => {
                     ensure!((1..=256).contains(&limit), "page limit must be 1..=256");
@@ -97,7 +90,7 @@ impl Store {
                         page.items.push((key.into(), serde_json::from_slice(value)?));
                         Ok(true)
                     };
-                    if format == indexed::FORMAT {
+                    {
                         if let Some(collection) = collection {
                             let start = cursor.as_ref().map_or(Included((collection as u8, "")), |c| Excluded((collection as u8, c.after.as_str())));
                             for row in tx.open_table(ROWS)?.range((start, Excluded((collection as u8 + 1, ""))))? {
@@ -110,13 +103,6 @@ impl Store {
                                 let (key, value) = row?;
                                 if !append(key.value(), value.value())? { break; }
                             }
-                        }
-                    } else {
-                        let value = serde_json::to_value(&header)?;
-                        let map = value.pointer(collection.map_or("/receipts", Collection::path)).and_then(|v| v.as_object()).context("missing collection")?;
-                        for (key, value) in map {
-                            if cursor.as_ref().is_some_and(|c| key <= &c.after) { continue; }
-                            if !append(key, &serde_json::to_vec(value)?)? { break; }
                         }
                     }
                     Ok(serde_json::to_value(page)?)

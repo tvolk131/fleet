@@ -12,6 +12,7 @@ use std::{
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RecoveryPlan {
+    pub family: String,
     pub format: u32,
     pub logical_cluster: String,
     pub previous: String,
@@ -51,7 +52,7 @@ fn digest(value: &impl Serialize) -> Result<String> {
         .to_string())
 }
 fn signing_bytes(plan: &RecoveryPlan) -> Result<Vec<u8>> {
-    let mut bytes = b"fleet/disaster-recovery/1\0".to_vec();
+    let mut bytes = b"fleet/baseline/disaster-recovery/1\0".to_vec();
     bytes.extend(serde_json::to_vec(plan)?);
     Ok(bytes)
 }
@@ -65,7 +66,8 @@ impl Manifest {
             .verify(&signing_bytes(&self.plan)?, &self.signature)?;
         let p = &self.plan;
         ensure!(
-            p.format == super::FORMAT
+            p.family == super::FAMILY
+                && p.format == super::FORMAT
                 && p.previous == previous
                 && p.config.cluster != previous
                 && !p.config.cluster.is_empty()
@@ -124,6 +126,7 @@ pub async fn recover(
         .unwrap_or_default();
     ancestors.insert(config.cluster.clone());
     let plan = RecoveryPlan {
+        family: super::FAMILY.into(),
         format: super::FORMAT,
         logical_cluster: source_state
             .recovery

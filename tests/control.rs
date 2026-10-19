@@ -1087,7 +1087,8 @@ async fn committed_request_survives_sigkill_and_process_restart() {
         }
     }
     let home = Home::new();
-    let initialized = std::process::Command::new(env!("CARGO_BIN_EXE_fleet-control-lab"))
+    let initialized = std::process::Command::new(env!("CARGO_BIN_EXE_fleet"))
+        .arg("cluster")
         .arg("init")
         .arg("--home")
         .arg(&home.0)
@@ -1104,7 +1105,8 @@ async fn committed_request_survives_sigkill_and_process_restart() {
     let config: Config = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
     let admin = fleet::keys::load_or_create(&home.0.join("client/node.key")).unwrap();
     let start = |bootstrap: bool| {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_fleet-control-lab"));
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_fleet"));
+        cmd.arg("cluster");
         cmd.arg("serve")
             .arg("--home")
             .arg(home.0.join("node-1"))
@@ -1306,7 +1308,8 @@ async fn membership_cli_survives_retiring_every_original_bootstrap_peer() {
     let config_path = format!("{root}/client/config.json");
     let key_path = format!("{root}/client/node.key");
     let run = |args: &[&str]| -> serde_json::Value {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_fleet-control-lab"))
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_fleet"))
+            .arg("cluster")
             .args(args)
             .output()
             .unwrap();
@@ -1319,7 +1322,8 @@ async fn membership_cli_survives_retiring_every_original_bootstrap_peer() {
     };
     run(&["init", "--home", &root, "--replicas", "1"]);
     let start = |id: u64, bootstrap: bool| {
-        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_fleet-control-lab"));
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_fleet"));
+        command.arg("cluster");
         command
             .args([
                 "serve",

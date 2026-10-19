@@ -828,7 +828,7 @@ async fn run(args: Args) -> Result<()> {
             let manifest = serde_json::from_slice(&std::fs::read(manifest)?)?;
             let lock_home = client_home.clone();
             let _lock = tokio::task::spawn_blocking(move || {
-                fleet::keys::lock_coordinator(&lock_home, std::time::Duration::from_secs(30))
+                fleet::keys::lock_client(&lock_home, std::time::Duration::from_secs(30))
             })
             .await??;
             fleet::control::recovery::accept_client(&client_home.join("config.json"), &manifest)?;

@@ -8,78 +8,40 @@ pub(super) fn snapshot_file(bytes: Vec<u8>) -> Box<tokio::fs::File> {
     Box::new(tokio::fs::File::from_std(file))
 }
 
-fn request(id: &str, mutation: Mutation) -> Request {
-    Request {
-        origin: "cluster".into(),
-        id: id.into(),
-        mutation,
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn version_preparation_survives_leader_loss_and_lost_activation_reply() {
-    let mut c = Cluster::new(3).await;
-    assert_eq!(
-        c.client
-            .write(
-                request(
-                    "prepare",
-                    Mutation::PrepareVersion {
-                        expected_revision: 0,
-                        target: fleet::control::version::MAX,
-                    }
-                ),
-                WAIT
-            )
-            .await
-            .unwrap(),
-        Reply::Recorded
-    );
-    let deadline = tokio::time::Instant::now() + WAIT;
-    loop {
-        let s = c.client.read(WAIT).await.unwrap();
-        if s.version.pending.as_ref().unwrap().ready == BTreeSet::from([1, 2, 3]) {
-            break;
+fn state_snapshot(state: &State) -> Vec<u8> {
+    let mut header = serde_json::to_value(state).unwrap();
+    let mut rows = Vec::new();
+    for (kind, path) in [
+        (0, "/receipts"),
+        (1, "/jobs"),
+        (2, "/assignments"),
+        (3, "/checkpoints"),
+        (4, "/workers"),
+        (5, "/membership_operations"),
+        (6, "/cursors"),
+        (7, "/vm/operations"),
+        (8, "/storage/artifacts"),
+        (9, "/history/attempts"),
+        (10, "/history/jobs"),
+    ] {
+        let map = header.pointer_mut(path).unwrap().as_object_mut().unwrap();
+        for (key, value) in map.iter() {
+            rows.push(serde_json::json!([kind, key, value]));
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "preparation did not converge"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        map.clear();
     }
-    let leader = c.leader().await;
-    c.replicas
-        .remove(&leader)
-        .unwrap()
-        .shutdown()
-        .await
-        .unwrap();
-    let next = c.leader().await;
-    c.replicas[&next]
-        .drop_write_reply
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let activate = request(
-        "activate",
-        Mutation::ActivateVersion {
-            expected_revision: 1,
-        },
-    );
-    assert_eq!(
-        c.client.write(activate.clone(), WAIT).await.unwrap(),
-        Reply::Recorded
-    );
-    assert_eq!(
-        c.client.write(activate, WAIT).await.unwrap(),
-        Reply::Recorded
-    );
-    assert_eq!(
-        c.client.read(WAIT).await.unwrap().version.active,
-        fleet::control::version::MAX
-    );
-    c.start(leader).await;
-    c.close().await;
+    let mut bytes = b"FLEET-BASELINE-1\n".to_vec();
+    bytes.extend(serde_json::to_vec(&header).unwrap());
+    bytes.push(b'\n');
+    for row in rows {
+        bytes.extend(serde_json::to_vec(&row).unwrap());
+        bytes.push(b'\n');
+    }
+    bytes
 }
 
+// Mixed-version preparation, leader loss, rollback and incompatible writes are exercised
+// by fleet-qualify rolling-upgrade using separately built 1, 1..2 and 3..4 executables.
 #[tokio::test]
 async fn unsupported_snapshot_and_startup_leave_original_bytes_unchanged() {
     use redb::{Database, ReadableDatabase, TableDefinition};
@@ -91,7 +53,7 @@ async fn unsupported_snapshot_and_startup_leave_original_bytes_unchanged() {
     let mut snapshot = store.build_snapshot().await.unwrap();
     let mut future = original.clone();
     future.version.active = fleet::control::version::MAX + 1;
-    let bytes = serde_json::to_vec(&future).unwrap();
+    let bytes = state_snapshot(&future);
     snapshot.meta.snapshot_id = blake3::hash(&bytes).to_hex().to_string();
     snapshot.snapshot = snapshot_file(bytes);
     assert!(
@@ -105,7 +67,7 @@ async fn unsupported_snapshot_and_startup_leave_original_bytes_unchanged() {
     let mut upgraded = original.clone();
     upgraded.version.active = fleet::control::version::MAX;
     upgraded.version.revision = 2;
-    let bytes = serde_json::to_vec(&upgraded).unwrap();
+    let bytes = state_snapshot(&upgraded);
     let mut meta = stale.meta.clone();
     meta.snapshot_id = blake3::hash(&bytes).to_hex().to_string();
     store

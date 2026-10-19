@@ -521,3 +521,20 @@ impl Drop for Lab {
         }
     }
 }
+
+/// Locate workspace tools, never an installed service executable.
+pub fn tool(name: &str) -> PathBuf {
+    let exe = std::env::current_exe().expect("test executable");
+    let dir = exe.parent().expect("test binary directory");
+    let dir = if dir.file_name().is_some_and(|n| n == "deps") {
+        dir.parent().unwrap()
+    } else {
+        dir
+    };
+    let path = dir.join(name);
+    assert!(
+        path.is_file(),
+        "build workspace tools first: cargo build --workspace --all-features --bins"
+    );
+    path
+}

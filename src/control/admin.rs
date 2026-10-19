@@ -53,15 +53,6 @@ pub enum Command {
         #[arg(long)]
         manifest: PathBuf,
     },
-    /// Offline format-5 through 11 upgrade: idle singleton, stopped workers, and paused client staging. Keeps backups.
-    Upgrade {
-        #[arg(long)]
-        controller_home: PathBuf,
-        #[arg(long)]
-        worker_home: Vec<PathBuf>,
-        #[arg(long)]
-        client_home: Vec<PathBuf>,
-    },
     /// Offline lost-quorum recovery. Creates a fresh single-replica home and signed manifest.
     Recover {
         #[arg(long)]
@@ -246,6 +237,7 @@ pub enum Command {
         worker_home: Option<PathBuf>,
         /// Qualification only: a local JSON array of peer public keys whose traffic is blocked.
         /// Reloaded while running; never modifies host networking or installed services.
+        #[cfg(feature = "qualification")]
         #[arg(long)]
         qualification_partition: Option<PathBuf>,
     },
@@ -288,16 +280,6 @@ pub async fn run(command: Command) -> Result<()> {
             })
             .await??;
             println!("{}", serde_json::to_string_pretty(&request)?);
-        }
-        Command::Upgrade {
-            controller_home,
-            worker_home,
-            client_home,
-        } => {
-            tokio::task::spawn_blocking(move || {
-                super::upgrade::run(&controller_home, &worker_home, &client_home)
-            })
-            .await??;
         }
         Command::Recover {
             source_home,
@@ -539,11 +521,8 @@ pub async fn run(command: Command) -> Result<()> {
             let request: Request = if path.exists() {
                 serde_json::from_slice(&std::fs::read(&path)?)?
             } else {
-                let file: crate::coordinator::JobFile =
-                    serde_json::from_slice(&std::fs::read(job)?)?;
-                let coordinator =
-                    crate::coordinator::Coordinator::new(client.endpoint.clone(), store.clone());
-                let spec = coordinator.prepare(&file).await?;
+                let file: crate::inputs::JobFile = serde_json::from_slice(&std::fs::read(job)?)?;
+                let spec = crate::inputs::prepare(&store, &file).await?;
                 let request = Request {
                     origin: client.cluster.clone(),
                     id: request_id.clone(),
@@ -840,10 +819,12 @@ pub async fn run(command: Command) -> Result<()> {
             config,
             bootstrap,
             worker_home,
+            #[cfg(feature = "qualification")]
             qualification_partition,
         } => {
             let config: Config = serde_json::from_slice(&std::fs::read(config)?)?;
             let replica = Replica::start(&home, config.clone()).await?;
+            #[cfg(feature = "qualification")]
             let partition_task = if let Some(path) = qualification_partition {
                 let blocked = replica.blocked.clone();
                 let initial = serde_json::from_slice(&std::fs::read(&path)?)?;
@@ -880,6 +861,7 @@ pub async fn run(command: Command) -> Result<()> {
             } else {
                 crate::shutdown_signal().await;
             }
+            #[cfg(feature = "qualification")]
             if let Some(task) = partition_task {
                 task.abort();
                 let _ = task.await;

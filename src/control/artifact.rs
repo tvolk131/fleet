@@ -63,9 +63,7 @@ pub struct Manifest {
     pub files: Vec<OutputFile>,
 }
 pub(crate) fn read_manifest(path: &std::path::Path) -> Result<Manifest> {
-    let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
-    super::upgrade::artifact_origins(&mut value);
-    Ok(serde_json::from_value(value)?)
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
 }
 impl Manifest {
     pub fn new(

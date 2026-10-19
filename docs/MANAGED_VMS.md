@@ -139,14 +139,13 @@ undo an application's prior side effects.
 
 ## Upgrade and qualification
 
-This executable supports generations 3–4. Upgrade all replicas at generation 3, prepare generation 4,
-then explicitly activate it. Workers advertise managed-VM capability before new requests are accepted.
-A worker durably accepting generation 4 upgrades its journal marker to format 13, so an older worker
-binary refuses to reopen it. Controller redb format remains 12. Never downgrade an activated worker by
-editing its marker or restoring an old journal over accepted work.
+Managed VMs are part of [baseline generation 1](BASELINE.md). Workers must advertise the appropriate
+capabilities before requests are accepted. The separate offline importer preserves existing operation
+history and execution markers. Future [rolling upgrades](ROLLING_UPGRADES.md) retain version guards;
+never edit a marker or restore an old journal over accepted work.
 
 ```sh
-cargo build --all-features --bins --locked
+cargo build --workspace --all-features --bins --locked
 fleet-qualify managed-vm --fake --binary /absolute/fleet --home /tmp/fleet-control-managed-vm
 ```
 

@@ -35,7 +35,7 @@ upgraded by qualification.
 ## Qualification commands
 
 ```sh
-cargo build --all-features --bins --locked
+cargo build --workspace --all-features --bins --locked
 cargo test --workspace --all-features --locked -- --test-threads=2
 target/debug/fleet-qualify --help
 ```
@@ -46,20 +46,20 @@ writes to fresh `/tmp/fleet-control-*` homes, validates service-role paths, and 
 identities before signaling processes. SSH mode uses a matching Rust runner on each host and keeps
 the launch session alive until its child exits. Local launchd mode uses disposable user services.
 
-| Previous Python coverage | Rust replacement |
+| Contract | Coverage |
 | --- | --- |
-| Nine public JSON CLI/service tests | `tests/cli_contract.rs`: inputs, executable permissions, logs/cursors, output overwrite refusal, queue dependencies/cancellation, durable retries/conflicts/unknown outcomes, staging service, storage status, service rendering and identity permissions |
-| Four host-fixture safeguard tests | `tests/cli_contract.rs`: path escapes, foreign service roles, foreign PIDs, owned children and held launch sessions |
-| Two rolling-reclamation predicate tests | `contrib/rust/tart.rs` unit tests; unavailable reports cannot confirm cleanup |
-| Previous/candidate/incompatible builds and rolling upgrades | `fleet-qualify build-upgrade-fixtures` and `rolling-upgrade` |
+| Public JSON CLI/service behavior | `tests/cli_contract.rs`: inputs, executable permissions, logs/cursors, output overwrite refusal, queue dependencies/cancellation, durable retries/conflicts/unknown outcomes, staging service, storage status, service rendering and identity permissions |
+| Host-fixture safeguards | `tests/cli_contract.rs`: path escapes, foreign service roles, foreign PIDs, owned children and held launch sessions |
+| Rolling-reclamation predicates | `contrib/rust/tart.rs` unit tests; unavailable reports cannot confirm cleanup |
+| Synthetic baseline/candidate/incompatible builds and rolling upgrades | `fleet-qualify build-upgrade-fixtures` and `rolling-upgrade` |
 | Checkpoint retention and backup-only restore | `fleet-qualify checkpoint --fake --rolling --backup-restore` |
 | Portable jobs, attempt history and storage replacement/loss | `fleet-qualify portable --fake --storage-lifecycle` (optional `--baseline-binary`) |
 | Normal local/SSH services, membership and disaster recovery | `fleet-qualify normal-multihost --local` or `--inventory`; optional local `--launchd` |
 | Stock Garage over authenticated Fleet service tunnels | `fleet-qualify garage --linux-binary /absolute/path/to/fleet --home /tmp/fleet-control-garage-test`; three Docker namespaces, pinned Garage/runtime/curl images, internal bridge and no host ports |
 | Native/VM coexistence, live outputs/metrics, worker/leader failure and persistent VM lifecycle | `fleet-qualify normal-tart`; real mode requires explicit `--instances` and `--image-cache` |
-| Older standalone control-worker/recovery scripts | Consolidated into the normal Tart and multihost scenarios above; authenticated partition/minority refusal and old-authority fencing also remain in `tests/control.rs` and `tests/control/recovery.rs` |
-| Python Tart double and inline workload programs | `fleet-fake-tart` and `fleet-test-workload` binaries under `tests/fixtures` |
-| Installer's Python systemd validation | `fleet service validate-unit`; the installer takes the absolute Fleet executable as its fourth argument |
+| Worker and recovery failure scenarios | Consolidated into the normal Tart and multihost scenarios above; authenticated partition/minority refusal and old-authority fencing also remain in `tests/control.rs` and `tests/control/recovery.rs` |
+| Simulated Tart and workload programs | `fleet-fake-tart` and `fleet-test-workload` binaries under `tests/fixtures` |
+| Systemd validation | `fleet service validate-unit`; the installer takes the absolute Fleet executable as its fourth argument |
 
 The checkpoint scenario now stages a real executable input. Its disk-reclamation assertion accounts
 for that executable's measured byte length in addition to the two retained checkpoint payloads. The
@@ -67,10 +67,11 @@ backup scenario uses Fleet's existing durable input bundle so both the executabl
 can be restored from the separate storage home after worker-cache removal. The portable scenario separately proves that executable and
 dataset backups survive loss of the original worker, client cache, and input paths.
 
-The rolling baseline is an immutable previous source revision. Qualification runs its unmodified
-binary, activates its highest supported generation, and then installs the candidate. The simulated
-Tart boundary also recognizes fixed historical guest request envelopes in Rust; no interpreter runs.
-Simulated Tart checks do not claim to qualify the real hypervisor.
+The consolidated family has no previous release. Rolling qualification therefore builds explicitly
+synthetic future releases with ranges 1, 1..2 and 3..4. It tests continuity, activation and incompatible
+refusal without claiming historical compatibility. Release qualification must add immutable prior
+binaries once a second family release exists. Simulated Tart checks exercise current guest protocol
+contracts; they do not qualify the real hypervisor.
 
 CI runs on Linux and macOS without a Python setup step. Qualification reports contain hashes and
 results; fixture keys, journals, and job data are never uploaded. Actual multi-machine and real-Tart

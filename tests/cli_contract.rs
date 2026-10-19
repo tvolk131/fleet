@@ -631,7 +631,7 @@ fn fixture_only_recorded_child_is_stopped() -> Result<()> {
 fn fixture_held_session_lives_until_child_stops() -> Result<()> {
     use std::io::{BufRead, Write};
     let root = fixture()?;
-    let mut session = std::process::Command::new(env!("CARGO_BIN_EXE_fleet-qualify"))
+    let mut session = std::process::Command::new(support::tool("fleet-qualify"))
         .arg("host")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -688,5 +688,36 @@ fn rendered_systemd_unit_validates_and_unsafe_variants_are_rejected() -> Result<
         );
     }
     fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn native_failures_timeouts_and_input_escape_use_the_public_api() -> Result<()> {
+    let l = lab()?;
+    submit(
+        &l,
+        "missing",
+        json!({"name":"missing","argv":["/nonexistent/fleet-qualification-program"],"keep_awake":false,"settle_seconds":0}),
+        json!({}),
+    )?;
+    phase(&l, "missing", "failed")?;
+    ensure!(
+        l.request(json!({"op":"logs","id":"missing","stderr":true}))?["Logs"]["data"]
+            .as_str()
+            .is_some_and(|s| s.contains("could not start")),
+        "missing executable diagnostics lost"
+    );
+    submit(
+        &l,
+        "timeout",
+        json!({"name":"timeout","argv":["/bin/sleep","60"],"keep_awake":false,"max_seconds":1,"shutdown_grace_seconds":0,"settle_seconds":0}),
+        json!({}),
+    )?;
+    phase(&l, "timeout", "failed")?;
+    let exit = read(&l.root.join("worker/backend/jobs/exec-timeout-a1/exit.json"))?;
+    ensure!(exit["reason"] == "TimeLimit", "timeout cause lost: {exit}");
+    fs::write(l.root.join("input"), "payload")?;
+    let rejected=l.envelope(json!({"op":"submit","id":"escape","request_id":"escape","memory_mb":128,"job":{"name":"escape","argv":["/bin/true"],"inputs":{"../outside":l.s("input")}}}))?;
+    ensure!(rejected["ok"] == false, "unsafe input accepted");
     Ok(())
 }

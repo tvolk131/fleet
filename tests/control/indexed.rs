@@ -27,55 +27,18 @@ async fn activate(store: &mut Store) {
             .unwrap()[0],
         Reply::Accepted { .. }
     ));
-    store
-        .apply([entry(
-            3,
-            Request {
-                origin: "cluster".into(),
-                id: "prepare".into(),
-                mutation: Mutation::PrepareVersion {
-                    expected_revision: 0,
-                    target: 5,
-                },
-            },
-        )])
-        .await
-        .unwrap();
-    store.prepare_version(1, 5).await.unwrap();
-    let mut ready = entry(
-        4,
-        Request {
-            origin: "cluster".into(),
-            id: "ready".into(),
-            mutation: Mutation::ReplicaPrepared {
-                revision: 1,
-                node: 1,
-            },
-        },
-    );
-    if let EntryPayload::Normal(c) = &mut ready.payload {
-        c.principal = peer.identity.to_string();
-    }
-    store.apply([ready]).await.unwrap();
-    assert_eq!(
+    for index in 3..=5 {
         store
             .apply([entry(
-                5,
-                Request {
-                    origin: "cluster".into(),
-                    id: "activate".into(),
-                    mutation: Mutation::ActivateVersion {
-                        expected_revision: 1
-                    }
-                }
+                index,
+                submit(&format!("duplicate-{index}"), "before-job"),
             )])
             .await
-            .unwrap(),
-        vec![Reply::Recorded]
-    );
+            .unwrap();
+    }
     assert_eq!(
         store.query(Query::Stats).await.unwrap()["physical_format"],
-        14
+        fleet::control::FORMAT
     );
 }
 
@@ -394,64 +357,12 @@ async fn indexed_history_scale_smoke() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn indexed_queries_and_receipts_survive_network_snapshot_and_leader_loss() {
     let mut c = Cluster::new(3).await;
-    assert!(
-        c.client
-            .query(Query::Stats, WAIT)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("generation 5")
+    assert_eq!(
+        c.client.query(Query::Stats, WAIT).await.unwrap()["physical_format"],
+        fleet::control::FORMAT
     );
     let request = submit("once", "job");
     let accepted = c.client.write(request.clone(), WAIT).await.unwrap();
-    c.client
-        .write(
-            Request {
-                origin: "cluster".into(),
-                id: "prepare-indexed".into(),
-                mutation: Mutation::PrepareVersion {
-                    expected_revision: 0,
-                    target: 5,
-                },
-            },
-            WAIT,
-        )
-        .await
-        .unwrap();
-    tokio::time::timeout(WAIT, async {
-        loop {
-            if c.client
-                .read(WAIT)
-                .await
-                .unwrap()
-                .version
-                .pending
-                .as_ref()
-                .unwrap()
-                .ready
-                .len()
-                == 3
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    c.client
-        .write(
-            Request {
-                origin: "cluster".into(),
-                id: "activate-indexed".into(),
-                mutation: Mutation::ActivateVersion {
-                    expected_revision: 1,
-                },
-            },
-            WAIT,
-        )
-        .await
-        .unwrap();
     assert_eq!(
         c.client
             .query(Query::Job { id: "job".into() }, WAIT)
@@ -513,9 +424,9 @@ async fn indexed_queries_and_receipts_survive_network_snapshot_and_leader_loss()
             .await
             .unwrap();
     }
-    let barrier = c.client.query(Query::Stats, WAIT).await.unwrap()["applied"]["index"]
-        .as_u64()
-        .unwrap();
+    let stats = c.client.query(Query::Stats, WAIT).await.unwrap();
+    let receipt_count = stats["receipts"].as_u64().unwrap();
+    let barrier = stats["applied"]["index"].as_u64().unwrap();
     c.replicas[&leader].raft.trigger().snapshot().await.unwrap();
     tokio::time::timeout(WAIT * 12, async {
         loop {
@@ -542,7 +453,7 @@ async fn indexed_queries_and_receipts_survive_network_snapshot_and_leader_loss()
                 .await
                 .unwrap()["receipts"]
                 .as_u64()
-                .is_some_and(|n| n >= 116)
+                .is_some_and(|n| n >= receipt_count)
                 && c.replicas[&follower]
                     .raft
                     .metrics()

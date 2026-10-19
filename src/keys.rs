@@ -104,8 +104,8 @@ pub fn allow(path: &Path, id: EndpointId, note: &str) -> Result<bool> {
 #[derive(Debug)]
 pub struct KeyLock(#[allow(dead_code)] fs::File);
 
-/// Takes the coordinator's key, or `None` if another process holds it.
-pub fn try_lock_coordinator(home: &Path) -> Result<Option<KeyLock>> {
+/// Takes the client's identity lock, or `None` if another process holds it.
+pub fn try_lock_client(home: &Path) -> Result<Option<KeyLock>> {
     use std::os::fd::AsRawFd;
     fs::create_dir_all(home)?;
     let file = fs::OpenOptions::new()
@@ -124,11 +124,11 @@ pub fn try_lock_coordinator(home: &Path) -> Result<Option<KeyLock>> {
     }
 }
 
-/// Takes the coordinator's key, waiting up to `patience` for another holder to let go.
-pub fn lock_coordinator(home: &Path, patience: std::time::Duration) -> Result<KeyLock> {
+/// Takes the client's identity lock, waiting up to `patience` for another holder to let go.
+pub fn lock_client(home: &Path, patience: std::time::Duration) -> Result<KeyLock> {
     let start = std::time::Instant::now();
     loop {
-        if let Some(lock) = try_lock_coordinator(home)? {
+        if let Some(lock) = try_lock_client(home)? {
             return Ok(lock);
         }
         if start.elapsed() >= patience {
@@ -151,6 +151,26 @@ fn from_hex(text: &str) -> Result<[u8; 32]> {
         *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16)?;
     }
     Ok(out)
+}
+
+#[cfg(feature = "control-plane")]
+pub(crate) fn backup_version(path: &Path, version: u32) -> Result<()> {
+    let mut backup = path.with_extension(format!(
+        "{}.v{version}-backup",
+        path.extension().and_then(|s| s.to_str()).unwrap_or("file")
+    ));
+    if backup.exists() {
+        backup = backup.with_extension(format!("v{version}-backup-{:016x}", rand::random::<u64>()));
+    }
+    let mut target = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&backup)
+        .with_context(|| format!("create immutable upgrade backup {}", backup.display()))?;
+    std::io::copy(&mut std::fs::File::open(path)?, &mut target)?;
+    target.sync_all()?;
+    std::fs::File::open(path.parent().context("backup parent")?)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -188,7 +208,7 @@ mod tests {
         let id = SecretKey::generate().public();
         assert!(allow(&path, id, "laptop").unwrap());
         assert!(!allow(&path, id, "laptop").unwrap());
-        fs::write(&path, format!("# coordinators\n{id}  # laptop\n\n")).unwrap();
+        fs::write(&path, format!("# administrators\n{id}  # laptop\n\n")).unwrap();
         assert_eq!(read_allowlist(&path).unwrap(), HashSet::from([id]));
         fs::remove_dir_all(dir).unwrap();
     }

@@ -192,7 +192,7 @@ impl Worker {
                 if read.data.is_empty() {
                     continue;
                 }
-                let (_, mut end) = crate::agent::log_text(
+                let (_, mut end) = crate::backend::log_text(
                     &read.data,
                     read.next,
                     if local.closed {

@@ -275,31 +275,6 @@ pub fn run(a: tart::Options) -> Result<()> {
     )?;
     l.stop("controller", false)?;
     l.stop(workers[0], false)?;
-    if let Some(baseline) = &a.baseline_binary {
-        let database = l.root.join(format!("{}/worker.redb", workers[0]));
-        let before = digest(&database)?;
-        let old = output(
-            baseline,
-            &[
-                "service".into(),
-                "run".into(),
-                "--config".into(),
-                l.s(&format!("{}.json", workers[0])),
-            ],
-            None,
-            15,
-        )?;
-        ensure!(
-            !old.status.success()
-                && String::from_utf8_lossy(&old.stderr).contains("worker metadata"),
-            "previous binary accepted indexed worker journal"
-        );
-        ensure!(
-            digest(&database)? == before,
-            "old binary mutated the worker journal"
-        );
-        l.phase("previous_binary_refuses_worker_journal_without_mutation");
-    }
     l.start(workers[0], None)?;
     std::thread::sleep(Duration::from_secs(6));
     l.start("controller", None)?;

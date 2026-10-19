@@ -3,8 +3,7 @@
 use super::*;
 use std::collections::BTreeMap;
 
-pub const GENERATION: u32 = 5;
-pub const FORMAT: u32 = 14;
+pub const FORMAT: u32 = super::super::FORMAT;
 pub(super) const ROWS: TableDefinition<(u8, &str), &[u8]> = TableDefinition::new("state_rows");
 pub(super) const RECEIPTS: TableDefinition<&str, &[u8]> = TableDefinition::new("request_receipts");
 
@@ -119,7 +118,11 @@ pub(super) fn read_state(tx: &redb::ReadTransaction, history: bool) -> Result<St
     let table = tx.open_table(META)?;
     let mut state: State = read(&table, "state")?.context("missing state")?;
     let identity: (u32, String, u64) = read(&table, "identity")?.context("missing identity")?;
-    if identity.0 == FORMAT {
+    ensure!(
+        identity.0 == FORMAT && state.family == super::super::FAMILY,
+        "incompatible metadata family"
+    );
+    {
         state = hydrate(state, &tx.open_table(ROWS)?)?;
         if history {
             state.receipts = tx
@@ -134,8 +137,6 @@ pub(super) fn read_state(tx: &redb::ReadTransaction, history: bool) -> Result<St
                 })
                 .collect::<Result<BTreeMap<_, _>>>()?;
         }
-    } else if !history {
-        state.receipts.clear();
     }
     Ok(state)
 }

@@ -1,4 +1,4 @@
-//! The agent: answers allowlisted coordinators, and closes every other connection at once.
+//! Local execution backend. Authorization and durable execution fencing belong to the worker.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -6,25 +6,20 @@ use std::{
     io::{Read, Seek, SeekFrom},
     os::unix::fs::PermissionsExt,
     path::PathBuf,
-    process::{Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result, bail};
-use iroh::{
-    EndpointId,
-    endpoint::{Connection, RecvStream, SendStream},
-    protocol::{AcceptError, ProtocolHandler},
-};
+use iroh::EndpointId;
 use iroh_blobs::{Hash, api::Store};
 
 use crate::{
     events::{EventKind, EventLog},
     instances,
     jobs::{self, Job, JobSpec, OutputFile, State, now},
-    proto::{Hello, MAX_LOG_CHUNK, MAX_MESSAGE, REFUSED, Request, Response},
     supervise, system,
+    worker_data::{Hello, MAX_LOG_CHUNK, Response},
 };
 
 /// Each job's numeric probes' first readings, by job and probe name.
@@ -33,9 +28,9 @@ type Origins = Arc<Mutex<HashMap<String, HashMap<String, crate::probes::Origin>>
 /// Output hashes by (path, size, modification time).
 type HashCache = HashMap<(PathBuf, u64, SystemTime), Hash>;
 
-/// Where the agent keeps its jobs and how it starts their supervisors.
+/// Where the backend keeps its jobs and how it starts their supervisors.
 #[derive(Debug, Clone)]
-pub struct AgentConfig {
+pub struct BackendConfig {
     /// `$FLEET_HOME`: jobs live in `jobs/` under it.
     pub home: PathBuf,
     /// The `fleet` binary that runs `fleet supervise <job folder>`.
@@ -44,21 +39,16 @@ pub struct AgentConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct Agent {
+pub struct Backend {
     /// Serializes output publication/input reservations with reclamation planning.
     blob_gate: Arc<tokio::sync::Mutex<()>>,
     _watchers: Arc<Watchers>,
-    allow: Arc<HashSet<EndpointId>>,
     submitting: Arc<tokio::sync::Mutex<()>>,
     hello: Arc<Hello>,
-    config: AgentConfig,
+    config: BackendConfig,
     /// Output hashes by (path, size, modification time), so unchanged files are hashed once.
     hashed: Arc<Mutex<HashCache>>,
     events: Arc<EventLog>,
-    /// Each job's numeric probes' first readings (for rates), shared by the watcher and suspend plans.
-    origins: Origins,
-    /// The sleep assertion held for `KeepAwake`.
-    awake: Arc<Mutex<Option<std::process::Child>>>,
 }
 
 #[derive(Debug)]
@@ -79,7 +69,7 @@ impl Drop for Staging {
     }
 }
 
-impl Agent {
+impl Backend {
     #[cfg(feature = "control-plane")]
     pub(crate) async fn blob_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.blob_gate.lock().await
@@ -106,30 +96,17 @@ impl Agent {
     }
 
     /// Opens the event log (`$FLEET_HOME/events.jsonl`) and starts watching the jobs. Must run inside a Tokio runtime.
-    pub fn start(
-        allow: Arc<HashSet<EndpointId>>,
-        hello: Hello,
-        config: AgentConfig,
-    ) -> Result<Self> {
-        Self::start_inner(allow, hello, config, true)
+    pub fn start(hello: Hello, config: BackendConfig) -> Result<Self> {
+        Self::start_inner(hello, config, true)
     }
 
     /// Replicated workers authorize backend effects in their own durable reconciliation loop.
     #[cfg(feature = "control-plane")]
-    pub(crate) fn start_managed(
-        allow: Arc<HashSet<EndpointId>>,
-        hello: Hello,
-        config: AgentConfig,
-    ) -> Result<Self> {
-        Self::start_inner(allow, hello, config, false)
+    pub(crate) fn start_managed(hello: Hello, config: BackendConfig) -> Result<Self> {
+        Self::start_inner(hello, config, false)
     }
 
-    fn start_inner(
-        allow: Arc<HashSet<EndpointId>>,
-        hello: Hello,
-        config: AgentConfig,
-        recover_backends: bool,
-    ) -> Result<Self> {
+    fn start_inner(hello: Hello, config: BackendConfig, recover_backends: bool) -> Result<Self> {
         fs::create_dir_all(&config.home)?;
         if config.home.join("instances.json").exists() || config.home.join("instances").exists() {
             // Reboot recovery must use the current worker capacity, not the
@@ -163,37 +140,16 @@ impl Agent {
         Ok(Self {
             blob_gate: Arc::default(),
             _watchers: Arc::new(Watchers(vec![vm_watch, job_watch])),
-            allow,
             submitting,
             hello: Arc::new(hello),
             config,
             hashed: Arc::default(),
             events,
-            origins,
-            awake: Arc::default(),
         })
     }
 
-    async fn serve(
-        &self,
-        peer: EndpointId,
-        mut send: SendStream,
-        mut recv: RecvStream,
-    ) -> Result<()> {
-        let bytes = recv.read_to_end(MAX_MESSAGE).await?;
-        let response = match serde_json::from_slice::<Request>(&bytes) {
-            Ok(request) => self
-                .handle(peer, request)
-                .await
-                .unwrap_or_else(|e| Response::Error(format!("{e:#}"))),
-            Err(e) => crate::proto::unreadable(&bytes, &e),
-        };
-        send.write_all(&crate::proto::encode(&response)?).await?;
-        send.finish()?;
-        Ok(())
-    }
-
     /// Reserve metadata before choosing the backend's desired state; this does not start a VM.
+    #[cfg(feature = "control-plane")]
     pub(crate) async fn reserve_instance(
         &self,
         peer: EndpointId,
@@ -204,282 +160,126 @@ impl Agent {
         instances::create(&self.config.home, id, spec, &peer.to_string(), &self.hello)
     }
 
-    pub(crate) async fn handle(&self, peer: EndpointId, request: Request) -> Result<Response> {
-        let _blobs = if matches!(&request, Request::Outputs { .. }) {
-            Some(self.blob_gate.lock().await)
-        } else {
-            None
-        };
+    pub async fn status(&self) -> Result<Response> {
         let home = &self.config.home;
-        Ok(match request {
-            Request::CancelVmJob { job, spec } => {
-                let admission = self.submitting.clone().lock_owned().await;
-                let home = home.clone();
-                let executable = self.config.supervisor.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _admission = admission;
-                    crate::vm_job::cancel(&home, &job, *spec, &peer.to_string(), &executable)
-                })
-                .await??;
-                Response::Cancelled
-            }
-            Request::InstanceGuest(request) => {
-                Response::InstanceGuest(self.guest(peer, request).await?)
-            }
-            Request::Instances => Response::Instances(instances::list(home)?),
-            Request::InstanceCreate { id, spec } => {
-                let instance = self.reserve_instance(peer, &id, spec).await?;
-                instances::ensure_controller(home, &id, &self.config.supervisor)?;
-                Response::Instance(instance)
-            }
-            Request::InstanceSet {
-                id,
-                desired,
-                revision,
-            } => {
-                let _admission = self.submitting.lock().await;
-                let instance = instances::set_desired(
-                    home,
-                    &id,
-                    desired,
-                    revision,
-                    &peer.to_string(),
-                    &self.hello,
-                )?;
-                instances::ensure_controller(home, &id, &self.config.supervisor)?;
-                Response::Instance(instance)
-            }
-            Request::SubmitAllocated { spec, id, gpu } => Response::Submitted {
-                job: self.submit(peer, *spec, id, Some(gpu)).await?,
-            },
-            Request::Hello { fleet, protocol } => {
-                tracing::info!(%peer, %fleet, %protocol, "hello from a coordinator");
-                Response::Hello((*self.hello).clone())
-            }
-            Request::Status => {
-                let home = home.clone();
-                Response::Status(
-                    tokio::task::spawn_blocking(move || {
-                        let mut status = system::status();
-                        status.instances = instances::list(&home)?;
-                        status.vm_capacity = instances::Config::load(&home).ok().map(Into::into);
-                        let patterns: Vec<String> = fs::read_to_string(home.join("gpu-processes"))
-                            .unwrap_or_default()
-                            .lines()
-                            .map(|l| l.split('#').next().unwrap_or("").trim().to_string())
-                            .filter(|l| !l.is_empty())
-                            .collect();
-                        let list = jobs::list(&home).unwrap_or_default();
-                        // Fleet's own jobs are not "outside" work: their process groups (the supervisor's and the
-                        // job's own) and their folders are left out.
-                        let own_groups: HashSet<u32> = list
-                            .iter()
-                            .filter(|j| !j.state.finished())
-                            .filter_map(|j| {
-                                jobs::read_json::<jobs::Started>(
-                                    &jobs::jobs_dir(&home).join(&j.id).join("supervisor.json"),
-                                )
-                                .ok()
-                                .flatten()
-                            })
-                            .flat_map(|s| [s.supervisor_pid, s.child_pid])
-                            .collect();
-                        status.gpu_busy_external =
-                            system::running_process(&patterns, &own_groups, &jobs::jobs_dir(&home));
-                        status.running_jobs = list
-                            .into_iter()
-                            .filter(|j| j.state == State::Running)
-                            .map(|j| j.id)
-                            .collect();
-                        Ok::<_, anyhow::Error>(status)
+        let home = home.clone();
+        Ok(Response::Status(
+            tokio::task::spawn_blocking(move || {
+                let mut status = system::status();
+                status.instances = instances::list(&home)?;
+                status.vm_capacity = instances::Config::load(&home).ok().map(Into::into);
+                let patterns: Vec<String> = fs::read_to_string(home.join("gpu-processes"))
+                    .unwrap_or_default()
+                    .lines()
+                    .map(|l| l.split('#').next().unwrap_or("").trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                let list = jobs::list(&home).unwrap_or_default();
+                // Fleet's own jobs are not "outside" work: their process groups (the supervisor's and the
+                // job's own) and their folders are left out.
+                let own_groups: HashSet<u32> = list
+                    .iter()
+                    .filter(|j| !j.state.finished())
+                    .filter_map(|j| {
+                        jobs::read_json::<jobs::Started>(
+                            &jobs::jobs_dir(&home).join(&j.id).join("supervisor.json"),
+                        )
+                        .ok()
+                        .flatten()
                     })
-                    .await??,
-                )
-            }
-            Request::Missing { hashes } => Response::Missing(self.missing(&hashes).await?),
-            Request::Submit { spec, id } => Response::Submitted {
-                job: self.submit(peer, *spec, id, None).await?,
-            },
-            Request::Events { since, wait_ms } => {
-                let wait = Duration::from_millis(u64::from(wait_ms.min(25_000)));
-                let events = self.events.wait_since(since, wait).await;
-                Response::Events {
-                    first: self.events.first(),
-                    events,
-                    last: self.events.last(),
-                }
-            }
-            Request::KeepAwake { seconds } => {
-                let mut held = self.awake.lock().expect("awake");
-                if let Some(mut previous) = held.take() {
-                    let _ = previous.kill();
-                    let _ = previous.wait();
-                }
-                *held = Some(
-                    Command::new("/usr/bin/caffeinate")
-                        .args(["-i", "-t", &seconds.min(3600).to_string()])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .spawn()?,
-                );
-                Response::Ok
-            }
-            Request::Jobs => Response::Jobs(jobs::list(home)?),
-            Request::Logs {
-                job,
-                stderr,
-                from,
-                max,
-            } => {
-                let dir = jobs::dir(home, &job)?;
-                let finished = jobs::info(&dir)?.state.finished();
-                let stream = crate::history::Stream::log(stderr);
-                if crate::history::root(&dir, stream)
-                    .join("state.json")
-                    .exists()
-                {
-                    let r =
-                        crate::history::read(&dir, stream, from, max.min(MAX_LOG_CHUNK) as usize)?;
-                    let (data, next) = log_text(
-                        &r.data,
-                        r.next,
-                        if r.data.len() < (max.min(MAX_LOG_CHUNK) as usize) {
-                            r.next
-                        } else {
-                            r.observed
-                        },
-                    );
-                    return Ok(Response::Logs {
-                        data,
-                        next,
-                        done: finished && next >= r.observed,
-                        gap: r.gap,
-                    });
-                }
-                let path = dir.join(if stderr { "stderr.log" } else { "stdout.log" });
-                let (bytes, next, len) = read_from(&path, from, max.min(MAX_LOG_CHUNK))?;
-                let (data, next) = log_text(&bytes, next, len);
-                Response::Logs {
-                    data,
-                    next,
-                    done: finished && next >= len,
-                    gap: None,
-                }
-            }
-            Request::Cancel { job } => {
-                let dir = jobs::dir(home, &job)?;
-                if jobs::info(&dir)?.state.finished() {
-                    bail!("job {job} has already finished");
-                }
-                instances::write(&dir.join("cancel"), &now())?;
-                Response::Cancelled
-            }
-            Request::Pause { job } => {
-                let dir = jobs::dir(home, &job)?;
-                let info = jobs::info(&dir)?;
-                if info.vm.is_some() {
-                    bail!("VM jobs do not support pause/continue; use cancellation");
-                }
-                if info.stopping.is_some()
-                    || dir.join("cancel").exists()
-                    || dir.join("suspend").exists()
-                {
-                    bail!("job {job} is stopping");
-                }
-                if info.state != State::Running {
-                    bail!("job {job} is {:?}, not running", info.state);
-                }
-                let started: jobs::Started =
-                    jobs::read_json(&dir.join("supervisor.json"))?.context("not started")?;
-                fs::write(dir.join("paused"), now().to_string())?;
-                supervise::signal_group(started.child_pid, libc::SIGSTOP);
-                Response::Ok
-            }
-            Request::Continue { job } => {
-                let _admission = self.submitting.lock().await;
-                let dir = jobs::dir(home, &job)?;
-                if jobs::info(&dir)?.state != State::Paused {
-                    bail!("job {job} is not paused");
-                }
-                let started: jobs::Started =
-                    jobs::read_json(&dir.join("supervisor.json"))?.context("not started")?;
-                let record: Job =
-                    jobs::read_json(&dir.join("job.json"))?.context("no job metadata")?;
-                let gpu = jobs::read_json::<bool>(&dir.join("gpu-allocation.json"))?;
-                instances::admit_job(home, record.spec.threads, gpu, Some(&job), &self.hello)?;
-                fs::remove_file(dir.join("paused"))?;
-                supervise::signal_group(started.child_pid, libc::SIGCONT);
-                Response::Ok
-            }
-            Request::Outputs { job } => Response::Outputs(self.outputs(&job).await?),
-            Request::SuspendPlan { job } => {
-                let dir = jobs::dir(home, &job)?;
-                let record: Job = jobs::read_json(&dir.join("job.json"))?.context("no job.json")?;
-                let resume = record.spec.resume.as_ref().context("this job has no resume declaration, so it cannot be suspended (only paused or cancelled)")?;
-                let mut job_origins = self
-                    .origins
-                    .lock()
-                    .expect("origins")
-                    .get(&job)
-                    .cloned()
-                    .unwrap_or_default();
-                let probes = crate::probes::evaluate(
-                    &record.spec.probes,
-                    &dir,
-                    &mut job_origins,
-                    now() as f64,
-                );
-                let settle = Duration::from_secs(record.spec.settle_seconds);
-                Response::Plan(crate::suspend::plan(
-                    &dir.join("work"),
-                    resume,
-                    settle,
-                    &probes,
-                    now(),
-                ))
-            }
-            Request::Suspend {
-                job,
-                now: at_once,
-                within_seconds,
-            } => {
-                let dir = jobs::dir(home, &job)?;
-                let record: Job = jobs::read_json(&dir.join("job.json"))?.context("no job.json")?;
-                let resume = record.spec.resume.as_ref().context("this job has no resume declaration, so it cannot be suspended (only paused or cancelled)")?;
-                let state = jobs::info(&dir)?.state;
-                if state != State::Running && state != State::Paused {
-                    bail!("job {job} is {state:?}, not running");
-                }
-                if at_once {
-                    fs::write(dir.join("suspend"), now().to_string())?;
+                    .flat_map(|s| [s.supervisor_pid, s.child_pid])
+                    .collect();
+                status.gpu_busy_external =
+                    system::running_process(&patterns, &own_groups, &jobs::jobs_dir(&home));
+                status.running_jobs = list
+                    .into_iter()
+                    .filter(|j| j.state == State::Running)
+                    .map(|j| j.id)
+                    .collect();
+                Ok::<_, anyhow::Error>(status)
+            })
+            .await??,
+        ))
+    }
+    pub async fn logs(&self, job: &str, stderr: bool, from: u64, max: u32) -> Result<Response> {
+        let home = &self.config.home;
+        let dir = jobs::dir(home, job)?;
+        let finished = jobs::info(&dir)?.state.finished();
+        let stream = crate::history::Stream::log(stderr);
+        if crate::history::root(&dir, stream)
+            .join("state.json")
+            .exists()
+        {
+            let r = crate::history::read(&dir, stream, from, max.min(MAX_LOG_CHUNK) as usize)?;
+            let (data, next) = log_text(
+                &r.data,
+                r.next,
+                if r.data.len() < (max.min(MAX_LOG_CHUNK) as usize) {
+                    r.next
                 } else {
-                    let settle = Duration::from_secs(record.spec.settle_seconds);
-                    let baseline =
-                        crate::suspend::checkpoints(&dir.join("work"), resume, settle, false)
-                            .pop()
-                            .map(|c| c.path);
-                    jobs::write_json(
-                        &dir.join("suspend-when-safe.json"),
-                        &WhenSafe {
-                            baseline,
-                            deadline: within_seconds.map(|s| now() + s),
-                        },
-                    )?;
-                }
-                Response::Ok
-            }
-            Request::Checkpoint { job } => {
-                let dir = jobs::dir(home, &job)?;
-                Response::Checkpoint(
-                    jobs::read_json(&dir.join("suspended.json"))?
-                        .context("no checkpoint recorded (yet) for this job")?,
-                )
-            }
+                    r.observed
+                },
+            );
+            return Ok(Response::Logs {
+                data,
+                next,
+                done: finished && next >= r.observed,
+                gap: r.gap,
+            });
+        }
+        let path = dir.join(if stderr { "stderr.log" } else { "stdout.log" });
+        let (bytes, next, len) = read_from(&path, from, max.min(MAX_LOG_CHUNK))?;
+        let (data, next) = log_text(&bytes, next, len);
+        Ok(Response::Logs {
+            data,
+            next,
+            done: finished && next >= len,
+            gap: None,
         })
     }
+    pub async fn events(&self, since: u64, wait_ms: u32) -> Response {
+        let events = self
+            .events
+            .wait_since(since, Duration::from_millis(u64::from(wait_ms.min(25_000))))
+            .await;
+        Response::Events {
+            first: self.events.first(),
+            events,
+            last: self.events.last(),
+        }
+    }
+    pub async fn cancel_vm_job(&self, peer: EndpointId, job: String, spec: JobSpec) -> Result<()> {
+        let admission = self.submitting.clone().lock_owned().await;
+        let home = self.config.home.clone();
+        let executable = self.config.supervisor.clone();
+        tokio::task::spawn_blocking(move || {
+            let _admission = admission;
+            crate::vm_job::cancel(&home, &job, spec, &peer.to_string(), &executable)
+        })
+        .await??;
+        Ok(())
+    }
+    pub async fn set_instance(
+        &self,
+        peer: EndpointId,
+        id: &str,
+        desired: instances::Desired,
+        revision: u64,
+    ) -> Result<instances::Info> {
+        let _admission = self.submitting.lock().await;
+        let instance = instances::set_desired(
+            &self.config.home,
+            id,
+            desired,
+            revision,
+            &peer.to_string(),
+            &self.hello,
+        )?;
+        instances::ensure_controller(&self.config.home, id, &self.config.supervisor)?;
+        Ok(instance)
+    }
 
-    async fn guest(
+    pub async fn guest(
         &self,
         peer: EndpointId,
         request: instances::guest::Request,
@@ -583,7 +383,7 @@ impl Agent {
         })
     }
 
-    async fn missing(&self, hashes: &[Hash]) -> Result<Vec<Hash>> {
+    pub async fn missing(&self, hashes: &[Hash]) -> Result<Vec<Hash>> {
         let mut missing = Vec::new();
         for &hash in hashes {
             if !self.config.store.blobs().has(hash).await? {
@@ -593,7 +393,7 @@ impl Agent {
         Ok(missing)
     }
 
-    async fn submit(
+    pub async fn submit(
         &self,
         peer: EndpointId,
         spec: JobSpec,
@@ -622,14 +422,14 @@ impl Agent {
             {
                 return Ok(id);
             }
-            bail!("job {id} already exists on this agent with different or incomplete metadata");
+            bail!("job {id} already exists in this backend with different or incomplete metadata");
         }
         let missing = self
             .missing(&spec.inputs.values().map(|i| i.hash).collect::<Vec<_>>())
             .await?;
         if !missing.is_empty() {
             bail!(
-                "{} input(s) are not in the agent's store yet; push them first",
+                "{} input(s) are not in the worker's store yet; push them first",
                 missing.len()
             );
         }
@@ -717,7 +517,8 @@ impl Agent {
         Ok(id)
     }
 
-    async fn outputs(&self, job: &str) -> Result<Vec<OutputFile>> {
+    pub async fn outputs(&self, job: &str) -> Result<Vec<OutputFile>> {
+        let _blobs = self.blob_gate.lock().await;
         let dir = jobs::dir(&self.config.home, job)?;
         let info = jobs::info(&dir)?;
         let record: Job = jobs::read_json(&dir.join("job.json"))?.context("no job.json")?;
@@ -1130,28 +931,6 @@ fn read_from(path: &std::path::Path, from: u64, max: u32) -> Result<(Vec<u8>, u6
     file.take(u64::from(max)).read_to_end(&mut data)?;
     let next = from.min(len) + data.len() as u64;
     Ok((data, next, len))
-}
-
-impl ProtocolHandler for Agent {
-    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        let peer = connection.remote_id();
-        if !self.allow.contains(&peer) {
-            tracing::warn!(%peer, "refused a connection from a key that is not on the allowlist");
-            connection.close(REFUSED.into(), b"not on this agent's allowlist");
-            return Ok(());
-        }
-        tracing::info!(%peer, "coordinator connected");
-        while let Ok((send, recv)) = connection.accept_bi().await {
-            let agent = self.clone();
-            tokio::spawn(async move {
-                if let Err(e) = agent.serve(peer, send, recv).await {
-                    tracing::warn!(%peer, "request failed: {e:#}");
-                }
-            });
-        }
-        tracing::info!(%peer, "coordinator disconnected");
-        Ok(())
-    }
 }
 
 #[cfg(test)]

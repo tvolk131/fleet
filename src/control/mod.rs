@@ -24,7 +24,6 @@ pub mod storage_lifecycle;
 mod storage_status;
 pub mod store;
 pub mod tunnels;
-pub mod upgrade;
 pub mod version;
 pub mod vm;
 pub mod workload;
@@ -45,4 +44,6 @@ openraft::declare_raft_types!(
 pub type Raft = openraft::Raft<TypeConfig>;
 pub type Entry = openraft::Entry<TypeConfig>;
 // Physical metadata layout. Independent of wire and cluster behavior generations.
-pub const FORMAT: u32 = 12;
+pub const FORMAT: u32 = 1;
+/// Distinguishes the consolidated baseline from every historical format numbered one.
+pub const FAMILY: &str = "fleet-baseline-202610";

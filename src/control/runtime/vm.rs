@@ -6,11 +6,8 @@ use crate::control::{
 };
 use instances::guest;
 
-pub(super) const FORMAT: u32 = 13;
 pub(super) fn supported(format: u32) -> bool {
     format == super::super::FORMAT
-        || format == FORMAT
-        || format == super::super::store::indexed::FORMAT
 }
 pub(super) fn input_tag(id: &str) -> String {
     format!("vm-input/{}", blake3::hash(id.as_bytes()).to_hex())
@@ -234,29 +231,28 @@ impl Worker {
                     return Ok(None);
                 }
                 let ready = self
-                    .agent
-                    .handle(
+                    .backend
+                    .guest(
                         self.config.registration.peer.identity,
-                        proto::Request::InstanceGuest(guest::Request::Ready {
+                        guest::Request::Ready {
                             id: a.execution.clone(),
-                        }),
+                        },
                     )
                     .await;
-                if !matches!(ready,Ok(proto::Response::InstanceGuest(guest::Response::Ready(r))) if r.ready)
-                {
+                if !matches!(ready,Ok(guest::Response::Ready(r)) if r.ready) {
                     return Ok(None);
                 }
                 self.journal.mark_attempted(true, &op.id, true)?;
                 let started = self
-                    .agent
-                    .handle(
+                    .backend
+                    .guest(
                         self.config.registration.peer.identity,
-                        proto::Request::InstanceGuest(guest::Request::Start {
+                        guest::Request::Start {
                             id: op.execution.clone(),
                             operation: backend_id.clone(),
                             revision: i.record.revision,
                             spec: op.spec.clone(),
-                        }),
+                        },
                     )
                     .await;
                 if let Err(e) = started
@@ -279,15 +275,15 @@ impl Worker {
                     // Recover that launch gap only: inspect/start honor the supervisor lock
                     // and attempted marker, so uncertain guest effects are never replayed.
                     self.journal.mark_attempted(true, &op.id, true)?;
-                    self.agent
-                        .handle(
+                    self.backend
+                        .guest(
                             self.config.registration.peer.identity,
-                            proto::Request::InstanceGuest(guest::Request::Start {
+                            guest::Request::Start {
                                 id: op.execution.clone(),
                                 operation: backend_id.clone(),
                                 revision: local.revision,
                                 spec: op.spec.clone(),
-                            }),
+                            },
                         )
                         .await?;
                 }
@@ -318,7 +314,7 @@ impl Worker {
             files: BTreeMap::new(),
         };
         if outcome.phase.terminal() {
-            let _gate = self.agent.blob_guard().await;
+            let _gate = self.backend.blob_guard().await;
             for name in ["stdout", "stderr"] {
                 let path = dir.join(name);
                 if !path.exists() {
@@ -347,7 +343,7 @@ impl Worker {
             op.outcome.phase.terminal() && op.released,
             "cannot reclaim unfinished operation"
         );
-        let _gate = self.agent.blob_guard().await;
+        let _gate = self.backend.blob_guard().await;
         let dir =
             guest::operation_dir(&self.home.join("backend"), &op.execution, &op.backend_id())?;
         // An operation fenced before start has no backend directory yet.
@@ -392,7 +388,7 @@ mod tests {
         })).unwrap();
         let j = Journal::open(&home, &cfg, true).unwrap();
         let mut view: WorkerView = serde_json::from_value(json!({
-            "generation":4,"vm":vm::Catalog::default(),"history":{},"artifacts":[],"stores":{},"cleanup_allowed":true,
+            "generation":1,"vm":vm::Catalog::default(),"history":{},"artifacts":[],"stores":{},"cleanup_allowed":true,
             "starts_allowed":true,"checkpoints":[],"resume_checkpoints":{},"recovery_required":false,
             "held":[],"registration":cfg.registration,"assignments":[],"acknowledged":0
         })).unwrap();
@@ -404,17 +400,13 @@ mod tests {
         })).unwrap();
         view.vm.operations.insert(op.id.clone(), op);
         j.accept(view.clone()).unwrap();
-        j.change(|s| {
-            s.vm_attempted.insert("once".into());
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(j.read().unwrap().format, FORMAT);
+        j.mark_attempted(true, "once", true).unwrap();
+        assert_eq!(j.read().unwrap().format, crate::control::FORMAT);
         drop(j);
         let j = Journal::open(&home, &cfg, false).unwrap();
-        assert!(j.read().unwrap().vm_attempted.contains("once"));
+        assert!(j.attempted(true, "once").unwrap());
         let mut bad = view.clone();
-        bad.generation = 3;
+        bad.generation = 0;
         assert!(j.accept(bad).is_err());
         let mut bad = view.clone();
         bad.vm.operations.get_mut("once").unwrap().outcome.phase = Phase::Running;
@@ -426,9 +418,9 @@ mod tests {
         view.vm.operations.get_mut("once").unwrap().released = false;
         assert!(j.accept(view).is_err());
         assert!(j.read().unwrap().vm.operations["once"].released);
-        // Upgrade preserves both execution domains, then future marker writes avoid the journal.
+        // Both execution domains survive reopen; marker writes avoid the resource journal.
         let mut view = serde_json::from_value::<WorkerView>(json!({
-            "generation":5,"vm":j.read().unwrap().vm,"history":{},"artifacts":[],"stores":{},"cleanup_allowed":true,
+            "generation":1,"vm":j.read().unwrap().vm,"history":{},"artifacts":[],"stores":{},"cleanup_allowed":true,
             "starts_allowed":true,"checkpoints":[],"resume_checkpoints":{},"recovery_required":false,
             "held":[],"registration":cfg.registration,"assignments":[],"acknowledged":0
         })).unwrap();
@@ -438,12 +430,10 @@ mod tests {
             j.read().unwrap().format,
             crate::control::store::indexed::FORMAT
         );
-        assert!(j.read().unwrap().vm_attempted.is_empty());
-        assert!(j.read().unwrap().attempted.is_empty());
         j.mark_attempted(true, "after", true).unwrap();
         j.mark_attempted(false, "not-published", true).unwrap();
         j.mark_attempted(false, "not-published", false).unwrap();
-        view.generation = 4;
+        view.generation = 0;
         assert!(j.accept(view.clone()).is_err());
         // Emergency rebinding resets the observed authority generation. A surviving older
         // controller image must not downgrade the worker's physical execution-fence format.
@@ -452,6 +442,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
+        view.generation = 1;
         j.accept(view).unwrap();
         assert_eq!(
             j.read().unwrap().format,
@@ -465,6 +456,43 @@ mod tests {
         assert!(!j.attempted(false, "not-published").unwrap());
         assert!(!j.attempted(false, "once").unwrap());
         drop(j);
+        // Number one alone is not compatibility, and an unsupported accepted generation must
+        // be refused before redb can repair or modify the original file.
+        let path = home.join("worker.redb");
+        for (field, bad) in [
+            ("family", json!("foreign")),
+            ("generation", json!(2)),
+            ("format", json!(4294967297u64)),
+        ] {
+            let original = {
+                let db = Database::open(&path).unwrap();
+                let tx = db.begin_write().unwrap();
+                let original;
+                {
+                    let mut table = tx.open_table(JOURNAL).unwrap();
+                    let mut state: serde_json::Value =
+                        serde_json::from_slice(table.get("state").unwrap().unwrap().value())
+                            .unwrap();
+                    original = state.clone();
+                    state[field] = bad;
+                    table
+                        .insert("state", serde_json::to_vec(&state).unwrap().as_slice())
+                        .unwrap();
+                }
+                tx.commit().unwrap();
+                original
+            };
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(Journal::open(&home, &cfg, false).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            let db = Database::open(&path).unwrap();
+            let tx = db.begin_write().unwrap();
+            tx.open_table(JOURNAL)
+                .unwrap()
+                .insert("state", serde_json::to_vec(&original).unwrap().as_slice())
+                .unwrap();
+            tx.commit().unwrap();
+        }
         {
             let db = Database::open(home.join("worker.redb")).unwrap();
             let tx = db.begin_write().unwrap();

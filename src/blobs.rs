@@ -1,5 +1,5 @@
-//! Content-addressed files over `iroh-blobs`: each side keeps a store; the agent's accepts pushes (inputs) and serves
-//! outputs only to allowlisted coordinators; the coordinator pushes inputs and fetches outputs.
+//! Content-addressed files over `iroh-blobs`. Each role keeps a store; authenticated clients and
+//! enrolled peers transfer inputs and outputs under that role's authorization policy.
 
 use std::{collections::HashSet, path::Path, sync::Arc};
 
@@ -85,8 +85,8 @@ pub async fn open_managed(path: &Path) -> Result<(Store, Reclamation)> {
     ))
 }
 
-/// The blobs protocol for an agent: connections from keys not on the allowlist are refused before any request, and
-/// allowlisted coordinators may both fetch and push.
+/// The worker blob protocol: keys outside the allowlist are refused before any request.
+/// Allowed clients may fetch and push.
 pub fn protocol(store: &Store, allow: Arc<HashSet<EndpointId>>) -> BlobsProtocol {
     let mask = EventMask {
         connected: ConnectMode::Intercept,
@@ -130,7 +130,7 @@ pub async fn push(
     let connection = endpoint
         .connect(to, iroh_blobs::ALPN)
         .await
-        .map_err(crate::proto::transport)?;
+        .map_err(anyhow::Error::from)?;
     for &hash in hashes {
         store
             .remote()
@@ -157,19 +157,13 @@ pub async fn fetch(
     let connection = endpoint
         .connect(from, iroh_blobs::ALPN)
         .await
-        .map_err(crate::proto::transport)?;
+        .map_err(anyhow::Error::from)?;
     for &hash in hashes {
         store
             .remote()
             .fetch(connection.clone(), HashAndFormat::raw(hash))
             .await
-            .map_err(|e| {
-                if connection.close_reason().is_some() {
-                    crate::proto::refusal(&connection, e.into())
-                } else {
-                    anyhow::Error::from(e)
-                }
-            })
+            .map_err(anyhow::Error::from)
             .with_context(|| format!("fetching {hash}"))?;
     }
     connection.close(0u32.into(), b"done");

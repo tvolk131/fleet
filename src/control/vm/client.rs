@@ -5,7 +5,7 @@ use crate::{
         client::AppClient,
         runtime::{self, DataRequest},
     },
-    proto,
+    worker_data,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -61,14 +61,14 @@ impl AppClient {
             let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(30);
             loop {
                 let response=runtime::data_call(&self.transport.endpoint,&state.cluster,worker,DataRequest::VmInput{id:id.into()}).await;
-                if matches!(response,Ok(proto::Response::Missing(_))) {break;}
+                if matches!(response,Ok(worker_data::Response::Missing(_))) {break;}
                 ensure!(tokio::time::Instant::now()<deadline,"upload is accepted but staging is unconfirmed; retry instance stage with the same operation ID");
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
             let connection=blobs::push(&store,&self.transport.endpoint,worker.addr(),&[*hash]).await?;
             loop {
                 let r=runtime::data_call(&self.transport.endpoint,&state.cluster,worker,DataRequest::VmInput{id:id.into()}).await?;
-                if matches!(r,proto::Response::Missing(ref missing) if missing.is_empty()) {break;}
+                if matches!(r,worker_data::Response::Missing(ref missing) if missing.is_empty()) {break;}
                 ensure!(tokio::time::Instant::now()<deadline,"upload staging unconfirmed; retry instance stage");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -171,8 +171,8 @@ impl AppClient {
         )
         .await?;
         match r {
-            proto::Response::Error(error) => anyhow::bail!("{error}"),
-            proto::Response::InstanceGuest(guest::Response::Logs(log)) => Ok(
+            worker_data::Response::Error(error) => anyhow::bail!("{error}"),
+            worker_data::Response::InstanceGuest(guest::Response::Logs(log)) => Ok(
                 json!({"data":String::from_utf8_lossy(&log.data),"next":log.next,"done":log.done}),
             ),
             other => anyhow::bail!("unexpected guest log response: {other:?}"),

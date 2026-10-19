@@ -1,10 +1,9 @@
-//! Disk-backed Raft snapshots. Generation four retains its JSON wire format; generation five
-//! streams a header and sorted rows. Snapshot chunks and applied state publish atomically in redb.
+//! Streaming Raft snapshots. Snapshot chunks and applied state publish atomically in redb.
 use super::*;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::os::unix::fs::OpenOptionsExt;
 
-const MAGIC: &[u8] = b"FLEET14\n";
+const MAGIC: &[u8] = b"FLEET-BASELINE-1\n";
 const RECORD_LIMIT: u64 = 16 << 20;
 const CHUNKS: TableDefinition<u64, &[u8]> = TableDefinition::new("snapshot_chunks");
 const CHUNK: usize = 64 << 10;
@@ -89,35 +88,12 @@ fn save(
     tx: &redb::WriteTransaction,
     file: &mut std::fs::File,
     meta: &SnapshotMeta<u64, BasicNode>,
-    indexed: bool,
 ) -> Result<()> {
     file.rewind()?;
     let bytes = file.metadata()?.len();
     ensure!(bytes <= MAX_STREAM, "snapshot disk budget exceeded");
     let mut chunks = tx.open_table(CHUNKS)?;
     chunks.retain(|_, _| false)?;
-    if !indexed {
-        // Before activation, the previous executable must still be able to reopen this database.
-        ensure!(
-            bytes <= MAX_SNAPSHOT as u64,
-            "legacy snapshot exceeds limit"
-        );
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)?;
-        let mut table = tx.open_table(META)?;
-        put(
-            &mut table,
-            "snapshot",
-            &SavedSnapshot {
-                meta: meta.clone(),
-                hash: meta.snapshot_id.clone(),
-                data,
-            },
-        )?;
-        table.remove("stream_snapshot")?;
-        file.rewind()?;
-        return Ok(());
-    }
     let mut buffer = vec![0; CHUNK];
     let mut offset = 0;
     while offset < bytes {
@@ -148,7 +124,11 @@ pub(super) fn build(db: &Database) -> Result<Snapshot<TypeConfig>> {
         read(&table, "identity")?.context("missing identity")?;
     let mut file = temporary()?;
     let mut writer = BufWriter::with_capacity(CHUNK, &mut file);
-    if format == indexed::FORMAT {
+    ensure!(
+        format == FORMAT && header.family == super::super::FAMILY,
+        "incompatible snapshot family"
+    );
+    {
         writer.write_all(MAGIC)?;
         line(&mut writer, &header)?;
         for record in read_tx.open_table(indexed::RECEIPTS)?.iter()? {
@@ -160,17 +140,9 @@ pub(super) fn build(db: &Database) -> Result<Snapshot<TypeConfig>> {
             let (kind, key) = key.value();
             row(&mut writer, kind, key, data.value())?;
         }
-    } else {
-        serde_json::to_writer(&mut writer, &header)?;
     }
     writer.flush()?;
     drop(writer);
-    if format != indexed::FORMAT {
-        ensure!(
-            file.metadata()?.len() <= MAX_SNAPSHOT as u64,
-            "legacy snapshot exceeds limit; activate indexed metadata"
-        );
-    }
     let meta = SnapshotMeta {
         last_log_id: header.last_applied,
         last_membership: header.membership,
@@ -182,16 +154,14 @@ pub(super) fn build(db: &Database) -> Result<Snapshot<TypeConfig>> {
     tx.set_durability(Durability::Immediate)?;
     {
         let table = tx.open_table(META)?;
-        let existing = read::<Saved>(&table, "stream_snapshot")?
-            .map(|s| s.meta)
-            .or(read::<SavedSnapshot>(&table, "snapshot")?.map(|s| s.meta));
+        let existing = read::<Saved>(&table, "stream_snapshot")?.map(|s| s.meta);
         if existing.is_some_and(|s| s.last_log_id > meta.last_log_id) {
             drop(table);
             drop(tx);
             return current(db)?.context("newer snapshot disappeared");
         }
     }
-    save(&tx, &mut file, &meta, format == indexed::FORMAT)?;
+    save(&tx, &mut file, &meta)?;
     tx.commit()?;
     Ok(Snapshot {
         meta,
@@ -214,27 +184,19 @@ pub(super) fn install(
         "snapshot digest mismatch"
     );
     let mut reader = BufReader::new(file);
-    let stream = reader.fill_buf()?.starts_with(MAGIC);
-    let state: State = if stream {
-        reader.consume(MAGIC.len());
-        serde_json::from_slice(&next(&mut reader)?.context("missing snapshot header")?)?
-    } else {
-        ensure!(
-            reader.get_ref().metadata()?.len() <= MAX_SNAPSHOT as u64,
-            "legacy snapshot exceeds limit"
-        );
-        serde_json::from_reader(&mut reader)?
-    };
-    let indexed = state.version.active >= indexed::GENERATION;
+    ensure!(
+        reader.fill_buf()?.starts_with(MAGIC),
+        "incompatible snapshot family"
+    );
+    reader.consume(MAGIC.len());
+    let state: State =
+        serde_json::from_slice(&next(&mut reader)?.context("missing snapshot header")?)?;
     ensure!(
         state.format == FORMAT
+            && state.family == super::super::FAMILY
             && state.last_applied == meta.last_log_id
             && state.membership == meta.last_membership,
         "snapshot metadata mismatch"
-    );
-    ensure!(
-        !stream || state.version.active >= indexed::GENERATION,
-        "indexed snapshot before activation"
     );
     let mut tx = db.begin_write()?;
     tx.set_durability(Durability::Immediate)?;
@@ -257,18 +219,13 @@ pub(super) fn install(
         }) {
             table.remove("version_prepared")?;
         }
-        let format = if state.version.active >= indexed::GENERATION {
-            indexed::FORMAT
-        } else {
-            FORMAT
-        };
-        put(&mut table, "identity", &(format, cluster, node))?;
+        put(&mut table, "identity", &(FORMAT, cluster, node))?;
         put(&mut table, "state", &state)?;
     }
     // Replacement, not merge: a snapshot must never retain rows from a different applied image.
     tx.open_table(indexed::ROWS)?.retain(|_, _| false)?;
     tx.open_table(indexed::RECEIPTS)?.retain(|_, _| false)?;
-    if stream {
+    {
         ensure!(
             state.receipts.is_empty(),
             "receipt rows embedded in indexed header"
@@ -308,11 +265,9 @@ pub(super) fn install(
         }
         // Type-check the resource image before publishing. Permanent receipts are never hydrated.
         indexed::hydrate(state, &tx.open_table(indexed::ROWS)?)?;
-    } else if state.version.active >= indexed::GENERATION {
-        indexed::persist(&tx, &state)?;
     }
     let mut file = reader.into_inner();
-    save(&tx, &mut file, &meta, indexed)?;
+    save(&tx, &mut file, &meta)?;
     ensure!(
         !fail.swap(false, Ordering::SeqCst),
         "injected snapshot commit failure"
@@ -334,13 +289,6 @@ pub(super) fn current(db: &Database) -> Result<Option<Snapshot<TypeConfig>>> {
             offset += value.value().len() as u64;
         }
         ensure!(offset == saved.bytes, "snapshot length mismatch");
-        saved.meta
-    } else if let Some(saved) = read::<SavedSnapshot>(&table, "snapshot")? {
-        ensure!(
-            saved.hash == snapshot_id(&saved.data),
-            "snapshot digest mismatch"
-        );
-        file.write_all(&saved.data)?;
         saved.meta
     } else {
         return Ok(None);

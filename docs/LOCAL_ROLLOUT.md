@@ -1,10 +1,8 @@
 # Local rollout and CI
 
-The revised milestone (14 October 2026) qualifies three independent local replicas,
-then deploys normal single-replica Fleet on the M4 Pro. Installation on the M1 Pro
-and Pi is deferred until those machines are available. Existing training runs,
-legacy data, and historical files remain preserved. Capacity moves only after an
-idle audit and after the old worker stops accepting work.
+Local qualification uses three independent replicas; the normal M4 installation runs one replica.
+The M1 Pro and Pi remain separate physical deployment targets. Qualification never upgrades the normal
+service or adopts existing workloads. A release cutover requires its own idle audit and matching backups.
 
 Three local processes exercise durable storage, elections, membership, client
 retries, worker reconciliation, and recovery. They share one hardware failure
@@ -16,7 +14,7 @@ later grow cooperatively to three physical replicas.
 Build the normal binary, then choose a fresh home and unused ports:
 
 ```sh
-cargo build --locked --bins
+cargo build --workspace --all-features --locked --bins
 target/debug/fleet-qualify normal-multihost --local --binary "$PWD/target/debug/fleet" \
   --home /tmp/fleet-control-local-example --port 29300
 ```

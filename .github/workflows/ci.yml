@@ -2,6 +2,7 @@ name: Fleet
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -10,12 +11,18 @@ permissions:
 
 defaults:
   run:
-    # Explicit bash enables -eo pipefail; tee must never hide a failing test.
     shell: bash
 
 concurrency:
   group: fleet-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUST_BACKTRACE: 1
+  ICED_BACKEND: tiny-skia
 
 jobs:
   test:
@@ -26,104 +33,113 @@ jobs:
         os: [ubuntu-24.04, macos-14]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
-    env:
-      CARGO_BUILD_JOBS: 2
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
-      RUST_BACKTRACE: 1
-      ICED_BACKEND: tiny-skia
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust toolchain
+        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          fetch-depth: 0 # Build the pinned previous compatibility baseline from this history.
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: fleet-${{ runner.os }}-1.99-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: fleet-${{ runner.os }}-1.99-${{ hashFiles('Cargo.lock') }}-
       - name: Linux GUI build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libudev-dev libfontconfig1-dev libegl1-mesa-dev
-      - name: Rust toolchain
-        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
       - name: Formatting
         run: cargo fmt --all --check
-      - name: Build Fleet and control-plane qualification tools
-        run: cargo build --all-features --bins --locked
-      - name: Stock Garage over Fleet service tunnels in separate network namespaces
-        if: runner.os == 'Linux'
-        run: |
-          # The namespace fixture intentionally has no desktop libraries.
-          cargo build --bin fleet --no-default-features --features control-plane --locked
-          target/debug/fleet-qualify garage --linux-binary "$PWD/target/debug/fleet" \
-            --home /tmp/fleet-control-garage-ci 2>&1 | tee garage-tunnels.log
-      - name: Build real previous/candidate executables and incompatible fixture
-        run: target/debug/fleet-qualify build-upgrade-fixtures --output /tmp/fleet-upgrade-binaries 2>&1 | tee upgrade-builds.log
-      - name: VM service attachments, permissions, revocation and cached-policy restarts
-        run: |
-          target/debug/fleet-qualify vm-services --fake --binary "$PWD/target/debug/fleet" \
-            --baseline-binary /tmp/fleet-upgrade-binaries/fleet-service-baseline \
-            --home /tmp/fleet-control-vm-services-ci 2>&1 | tee vm-services.log
-      - name: Rolling upgrades, live work, rollback and incompatible-version refusal
-        run: |
-          target/debug/fleet-qualify rolling-upgrade --baseline /tmp/fleet-upgrade-binaries/fleet-baseline \
-            --candidate /tmp/fleet-upgrade-binaries/fleet-candidate --unsupported /tmp/fleet-upgrade-binaries/fleet-unsupported \
-            --home /tmp/fleet-control-rolling-ci 2>&1 | tee rolling-upgrade.log
-      - name: Managed VM connections, durable operations, restart and retention
-        run: |
-          target/debug/fleet-qualify managed-vm --fake --binary "$PWD/target/debug/fleet" \
-            --baseline-binary /tmp/fleet-upgrade-binaries/fleet-baseline \
-            --home /tmp/fleet-control-managed-vm-ci 2>&1 | tee managed-vm.log
-      - name: Rolling checkpoint retention, backup and restore JSON CLI lifecycle with isolated Tart backend
-        run: |
-          target/debug/fleet-qualify checkpoint --fake --rolling --backup-restore --binary "$PWD/target/debug/fleet" \
-            --home /tmp/fleet-control-checkpoint-ci 2>&1 | tee checkpoint-client.log
-      - name: Portable Tart jobs, storage replacement/loss, and durable attempt history
-        run: |
-          target/debug/fleet-qualify portable --fake --storage-lifecycle --binary "$PWD/target/debug/fleet" \
-            --baseline-binary /tmp/fleet-upgrade-binaries/fleet-baseline \
-            --home /tmp/fleet-control-portable-ci 2>&1 | tee portable-client.log
-      - name: Rust tests (including Raft, redb, workers, and headless M3 GUI)
+      - name: Build product and explicit qualification tools
+        run: cargo build --workspace --all-features --bins --locked
+      - name: Rust contracts, state machines, failure tests and headless Material 3 GUI
         run: cargo test --workspace --all-features --locked --no-fail-fast -- --test-threads=2 2>&1 | tee rust-tests.log
-      - name: Worker library without the optional control plane
+      - name: Worker library without control plane
         run: cargo check --no-default-features --lib --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
       - name: Million-receipt snapshot and restore qualification
         if: runner.os == 'Linux'
         run: cargo test --all-features --locked --test control indexed::indexed_million_receipts -- --ignored --nocapture --test-threads=1 2>&1 | tee indexed-scale.log
-      - name: Clippy
-        run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
-      - name: Three-replica CLI/service failure scenarios
+      - name: Package headless qualification binaries
         run: |
-          target/debug/fleet-qualify normal-multihost --local --binary "$PWD/target/debug/fleet" \
-            --home /tmp/fleet-control-ci --port 29300 2>&1 | tee local-three.log
-      - name: Collect safe evidence
+          cargo build --bin fleet --no-default-features --features control-plane,qualification --locked
+          tar -czf fleet-binaries.tar.gz -C target/debug fleet fleet-guest fleet-fake-tart fleet-test-workload fleet-qualify fleet-import-baseline
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binaries-${{ matrix.os }}
+          path: fleet-binaries.tar.gz
+          retention-days: 3
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: test-evidence-${{ matrix.os }}
+          path: '*.log'
+          retention-days: 14
+
+  qualification:
+    name: Qualification (${{ matrix.os }}, ${{ matrix.scenario }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+        scenario: [workloads, networking, rolling]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: binaries-${{ matrix.os }}
+      - name: Extract exact tested executables
+        run: mkdir -p target/debug && tar -xzf fleet-binaries.tar.gz -C target/debug
+      - name: Rust toolchain for synthetic future releases
+        if: matrix.scenario == 'rolling'
+        run: rustup toolchain install 1.99.0 --profile minimal
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: matrix.scenario == 'rolling'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/rolling-fixtures
+          key: rolling-${{ runner.os }}-1.99-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: rolling-${{ runner.os }}-1.99-${{ hashFiles('Cargo.lock') }}-
+      - name: Rolling upgrade, live work, rollback and incompatible-version refusal
+        if: matrix.scenario == 'rolling'
+        run: |
+          target/debug/fleet-qualify build-upgrade-fixtures --output /tmp/fleet-upgrade-binaries 2>&1 | tee upgrade-builds.log
+          target/debug/fleet-qualify rolling-upgrade --baseline /tmp/fleet-upgrade-binaries/fleet-baseline --candidate /tmp/fleet-upgrade-binaries/fleet-candidate --unsupported /tmp/fleet-upgrade-binaries/fleet-unsupported --home /tmp/fleet-control-rolling-ci 2>&1 | tee rolling-upgrade.log
+      - name: Checkpoint retention, backup restore, portable jobs, storage retirement and history
+        if: matrix.scenario == 'workloads'
+        run: |
+          target/debug/fleet-qualify checkpoint --fake --rolling --backup-restore --binary "$PWD/target/debug/fleet" --home /tmp/fleet-control-checkpoint-ci 2>&1 | tee checkpoint.log
+          target/debug/fleet-qualify portable --fake --storage-lifecycle --binary "$PWD/target/debug/fleet" --home /tmp/fleet-control-portable-ci 2>&1 | tee portable.log
+      - name: Managed VM operations, network enforcement and replica failures
+        if: matrix.scenario == 'networking'
+        run: |
+          target/debug/fleet-qualify vm-services --fake --binary "$PWD/target/debug/fleet" --home /tmp/fleet-control-vm-services-ci 2>&1 | tee vm-services.log
+          target/debug/fleet-qualify managed-vm --fake --binary "$PWD/target/debug/fleet" --home /tmp/fleet-control-managed-vm-ci 2>&1 | tee managed-vm.log
+          target/debug/fleet-qualify normal-multihost --local --binary "$PWD/target/debug/fleet" --home /tmp/fleet-control-ci --port 29300 2>&1 | tee local-three.log
+      - name: Stock Garage in separate network namespaces
+        if: matrix.scenario == 'networking' && runner.os == 'Linux'
+        run: target/debug/fleet-qualify garage --linux-binary "$PWD/target/debug/fleet" --home /tmp/fleet-control-garage-ci 2>&1 | tee garage.log
+      - name: Collect safe qualification evidence
         if: always()
         run: |
           mkdir -p ci-evidence
           cp *.log ci-evidence/ 2>/dev/null || true
-          if [ -f /tmp/fleet-control-ci/qualification.json ]; then
-            cp /tmp/fleet-control-ci/qualification.json ci-evidence/
-          fi
-          if [ -f /tmp/fleet-control-checkpoint-ci/qualification.json ]; then
-            cp /tmp/fleet-control-checkpoint-ci/qualification.json ci-evidence/checkpoint-qualification.json
-          fi
-          if [ -f /tmp/fleet-control-portable-ci/qualification.json ]; then
-            cp /tmp/fleet-control-portable-ci/qualification.json ci-evidence/portable-qualification.json
-          fi
-          if [ -f /tmp/fleet-control-rolling-ci/qualification.json ]; then
-            cp /tmp/fleet-control-rolling-ci/qualification.json ci-evidence/rolling-upgrade-qualification.json
-          fi
-          if [ -f /tmp/fleet-upgrade-binaries/builds.json ]; then
-            cp /tmp/fleet-upgrade-binaries/builds.json ci-evidence/upgrade-builds.json
-          fi
-          if [ -f /tmp/fleet-control-garage-ci/result.json ]; then
-            cp /tmp/fleet-control-garage-ci/result.json ci-evidence/garage-tunnels.json
-          fi
-          if [ -f /tmp/fleet-control-vm-services-ci/qualification.json ]; then
-            cp /tmp/fleet-control-vm-services-ci/qualification.json ci-evidence/vm-services.json
-          fi
-          if [ -f /tmp/fleet-control-managed-vm-ci/qualification.json ]; then
-            cp /tmp/fleet-control-managed-vm-ci/qualification.json ci-evidence/managed-vm.json
-          fi
-          # Never upload fixture homes: they contain private identity keys and databases.
+          for home in /tmp/fleet-control-{rolling,checkpoint,portable,vm-services,managed-vm,garage}-ci /tmp/fleet-control-ci; do
+            for name in qualification.json result.json; do
+              if [ -f "$home/$name" ]; then cp "$home/$name" "ci-evidence/$(basename "$home")-$name"; fi
+            done
+          done
+          if [ -f /tmp/fleet-upgrade-binaries/builds.json ]; then cp /tmp/fleet-upgrade-binaries/builds.json ci-evidence/; fi
+          # Fixture homes contain private keys and data; only allowlisted evidence is uploaded.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: evidence-${{ matrix.os }}
+          name: qualification-${{ matrix.os }}-${{ matrix.scenario }}
           path: ci-evidence/
           retention-days: 14

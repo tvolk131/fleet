@@ -244,6 +244,7 @@ pub struct Receipt {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct State {
+    pub family: String,
     #[serde(default)]
     pub vm: super::vm::Catalog,
     #[serde(default)]
@@ -278,6 +279,7 @@ pub fn key(principal: &str, id: &str) -> String {
 impl State {
     pub fn new(cluster: String) -> Self {
         Self {
+            family: super::FAMILY.into(),
             vm: Default::default(),
             tunnels: Default::default(),
             // New clusters start at the binary's floor. Deserializing old metadata still

@@ -1,12 +1,12 @@
 use super::support::*;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 const BASE: u32 = fleet::control::version::MIN;
-const NEXT: u32 = fleet::control::version::MAX;
+const NEXT: u32 = BASE + 1;
 
 /// Use the previous executable for every preparation/activation before installing
 /// the candidate. Installing binaries must never silently upgrade stored behavior.
@@ -77,33 +77,24 @@ fn rejected(l: &Lab, r: Value) -> Result<()> {
 fn unchanged(l: &Lab, n: u64, binary: &Path) -> Result<()> {
     let db = l.root.join(format!("seed/node-{n}/control.redb"));
     let before = digest(&db)?;
-    for args in [
-        vec![
-            "service".into(),
-            "run".into(),
-            "--config".into(),
-            l.s(&format!("node-{n}.json")),
-        ],
-        vec![
-            "cluster".into(),
-            "upgrade".into(),
-            "--controller-home".into(),
-            l.s(&format!("seed/node-{n}")),
-        ],
-    ] {
-        let out = output(binary, &args, None, 60)?;
-        ensure!(
-            !out.status.success() && {
-                let error = String::from_utf8_lossy(&out.stderr);
-                error.contains("incompatible")
-                    || error.contains("format mismatch")
-                    || error.contains("unsupported source format")
-            },
-            "expected incompatible startup: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        ensure!(digest(&db)? == before, "rejection changed database");
-    }
+    let args = vec![
+        "service".into(),
+        "run".into(),
+        "--config".into(),
+        l.s(&format!("node-{n}.json")),
+    ];
+    let out = output(binary, &args, None, 60)?;
+    ensure!(
+        !out.status.success() && {
+            let error = String::from_utf8_lossy(&out.stderr);
+            error.contains("incompatible")
+                || error.contains("format mismatch")
+                || error.contains("unsupported source format")
+        },
+        "expected incompatible startup: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    ensure!(digest(&db)? == before, "rejection changed database");
     Ok(())
 }
 fn live(l: &Lab, supervisor: &[u8], reply: &Value) -> Result<()> {
@@ -189,16 +180,13 @@ pub fn run(root: &Path, baseline: &Path, candidate: &Path, unsupported: &Path) -
     let initial_revision = l.state()?["version"]["revision"].as_u64().unwrap();
     l.binary = current;
     caught(&l, &[1, 2, 3])?;
-    let denied = l.envelope(json!({"op":"metadata","query":{"kind":"stats"}}))?;
     ensure!(
-        denied["ok"] == false
-            && denied["outcome_unknown"] == false
-            && denied.to_string().contains("activate generation 5"),
-        "future variant reached an older leader: {denied}"
+        l.request(json!({"op":"metadata","query":{"kind":"stats"}}))?["indexed"] == true,
+        "baseline must use indexed storage"
     );
     for n in 1..=3 {
         ensure!(
-            inspect(&l, n)?["software"] == json!({"min":BASE-1,"max":BASE}),
+            inspect(&l, n)?["software"] == json!({"min":BASE,"max":BASE}),
             "baseline range changed"
         );
     }
@@ -496,128 +484,96 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     }
     Ok(())
 }
+/// The first consolidated release has no earlier release in its format family. Build explicit
+/// synthetic future releases to exercise rolling mechanics; do not claim historical compatibility.
 pub fn build(output_dir: &Path) -> Result<()> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()?;
     let output_dir = resolve(output_dir)?;
     fs::create_dir_all(&output_dir)?;
-    let previous = read(&root.join("contrib/upgrade_baseline.json"))?;
     let scratch = std::env::temp_dir().join(format!(
         "fleet-control-upgrade-build-{:016x}",
         rand::random::<u64>()
     ));
     fs::create_dir(&scratch)?;
-    let target = root.join("target");
-    let build_one = |source: &Path, name: &str, all: bool| -> Result<()> {
-        for args in [
-            vec!["clean", "-p", "fleet", "--profile", "dev"],
-            if all {
-                vec!["build", "--all-features", "--bins", "--locked"]
-            } else {
-                vec!["build", "--all-features", "--bin", "fleet", "--locked"]
-            },
-        ] {
-            let status = std::process::Command::new("cargo")
-                .args(args)
-                .current_dir(source)
-                .env("CARGO_TARGET_DIR", &target)
-                .status()?;
-            ensure!(status.success(), "qualification binary build failed");
-        }
-        fs::copy(target.join("debug/fleet"), output_dir.join(name))?;
-        Ok(())
-    };
-    let result = (|| -> Result<()> {
-        let archive = scratch.join("baseline.tar");
-        let status = std::process::Command::new("git")
-            .args(["archive", "--format=tar", "--output"])
-            .arg(&archive)
-            .arg(previous["revision"].as_str().unwrap())
-            .current_dir(&root)
-            .status()?;
-        ensure!(status.success(), "baseline source unavailable");
-        let baseline = scratch.join("baseline");
-        fs::create_dir(&baseline)?;
-        let status = std::process::Command::new("tar")
-            .arg("-xf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&baseline)
-            .status()?;
-        ensure!(status.success(), "baseline extraction failed");
-        build_one(&baseline, "fleet-baseline", false)?;
-        let adapter_previous = read(&root.join("contrib/service_adapter_baseline.json"))?;
-        let adapter_source = scratch.join("service-baseline");
-        fs::create_dir(&adapter_source)?;
-        let status = std::process::Command::new("git")
-            .args(["archive", "--format=tar", "--output"])
-            .arg(&archive)
-            .arg(
-                adapter_previous["revision"]
-                    .as_str()
-                    .context("service adapter revision required")?,
-            )
-            .current_dir(&root)
-            .status()?;
-        ensure!(status.success(), "service adapter baseline unavailable");
-        let status = std::process::Command::new("tar")
-            .arg("-xf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&adapter_source)
-            .status()?;
-        ensure!(
-            status.success(),
-            "service adapter baseline extraction failed"
-        );
-        build_one(&adapter_source, "fleet-service-baseline", false)?;
-        let future = scratch.join("unsupported");
-        fs::create_dir(&future)?;
+    let mut hashes = serde_json::Map::new();
+    for (name, min, max) in [
+        ("fleet-baseline", BASE, BASE),
+        ("fleet-candidate", BASE, NEXT),
+        ("fleet-unsupported", NEXT + 1, NEXT + 2),
+    ] {
+        let source = scratch.join(name);
+        fs::create_dir(&source)?;
         for dir in ["src", "crates", "contrib/rust", "tests/fixtures"] {
-            copy_tree(&root.join(dir), &future.join(dir))?;
+            copy_tree(&root.join(dir), &source.join(dir))?;
         }
-        for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
-            fs::copy(root.join(name), future.join(name))?;
+        for file in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
+            fs::copy(root.join(file), source.join(file))?;
         }
-        let file = future.join("src/control/version.rs");
-        let source = fs::read_to_string(&file)?;
+        let file = source.join("src/control/version.rs");
+        let text = fs::read_to_string(&file)?;
         ensure!(
-            source.contains(&format!("pub const MIN: u32 = {BASE};"))
-                && source.contains(&format!("pub const MAX: u32 = {NEXT};")),
-            "update unsupported build fixture for new baseline"
+            text.contains("pub const MIN: u32 = 1;") && text.contains("pub const MAX: u32 = 1;"),
+            "update rolling fixtures when publishing a new baseline-family release"
         );
         fs::write(
             file,
-            source
-                .replace(
-                    &format!("pub const MIN: u32 = {BASE};"),
-                    &format!("pub const MIN: u32 = {};", NEXT + 1),
-                )
-                .replace(
-                    &format!("pub const MAX: u32 = {NEXT};"),
-                    &format!("pub const MAX: u32 = {};", NEXT + 2),
-                ),
+            text.replace(
+                "pub const MIN: u32 = 1;",
+                &format!("pub const MIN: u32 = {min};"),
+            )
+            .replace(
+                "pub const MAX: u32 = 1;",
+                &format!("pub const MAX: u32 = {max};"),
+            ),
         )?;
-        build_one(&future, "fleet-unsupported", false)?;
-        build_one(&root, "fleet-candidate", true)?;
-        for name in ["fleet-guest", "fleet-fake-tart", "fleet-test-workload"] {
-            fs::copy(target.join("debug").join(name), output_dir.join(name))?;
-        }
-        let hashes = ["fleet-baseline", "fleet-candidate", "fleet-unsupported"]
-            .map(|n| digest(&output_dir.join(n)))
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
+        // Accelerate snapshot creation in these explicitly synthetic releases. The production
+        // cadence remains 10,000; snapshot transport/storage are unchanged.
+        let network_file = source.join("src/control/network.rs");
+        let network = fs::read_to_string(&network_file)?;
         ensure!(
-            hashes[0] != hashes[1] && hashes[0] != hashes[2] && hashes[1] != hashes[2],
-            "builds must be distinct"
+            network.contains("SnapshotPolicy::LogsSinceLast(10_000)"),
+            "update fixture snapshot cadence for changed source"
         );
-        let report = json!({"baseline":previous,"service_adapter_baseline":adapter_previous,"unsupported_is_test_fixture":true,"sha256":{"fleet-baseline":hashes[0],"fleet-candidate":hashes[1],"fleet-unsupported":hashes[2],"fleet-service-baseline":digest(&output_dir.join("fleet-service-baseline"))?}});
-        save(&output_dir.join("builds.json"), &report)?;
-        println!("{report}");
-        Ok(())
-    })();
-    // Always leave the candidate build intact on success; retain failed build evidence otherwise.
-    if result.is_ok() {
-        fs::remove_dir_all(scratch)?;
+        fs::write(
+            network_file,
+            network.replace(
+                "SnapshotPolicy::LogsSinceLast(10_000)",
+                "SnapshotPolicy::LogsSinceLast(100)",
+            ),
+        )?;
+        let status = std::process::Command::new("cargo")
+            .args([
+                "build",
+                "--features",
+                "qualification",
+                "--locked",
+                "--bin",
+                "fleet",
+                "--bin",
+                "fleet-guest",
+            ])
+            .current_dir(&source)
+            .env("CARGO_TARGET_DIR", root.join("target/rolling-fixtures"))
+            .status()?;
+        ensure!(status.success(), "fixture build failed");
+        fs::copy(
+            root.join("target/rolling-fixtures/debug/fleet"),
+            output_dir.join(name),
+        )?;
+        fs::copy(
+            root.join("target/rolling-fixtures/debug/fleet-guest"),
+            output_dir.join("fleet-guest"),
+        )?;
+        hashes.insert(name.into(), json!(digest(&output_dir.join(name))?));
     }
-    result
+    for name in ["fleet-fake-tart", "fleet-test-workload"] {
+        fs::copy(tool(name), output_dir.join(name))?;
+    }
+    let report = json!({"family":fleet::control::FAMILY,"synthetic_future_releases":true,"snapshot_after_entries":100,"ranges":{"baseline":[BASE,BASE],"candidate":[BASE,NEXT],"unsupported":[NEXT+1,NEXT+2]},"sha256":hashes});
+    save(&output_dir.join("builds.json"), &report)?;
+    fs::remove_dir_all(&scratch)?;
+    println!("{report}");
+    Ok(())
 }

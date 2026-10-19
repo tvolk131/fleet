@@ -44,7 +44,6 @@ pub enum EventKind {
     /// A job's progress probes, when what they measure changed.
     Progress {
         job: String,
-        #[serde(deserialize_with = "crate::proto::lenient")]
         probes: Vec<crate::probes::ProbeValue>,
     },
     /// A suspension waiting for the next checkpoint gave up (none settled in time); the job keeps running.

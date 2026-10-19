@@ -1,6 +1,6 @@
 use fleet::{
     instances::{self, Config, Desired, Gpu, Network, Spec, State},
-    proto::{Hello, PROTOCOL},
+    worker_data::Hello,
 };
 use std::{
     collections::BTreeMap,
@@ -17,7 +17,7 @@ mod guest_tests;
 fn hello() -> Hello {
     Hello {
         agent_version: "test".into(),
-        protocol: PROTOCOL,
+
         hostname: "test".into(),
         os: "macOS".into(),
         cpu: "test".into(),
@@ -186,8 +186,7 @@ fn failed_configuration_can_be_stopped_and_deleted_without_reprovisioning() {
 }
 
 #[test]
-fn gpu_modes_default_to_exclusive_and_gate_shared_on_protocol_3_4() {
-    use fleet::proto::{Protocol, Request, too_new};
+fn gpu_modes_default_to_exclusive_and_preserve_explicit_shared() {
     let legacy = serde_json::to_value(spec()).unwrap();
     assert!(
         legacy.get("gpu").is_none(),
@@ -210,20 +209,6 @@ fn gpu_modes_default_to_exclusive_and_gate_shared_on_protocol_3_4() {
     let mut unsupported_cpu = legacy;
     unsupported_cpu["cpu_mode"] = "dedicated".into();
     assert!(serde_json::from_value::<Spec>(unsupported_cpu).is_err());
-    let exclusive = Request::InstanceCreate {
-        id: "old".into(),
-        spec: spec(),
-    };
-    let shared = Request::InstanceCreate {
-        id: "new".into(),
-        spec: shared_spec(),
-    };
-    assert_eq!(too_new(&exclusive, Protocol { major: 3, minor: 3 }), None);
-    assert_eq!(
-        too_new(&shared, Protocol { major: 3, minor: 3 }),
-        Some(("InstanceCreate.spec.gpu", 4))
-    );
-    assert_eq!(too_new(&shared, PROTOCOL), None);
 }
 
 #[test]
@@ -666,18 +651,6 @@ fn failed_launcher_keeps_reservation_until_stop_confirms_termination() {
     assert!(instances::admit_job(&f.home, 1, Some(true), None, &hello()).is_ok());
     f.set("one", Desired::Deleted);
     f.wait("one", State::Deleted);
-}
-
-#[test]
-fn protocol_requires_upgraded_agent_for_instances() {
-    let request = fleet::proto::Request::InstanceCreate {
-        id: "one".into(),
-        spec: spec(),
-    };
-    assert_eq!(
-        fleet::proto::too_new(&request, fleet::proto::Protocol { major: 3, minor: 2 }),
-        Some(("InstanceCreate", 3))
-    );
 }
 
 #[test]

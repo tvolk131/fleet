@@ -1,14 +1,16 @@
 # Lost quorum recovery
 
 Fleet can recover a permanently unavailable control plane from one surviving replica's applied state.
-This is an explicit disaster recovery operation in `fleet-control-lab`, separate from ordinary Raft
+This is an explicit disaster recovery operation in `fleet cluster`, separate from ordinary Raft
 membership changes. It creates a new controller identity and wire incarnation, preserves the original
 logical Fleet identity in a signed recovery record, and requires explicit client and worker rebinding.
 Installed Fleet services and training records remain outside this workflow.
 
-The normal queue and recovery use wire protocol 1 and physical storage format 12. See the [checkpoint/upgrade guide](CHECKPOINT_JOBS.md) for the current model. Recovery-bound format-5/6/7/8/9/10/11 state is deliberately refused by that upgrade; earlier lab formats and the SQLite coordinator are not imported. The recovery command
-accepts a concrete loopback or LAN address. See [multi-machine deployment](CONTROL_PLANE_NETWORKING.md)
-for the network configuration and physical-host qualification.
+Recovery images and signatures are bound to the current [baseline family](BASELINE.md), whose
+metadata and wire versions start at 1. The separate baseline importer refuses recovery-bound old
+state; it cannot erase an authority transition. The recovery command accepts a concrete loopback or
+LAN address. See [multi-machine deployment](CONTROL_PLANE_NETWORKING.md) for configuration and
+physical-host qualification.
 
 ## What recovery preserves and can lose
 
@@ -47,7 +49,7 @@ Use a new destination directory, the survivor's matching configuration, an exist
 and an unused port on an explicit local IP address. These example paths are placeholders for an isolated deployment:
 
 ```sh
-target/debug/fleet-control-lab recover \
+target/debug/fleet cluster recover \
   --source-home /tmp/fleet-example/node-1 \
   --config /tmp/fleet-example/node-1/config.json \
   --key /tmp/fleet-example/client/node.key \
@@ -64,7 +66,7 @@ partial destination that must not be started; retry into another fresh destinati
 Start the recovered replica once with bootstrap:
 
 ```sh
-target/debug/fleet-control-lab serve \
+target/debug/fleet cluster serve \
   --home /tmp/fleet-recovered --config /tmp/fleet-recovered/config.json --bootstrap
 ```
 
@@ -76,7 +78,7 @@ Ordinary membership changes can grow this new single-replica cluster to three vo
 For each client configuration, explicitly accept the signed recovery record:
 
 ```sh
-target/debug/fleet-control-lab accept-recovery \
+target/debug/fleet cluster accept-recovery \
   --config /tmp/fleet-example/client/config.json \
   --manifest /tmp/fleet-recovered/recovery.json
 ```
@@ -110,11 +112,11 @@ Stop each worker agent, keeping its journal, key and backend directory intact. D
 continue to own their workloads. Then run:
 
 ```sh
-target/debug/fleet-control-lab rebind-worker \
+target/debug/fleet cluster rebind-worker \
   --home /tmp/fleet-example/worker \
   --manifest /tmp/fleet-recovered/recovery.json
 
-target/debug/fleet-control-lab worker --home /tmp/fleet-example/worker
+target/debug/fleet cluster worker --home /tmp/fleet-example/worker
 ```
 
 Rebinding commits the new authority and a frozen recovery inventory in the worker journal before
@@ -152,7 +154,7 @@ Cancellation/deletion of reconciled work remains possible while new work is paus
 After inspecting reconciliation, explicitly enable new work:
 
 ```sh
-target/debug/fleet-control-lab resume-recovery \
+target/debug/fleet cluster resume-recovery \
   --key /tmp/fleet-example/client/node.key \
   --config /tmp/fleet-example/client/config.json \
   --origin RECOVERED_CLUSTER_ID --request-id resume-after-review

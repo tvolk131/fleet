@@ -5,7 +5,8 @@ edition = "2024"
 default-run = "fleet"
 
 [workspace]
-members = ["crates/fleet-guest"]
+members = ["crates/fleet-guest", "crates/fleet-tools"]
+default-members = [".", "crates/fleet-guest"]
 
 [dependencies]
 fleet-guest = { path = "crates/fleet-guest" }
@@ -33,32 +34,26 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [features]
 default = ["control-plane"]
+# Fixture executables are excluded from normal product builds.
+qualification = []
 # The desktop GUI (`fleet gui`); agents do not need it.
 gui = ["dep:iced", "dep:iced-m3", "control-plane"]
 # Replicated control plane, enabled in normal builds.
 control-plane = ["dep:openraft", "dep:redb"]
 
 [[bin]]
-name = "fleet-control-lab"
-path = "src/bin/fleet-control-lab.rs"
-required-features = ["control-plane"]
-
-[[bin]]
 name = "fleet-guest"
 path = "src/bin/fleet-guest.rs"
 
 [[bin]]
-name = "fleet-qualify"
-path = "contrib/rust/main.rs"
-required-features = ["control-plane"]
-
-[[bin]]
 name = "fleet-test-workload"
 path = "tests/fixtures/workload.rs"
+required-features = ["qualification"]
 
 [[bin]]
 name = "fleet-fake-tart"
 path = "tests/fixtures/fake_tart.rs"
+required-features = ["qualification"]
 
 [dev-dependencies]
 iroh-relay = { version = "=1.3.0", features = ["server"] }
