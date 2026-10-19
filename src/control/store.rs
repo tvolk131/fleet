@@ -37,6 +37,8 @@ pub struct Store {
     db: Arc<Database>,
     // Held inside the blocking task, even if the awaiting future is cancelled.
     writes: Arc<tokio::sync::Mutex<()>>,
+    // Blocking jobs outlive cancelled callers; shutdown must wait for their database handles.
+    activity: Arc<tokio::sync::RwLock<()>>,
     fail_state_commit: Arc<AtomicBool>,
     hold_joint_apply: Arc<AtomicBool>,
 }
@@ -247,6 +249,7 @@ impl Store {
             _startup_lock: Arc::new(startup_lock),
             db: Arc::new(db),
             writes: Arc::new(tokio::sync::Mutex::new(())),
+            activity: Arc::new(tokio::sync::RwLock::new(())),
             fail_state_commit: Arc::new(AtomicBool::new(false)),
             hold_joint_apply: Arc::new(AtomicBool::new(false)),
         })
@@ -267,6 +270,7 @@ impl Store {
         write: bool,
         f: impl FnOnce(&Database) -> Result<T> + Send + 'static,
     ) -> Result<T, StorageError<u64>> {
+        let activity = self.activity.clone().read_owned().await;
         let guard = if write {
             Some(self.writes.clone().lock_owned().await)
         } else {
@@ -274,12 +278,20 @@ impl Store {
         };
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
+            let _activity = activity;
             let _guard = guard;
-            f(&db)
+            // Drop the database handle before signaling that the blocking job has drained.
+            let owned_db = db;
+            f(&owned_db)
         })
         .await
         .map_err(|e| StorageIOError::read(&e))?
         .map_err(|e| StorageIOError::write(&std::io::Error::other(format!("{e:#}"))).into())
+    }
+
+    /// Call after all producers have stopped. Cancellation cannot stop a redb blocking job.
+    pub(crate) async fn drain(&self) {
+        let _drained = self.activity.write().await;
     }
 
     pub async fn state(&self) -> Result<State, StorageError<u64>> {
@@ -587,6 +599,48 @@ mod version_tests {
     use super::*;
     use crate::control::{Command, Mutation, Request, network::Peer, version::Software};
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[tokio::test]
+    async fn drain_waits_for_database_work_after_its_caller_is_cancelled() {
+        let home = std::env::temp_dir().join(format!(
+            "fleet-control-drain-{:032x}",
+            rand::random::<u128>()
+        ));
+        let path = home.join("control.redb");
+        let store = Store::open(&path, "cluster", 1).unwrap();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let caller = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .blocking(false, move |db| {
+                        let _read = db.begin_read()?;
+                        started.send(()).unwrap();
+                        held.recv().unwrap();
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        entered.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let mut drain = tokio::spawn({
+            let store = store.clone();
+            async move { store.drain().await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut drain)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        drain.await.unwrap();
+        drop(store);
+        drop(Store::open(&path, "cluster", 1).unwrap());
+        std::fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn missing_receipts_cannot_be_reinitialized_as_empty_history() {

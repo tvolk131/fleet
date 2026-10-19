@@ -428,8 +428,11 @@ impl RaftNetwork<TypeConfig> for Network {
     }
 }
 
+type Requests = Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>;
+
 #[derive(Clone)]
 struct Handler {
+    requests: Requests,
     raft: Raft,
     store: Store,
     config: Config,
@@ -928,7 +931,9 @@ impl ProtocolHandler for Handler {
         }
         while let Ok((mut send, mut recv)) = connection.accept_bi().await {
             let handler = self.clone();
-            tokio::spawn(async move {
+            let mut requests = self.requests.lock().await;
+            while requests.try_join_next().is_some() {}
+            requests.spawn(async move {
                 let receive = async {
                     if handler.blocked.read().expect("blocked").contains(&peer) {
                         bail!("injected partition");
@@ -978,6 +983,7 @@ impl ProtocolHandler for Handler {
 }
 
 pub struct Replica {
+    requests: Requests,
     pub raft: Raft,
     pub store: Store,
     pub blocked: Blocked,
@@ -1073,10 +1079,12 @@ impl Replica {
             )?,
             config.id,
         );
+        let requests = Requests::default();
         let router = Router::builder(endpoint)
             .accept(
                 ALPN,
                 Handler {
+                    requests: requests.clone(),
                     raft: raft.clone(),
                     store: store.clone(),
                     config,
@@ -1091,6 +1099,7 @@ impl Replica {
         let membership_task =
             spawn_reconciler(raft.clone(), store.clone(), membership_paused.clone());
         Ok(Self {
+            requests,
             raft,
             store,
             blocked,
@@ -1133,8 +1142,13 @@ impl Replica {
         let _ = self.scheduler_task.await;
         self.membership_task.abort();
         let _ = self.membership_task.await;
-        self.raft.shutdown().await?;
-        self.router.shutdown().await?;
+        let raft = self.raft.shutdown().await;
+        // Router shutdown joins accept futures. Then no new request can enter this task set.
+        let router = self.router.shutdown().await;
+        self.requests.lock().await.shutdown().await;
+        self.store.drain().await;
+        raft?;
+        router?;
         Ok(())
     }
 }
@@ -1428,5 +1442,69 @@ mod tests {
         assert_eq!(connection.remote_id(), peer.identity);
         client.close().await;
         router.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_joins_half_open_requests_and_releases_the_database() {
+        let home = std::env::temp_dir().join(format!(
+            "fleet-control-request-shutdown-{:032x}",
+            rand::random::<u128>()
+        ));
+        let key = crate::keys::load_or_create(&home.join("node.key")).unwrap();
+        let admin = SecretKey::generate();
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = Peer {
+            identity: key.public(),
+            address: socket.local_addr().unwrap(),
+        };
+        drop(socket);
+        let config = Config {
+            cluster: "shutdown".into(),
+            id: 1,
+            peers: BTreeMap::from([(1, peer.clone())]),
+            administrators: BTreeSet::from([admin.public()]),
+            bootstrap_allowed: true,
+        };
+        let replica = Replica::start(&home, config.clone()).await.unwrap();
+        replica.bootstrap(&config.peers).await.unwrap();
+        let mut client = Client::new(admin, config.cluster.clone(), config.peers.clone())
+            .await
+            .unwrap();
+        client.read(Duration::from_secs(10)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut requests = replica.requests.lock().await;
+                while requests.try_join_next().is_some() {}
+                if requests.is_empty() {
+                    break;
+                }
+                drop(requests);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let connection = client.endpoint.connect(peer.addr(), ALPN).await.unwrap();
+        let (mut send, _receive) = connection.open_bi().await.unwrap();
+        send.write_all(b"{").await.unwrap(); // Deliberately never complete the request frame.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while replica.requests.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), replica.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(Store::open(&home.join("control.redb"), &config.cluster, 1).unwrap());
+        client.endpoint.close().await;
+        std::fs::remove_dir_all(home).unwrap();
     }
 }
