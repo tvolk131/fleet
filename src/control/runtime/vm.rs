@@ -444,7 +444,19 @@ mod tests {
         j.mark_attempted(false, "not-published", true).unwrap();
         j.mark_attempted(false, "not-published", false).unwrap();
         view.generation = 4;
-        assert!(j.accept(view).is_err());
+        assert!(j.accept(view.clone()).is_err());
+        // Emergency rebinding resets the observed authority generation. A surviving older
+        // controller image must not downgrade the worker's physical execution-fence format.
+        j.change(|s| {
+            s.generation = 0;
+            Ok(())
+        })
+        .unwrap();
+        j.accept(view).unwrap();
+        assert_eq!(
+            j.read().unwrap().format,
+            crate::control::store::indexed::FORMAT
+        );
         drop(j);
         let j = Journal::open(&home, &cfg, false).unwrap();
         assert!(j.attempted(true, "once").unwrap());

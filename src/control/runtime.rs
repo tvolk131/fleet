@@ -182,8 +182,11 @@ impl Journal {
             let mut table = tx.open_table(JOURNAL)?;
             let mut state: JournalState =
                 serde_json::from_slice(table.get("state")?.context("missing journal")?.value())?;
+            let indexed = state.format == super::store::indexed::FORMAT;
             f(&mut state)?;
-            if state.generation >= super::store::indexed::GENERATION {
+            // Explicit recovery can bind to an older surviving authority image. That must never
+            // downgrade the physical marker layout and let an old binary overlook executions.
+            if indexed || state.generation >= super::store::indexed::GENERATION {
                 state.format = super::store::indexed::FORMAT;
                 table.insert("execution_format", b"14".as_slice())?;
                 let mut markers = tx.open_table(EXECUTIONS)?;
