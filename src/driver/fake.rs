@@ -167,7 +167,6 @@ impl Vm for Arc<FakeVm> {
     fn save(&self, to: &Path) -> Result<()> {
         let served = self.state.lock().unwrap().served;
         std::fs::write(to, serde_json::to_vec(&Saved { served })?)?;
-        self.power_off(Exit::Saved { path: to.into() });
         Ok(())
     }
 

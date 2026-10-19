@@ -29,8 +29,17 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10.9"
 tokio = { version = "1.53.2", features = ["full"] }
+base64 = "0.22.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# Virtualization.framework, used only by the `vz` driver's runner (`fleet-runner-vz`).
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSString", "NSURL", "NSError", "NSFileHandle", "NSObject", "NSValue", "NSData"] }
+objc2-virtualization = "0.3.2"
 
 [features]
 default = ["control-plane"]
@@ -44,6 +53,10 @@ control-plane = ["dep:openraft", "dep:redb"]
 [[bin]]
 name = "fleet-guest"
 path = "src/bin/fleet-guest.rs"
+
+[[bin]]
+name = "fleet-runner-vz"
+path = "src/bin/fleet-runner-vz.rs"
 
 [[bin]]
 name = "fleet-test-workload"

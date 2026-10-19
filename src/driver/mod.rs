@@ -10,6 +10,8 @@ pub mod conformance;
 pub mod fake;
 pub mod protocol;
 pub mod runner;
+#[cfg(target_os = "macos")]
+pub mod vz;
 
 use std::{
     fmt, fs,
@@ -249,6 +251,12 @@ pub trait Backend: Send + Sync {
     /// The command that runs `fleet driver-runner` (or equivalent) for an instance directory.
     fn runner(&self, dir: &Path) -> Command;
 }
+
+/// The guest port Fleet's guest agent listens on. A graceful stop sends it
+/// [`SHUTDOWN_REQUEST`] as well as pressing the virtual power button, which a guest without a
+/// power-button driver never sees.
+pub const AGENT_PORT: u32 = 1024;
+pub const SHUTDOWN_REQUEST: &[u8] = b"{\"kind\":\"shutdown\"}\n";
 
 const SPEC: &str = "spec.json";
 const START: &str = "start.json";

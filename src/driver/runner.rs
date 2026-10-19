@@ -9,7 +9,7 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -33,9 +33,10 @@ pub trait Vm: Send + Sync + 'static {
     /// Asks the guest to stop. Returning does not mean it has.
     fn request_stop(&self) -> Result<()>;
     fn connect_guest(&self, port: u32) -> Result<OwnedFd>;
-    /// Saves to `to` and stops the guest, after which `wait` returns `Exit::Saved`.
+    /// Saves the guest's state to `to`, leaving it paused. The runner then ends with
+    /// `Exit::Saved`, once the driver has its reply.
     fn save(&self, to: &Path) -> Result<()>;
-    /// Blocks until the guest has stopped.
+    /// Blocks until the guest has stopped on its own or failed.
     fn wait(&self) -> Exit;
 }
 
@@ -43,6 +44,33 @@ pub struct Args {
     pub dir: PathBuf,
     pub lock_fd: Option<RawFd>,
     pub restore: Option<PathBuf>,
+}
+
+impl Args {
+    /// `<dir> [--lock-fd N] [--restore PATH]`, as `RunnerDriver` passes them.
+    pub fn parse(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<Self> {
+        let dir = args
+            .next()
+            .context("usage: <instance dir> [--lock-fd N] [--restore PATH]")?;
+        let mut parsed = Self {
+            dir: dir.into(),
+            lock_fd: None,
+            restore: None,
+        };
+        while let Some(flag) = args.next() {
+            let value = args
+                .next()
+                .with_context(|| format!("{flag:?} needs a value"))?;
+            match flag.to_str() {
+                Some("--lock-fd") => {
+                    parsed.lock_fd = Some(value.to_str().context("lock fd")?.parse()?);
+                }
+                Some("--restore") => parsed.restore = Some(value.into()),
+                _ => bail!("unknown argument {flag:?}"),
+            }
+        }
+        Ok(parsed)
+    }
 }
 
 /// Runs one VM to completion. Errors before the guest starts are recorded as `Exit::Failed`.
@@ -79,9 +107,11 @@ fn serve(args: &Args, vm: Arc<impl Vm>) -> Result<Exit> {
         host_end,
         stopping: AtomicBool::new(false),
         generation: spec.generation,
+        exit: Mutex::new(None),
+        ended: Condvar::new(),
     });
     std::thread::spawn({
-        let vm = vm.clone();
+        let (vm, state) = (vm.clone(), state.clone());
         move || {
             for stream in listener.incoming().flatten() {
                 let (vm, state) = (vm.clone(), state.clone());
@@ -91,7 +121,17 @@ fn serve(args: &Args, vm: Arc<impl Vm>) -> Result<Exit> {
             }
         }
     });
-    Ok(vm.wait())
+    std::thread::spawn({
+        let state = state.clone();
+        move || state.end(vm.wait())
+    });
+    let mut exit = state.exit.lock().unwrap();
+    loop {
+        if let Some(exit) = exit.take() {
+            return Ok(exit);
+        }
+        exit = state.ended.wait(exit).unwrap();
+    }
 }
 
 struct State {
@@ -99,6 +139,19 @@ struct State {
     host_end: OwnedFd,
     stopping: AtomicBool,
     generation: u64,
+    /// How the runner ends: the first of the guest stopping and a completed save.
+    exit: Mutex<Option<Exit>>,
+    ended: Condvar,
+}
+
+impl State {
+    fn end(&self, exit: Exit) {
+        let mut slot = self.exit.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(exit);
+            self.ended.notify_all();
+        }
+    }
 }
 
 fn handle(vm: &impl Vm, state: &State, mut stream: UnixStream) -> Result<()> {
@@ -136,7 +189,18 @@ fn handle(vm: &impl Vm, state: &State, mut stream: UnixStream) -> Result<()> {
         },
         Request::Save { path } => {
             state.stopping.store(true, Ordering::Relaxed);
-            reply(&mut stream, vm.save(&path).map(|()| Response::Ok))
+            match vm.save(&path) {
+                Ok(()) => {
+                    // Reply before ending: the runner exits as soon as it ends.
+                    let sent = reply(&mut stream, Ok(Response::Ok));
+                    state.end(Exit::Saved { path });
+                    sent
+                }
+                Err(e) => {
+                    state.stopping.store(false, Ordering::Relaxed);
+                    reply(&mut stream, Err(e))
+                }
+            }
         }
     }
 }

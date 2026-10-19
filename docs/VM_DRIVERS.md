@@ -1,7 +1,7 @@
 # VM drivers
 
-Status: draft. The trait below is a hypothesis to be tested by the spikes in the last section. It is
-not frozen until a `vz` and a `krun` guest have both booted under it.
+Status: the trait, the `fake` driver and the production `vz` driver are implemented and pass the
+conformance suite; `krun` is still a spike. Tart is still what the worker runs (see "Removing Tart").
 
 Fleet replaces Tart and Softnet with its own VM drivers. A driver turns a Fleet-owned instance
 record into a running guest on one host and reports what it observes. Fleet stays the only
@@ -38,8 +38,10 @@ and its own VM registry each break a binding constraint.
 
 ## Process model
 
-Each VM lives in its own **runner** process, `fleet driver-runner <backend> <instance dir>`,
-started detached in its own process group, so restarting the worker never touches guests.
+Each VM lives in its own **runner** process, started detached in its own process group, so
+restarting the worker never touches guests. The `fake` runner is `fleet driver-runner fake <dir>`;
+the `vz` runner is its own executable, `fleet-runner-vz <dir>`, so the virtualization entitlement is
+never granted to the rest of Fleet. Both take `--lock-fd` and `--restore` and speak one protocol.
 
 - Virtualization.framework ties a VM to the process that created it, and libkrun's
   `krun_start_enter` takes over the calling process. Either way one process per VM is forced, so
@@ -58,19 +60,24 @@ started detached in its own process group, so restarting the worker never touche
 - Descriptors are passed with `SCM_RIGHTS`, and the runner keeps its copy open until the client
   hangs up: on macOS, closing the sender's copy of a socket descriptor still in flight lost about
   one in five of them in the conformance suite.
-- Open: `vz` and `krun` runners need an entitlement and (for `krun`) libkrun, which `fleet`
-  itself should not carry. They will likely be separate `fleet-runner-vz` and `fleet-runner-krun`
-  executables that the backends launch, speaking the same protocol.
+- A save ends the runner only after the driver has the reply, so a save is never reported as a
+  dropped connection.
+- `krun` will get a `fleet-runner-krun` executable the same way, so `fleet` never links libkrun.
 
 ## Storage and images
 
 - Disks are raw images. Instance disks are `clonefile(2)` copies of a base image, so they are
   instant and copy-on-write on APFS. On Linux hosts, `FICLONE` where the filesystem supports it,
   otherwise a full copy.
-- Images stop being OCI references pulled by Tart. A Fleet image is a content-addressed bundle
-  (disk, plus kernel/initrd or the macOS auxiliary storage and hardware model, plus a small manifest)
-  stored and transferred with the existing iroh-blobs store. The trusted image catalog in
-  `instances.json` pins bundle hashes instead of OCI digests.
+- Images stop being OCI references pulled by Tart. A Fleet image is a bundle directory: an
+  `image.json` manifest naming files beside it, either a Linux kernel, optional initrd, command line
+  and optional disk, or a macOS hardware model, auxiliary storage (NVRAM) and disk.
+  `vz::import_tart` turns a Tart VM directory into a bundle with clones, so existing images carry
+  over without a download. Still to do: storing and transferring bundles content-addressed with the
+  iroh-blobs store, and pinning bundle hashes in the trusted catalog instead of OCI digests.
+- `prepare` clones every file of the bundle into the instance directory and records which bundle it
+  came from. A running instance never reads its image again, an instance cannot silently switch
+  images, and disks only grow.
 
 ## Networking contract
 
@@ -85,9 +92,15 @@ address carried over iroh.
 
 ## Guest channel
 
-`fleet-guest` listens on a fixed vsock port inside the guest, replacing `tart exec`. The driver
-exposes `connect_guest(port) -> stream`; the runner bridges it from `runner.sock` to the
-hypervisor's vsock device. The guest protocol in `crates/fleet-guest` is unchanged.
+`fleet-guest` will listen on `driver::AGENT_PORT` (vsock 1024) inside the guest, replacing
+`tart exec`. The driver exposes `connect_guest(port) -> stream`; the runner bridges it from
+`runner.sock` to the hypervisor's vsock device.
+
+A graceful stop presses the virtual power button and also sends `{"kind":"shutdown"}` to the agent
+port, retrying while the guest boots. Neither guest tested honours the power button: the Kata test
+kernel has no GPIO power-key driver, and macOS ignored it for the whole 90-second deadline. So in
+practice graceful stop depends on the agent, and macOS guests are forced until Fleet's agent is in
+the image.
 
 ## Driver trait
 
@@ -120,7 +133,38 @@ Repeating a generation with a different spec is rejected; `delete` forgets the g
 `fleet::driver_conformance!(harness)` generates one test per case. A harness provides fresh
 drivers over shared state (a new driver stands in for a restarted worker) and two test images that
 follow the test-guest contract documented in `conformance.rs`. `tests/driver_conformance.rs` runs
-all 20 cases against `fake`; `vz` and `krun` will run the same cases with real images.
+all 20 cases against `fake`, and `tests/driver_conformance_vz.rs` runs them against real
+Virtualization.framework guests.
+
+`Running` means the VM started, not that the guest has booted: the test helpers retry guest
+connections, and wait for a first frame before sending, as any client of a booting machine must.
+
+## The `vz` driver
+
+`src/driver/vz/`: `VzBackend` (supervising side: bundles, `prepare`, signing) and the
+`runner::Vm` implementation used by `fleet-runner-vz`. The runner is ad-hoc signed with
+`contrib/vz.entitlements` (`vz::sign_runner`); signing needs no identity.
+
+The real-VM tests are ignored by default, because CI's macOS runners are VMs without nested
+virtualization:
+
+    tests/vm-guest/build.sh                                  # test guest bundles in target/vm-guest
+    cargo test --test driver_conformance_vz -- --ignored     # 20 cases, about 2 s
+    FLEET_VZ_MACOS_TART=<Tart VM dir> cargo test --test driver_vz_macos -- --ignored --nocapture
+
+`tests/vm-guest` is the Linux test guest: a static Rust `/init` on Kata Containers' 4.2.0 guest
+kernel (pinned by SHA-256 in `build.sh`). Ten consecutive runs of the suite passed, leaving no
+runner processes or sockets behind.
+
+macOS guest, Tahoe base image imported from Tart's cache, 4 vCPUs and 8 GiB, M4 Pro:
+
+| | |
+| --- | --- |
+| Start (`startWithCompletionHandler`) | 4.4 s |
+| First frame from the guest on its card | 5.6 s later (IPv6) |
+| Save | 3.5 s, 3.2 GiB |
+| Restore in a new runner, new card | 5.6 s; frames within 2 ms |
+| Graceful stop with no agent | power button ignored; forced at the deadline |
 
 ## Open questions
 
@@ -208,8 +252,9 @@ the guest a pause in traffic (buffered up to the socket size, then back-pressure
 Because a closed end is invisible to the guest, "the card is not connected" has to be Fleet's own
 state, reported in `Observed`, never inferred from the guest.
 
-Still open for `vz`: disks (raw images, `clonefile`), a macOS guest and its IPSW install
-(question 2), and restore on a different host.
+Since done in the production driver: disks (raw images, `clonefile`) and a macOS guest (imported
+from Tart, not installed from an IPSW). Still open: the IPSW install (question 2) and restore on a
+different host.
 
 ## Findings: `krun` spike, 2026-10-19
 

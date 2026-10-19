@@ -44,10 +44,20 @@ pub trait Harness {
 }
 
 /// Generates one `#[test]` per conformance case. `$harness` is evaluated once per case.
+/// Attributes after it, such as `#[ignore = "..."]`, are applied to every case.
 #[macro_export]
 macro_rules! driver_conformance {
-    ($harness:expr) => {
-        $crate::driver_conformance!(@cases $harness;
+    (@cases [$($attr:tt)*] $harness:expr; $case:ident $(, $rest:ident)* $(,)?) => {
+        #[test]
+        $($attr)*
+        fn $case() {
+            $crate::driver::conformance::$case(&$harness);
+        }
+        $crate::driver_conformance!(@cases [$($attr)*] $harness; $($rest),*);
+    };
+    (@cases [$($attr:tt)*] $harness:expr;) => {};
+    ($harness:expr $(, #[$attr:meta])* $(,)?) => {
+        $crate::driver_conformance!(@cases [$(#[$attr])*] $harness;
             capabilities_are_consistent,
             unknown_instance_is_absent,
             prepare_is_idempotent,
@@ -69,14 +79,6 @@ macro_rules! driver_conformance {
             save_and_restore_preserve_guest_state,
             unsupported_save_is_reported
         );
-    };
-    (@cases $harness:expr; $($case:ident),* $(,)?) => {
-        $(
-            #[test]
-            fn $case() {
-                $crate::driver::conformance::$case(&$harness);
-            }
-        )*
     };
 }
 
@@ -123,8 +125,17 @@ fn wait_for(driver: &impl Driver, id: &InstanceId, phase: Phase) -> Observed {
     }
 }
 
+/// One echo request. `Running` means the VM started, not that the guest has booted, so the
+/// connection is retried until the guest listens.
 fn ask(driver: &impl Driver, id: &InstanceId, request: &str) -> String {
-    let mut stream = driver.connect_guest(id, ECHO_PORT).unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    let mut stream = loop {
+        match driver.connect_guest(id, ECHO_PORT) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => panic!("guest port {ECHO_PORT} never answered: {e}"),
+        }
+    };
     stream.set_read_timeout(Some(PATIENCE)).unwrap();
     stream.write_all(request.as_bytes()).unwrap();
     let mut reply = String::new();
@@ -263,6 +274,8 @@ pub fn guest_channel_round_trip(h: &impl Harness) {
 
 pub fn guest_channel_unknown_port_fails_fast(h: &impl Harness) {
     let (driver, spec) = started(h, "closed-port", TestImage::Standard);
+    // Once the guest is up, so the refusal comes from the guest and not from a boot in progress.
+    ask(&driver, &spec.id, "up");
     let began = Instant::now();
     assert!(driver.connect_guest(&spec.id, 9999).is_err());
     assert!(
@@ -286,6 +299,8 @@ pub fn network_card_survives_borrower_closing(h: &impl Harness) {
     let (driver, spec) = started(h, "borrowed", TestImage::Standard);
     drop(driver.network_card(&spec.id).unwrap());
     let card = driver.network_card(&spec.id).unwrap();
+    // Frames sent before the guest's interface is up are lost, as on any network.
+    next_frame(&card, |_| true);
     send_frame(&card, "after reborrow");
     next_frame(&card, |p| p == "echo: after reborrow");
     driver.delete(&spec.id, 1).unwrap();
