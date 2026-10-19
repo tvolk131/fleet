@@ -1,9 +1,9 @@
-# Fleet 0.2: replicated queue, clients, and services
+# Replicated queue, clients and services
 
-This release uses fresh state and one qualified software version across the cluster. It does not import
-SQLite, adopt legacy jobs, or support mixed old/new workers. The separately installed legacy Fleet and
-its files can remain available while existing work finishes. Do not assign the same physical capacity
-to both schedulers.
+Normal Fleet uses the replicated control plane for scheduling and management, including a single
+replica installation. The [consolidated baseline](BASELINE.md) has a separate offline importer for the
+sole existing installation. Future compatible releases use [rolling upgrades](ROLLING_UPGRADES.md).
+Archived SQLite coordinator state is not adopted. Assign physical capacity to only one worker authority.
 
 ## Roles and homes
 
@@ -99,7 +99,7 @@ fleet --home /absolute/client-home retry experiment-1
 ```
 
 The job JSON holds `name`, `argv`, local `inputs`, `publish`, `threads`, time limits, probes and optional
-`vm` and `checkpoint`. See [checkpoint-resumable VM jobs](CHECKPOINT_JOBS.md) for the manifest contract, attempt history, and explicit format-5/6 metadata upgrade. CPU threads default to one for native jobs; a VM uses its configured vCPUs. Native memory is an
+`vm` and `checkpoint`. See [checkpoint-resumable VM jobs](CHECKPOINT_JOBS.md) for the manifest contract, attempt history and baseline compatibility. CPU threads default to one for native jobs; a VM uses its configured vCPUs. Native memory is an
 admission reservation, not a per-process limit. Native GPU use must be declared with `--gpu`; it requires
 an advertised compute GPU and reserves exclusive Fleet GPU use. All macOS VMs still have GPU access.
 VM CPU/RAM/disk reservations and exclusive/shared GPU policy use the existing backend admission rules.
@@ -220,12 +220,10 @@ Qualify fresh homes first, then stage each idle machine. Recheck immediately bef
 another client may have submitted work since the earlier audit. A replica-only deployment can proceed while
 an old worker remains busy. Reverting to the old installation also requires draining the new worker first.
 
-Cross-worker checkpoint migration, preemption, direct persistent-guest commands, per-user ACLs,
-background output fetching to remembered destinations, and shared blob-cache vacuum
-are not in this release. Receipts are retained indefinitely unless explicitly released through the low-level
-administrative contract; automatic 90-day pruning remains future work. Metadata/snapshot size limits from
-the qualification remain applicable. Existing backend guarantees do not make CPU/GPU scheduling exclusive
-against unrelated host processes.
+Portable checkpoint resume and durable persistent-guest operations are supported. Per-user ACLs and
+background output fetching to remembered destinations remain future work. Request identities remain
+reserved indefinitely; response release never permits replay. Payload retention is separately configured.
+Tart CPU/GPU reservations do not enforce exclusivity against unrelated host processes.
 
 The desktop GUI uses `iced-m3` Material 3 components, follows system light/dark appearance, and uses the same durable request journal and replicated API as the CLI and JSON interface. Closing the window never cancels a job.
 

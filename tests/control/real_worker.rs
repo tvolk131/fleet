@@ -4,14 +4,13 @@ use fleet::{
         runtime::{DataRequest, Worker, WorkerConfig, data_call, fetch_outputs, push_inputs},
         workload::*,
     },
-    instances, jobs, proto,
+    instances, jobs, worker_data,
 };
 use std::os::unix::fs::PermissionsExt;
 
-fn hello() -> proto::Hello {
-    proto::Hello {
+fn hello() -> worker_data::Hello {
+    worker_data::Hello {
         agent_version: "test".into(),
-        protocol: proto::PROTOCOL,
         hostname: "test".into(),
         os: "macOS".into(),
         cpu: "test".into(),
@@ -111,7 +110,7 @@ async fn prepare_named(
         },
         controllers: c.config.peers.clone(),
         administrators: c.config.administrators.clone(),
-        supervisor: env!("CARGO_BIN_EXE_fleet-control-lab").into(),
+        supervisor: env!("CARGO_BIN_EXE_fleet").into(),
     };
     drop(socket);
     if tart {
@@ -298,7 +297,7 @@ async fn native_worker_survives_lost_reply_restart_and_replica_replacement() {
         )
         .await
         .unwrap();
-        let proto::Response::Logs { data, .. } = logs else {
+        let worker_data::Response::Logs { data, .. } = logs else {
             panic!("unexpected logs response: {logs:?}");
         };
         if data == "started\n" {
@@ -551,6 +550,49 @@ async fn enrolled_worker_cannot_submit_jobs_or_impersonate_another_journal() {
             .await
             .is_err()
     );
+    // Authentication applies to the data and blob planes as well as replicated commands.
+    assert!(
+        data_call(
+            &impostor.endpoint,
+            &config.cluster,
+            &config.registration.peer,
+            DataRequest::Status
+        )
+        .await
+        .is_err()
+    );
+    let store = fleet::blobs::open(&home.join("stranger-blobs"))
+        .await
+        .unwrap();
+    let hash = store
+        .blobs()
+        .add_bytes("unauthorized upload")
+        .await
+        .unwrap()
+        .hash;
+    let pushed = tokio::time::timeout(
+        Duration::from_secs(3),
+        fleet::blobs::push(
+            &store,
+            &impostor.endpoint,
+            config.registration.peer.addr(),
+            &[hash],
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(pushed);
+    assert_eq!(
+        data_call(
+            &c.client.endpoint,
+            &config.cluster,
+            &config.registration.peer,
+            DataRequest::Missing { hashes: vec![hash] }
+        )
+        .await
+        .unwrap(),
+        worker_data::Response::Missing(vec![hash])
+    );
     impostor.endpoint.close().await;
     w.shutdown().await.unwrap();
     c.close().await;
@@ -596,7 +638,7 @@ async fn tart_job_and_persistent_instances_use_replicated_intent_and_shared_budg
         );
     }
     let mut w = Worker::start(&home, config.clone(), hello()).await.unwrap();
-    let proto::Response::Instances(inventory) = data_call(
+    let worker_data::Response::Instances(inventory) = data_call(
         &c.client.endpoint,
         &c.config.cluster,
         &config.registration.peer,
@@ -699,7 +741,8 @@ async fn worker_process_sigkill_preserves_supervisor_and_durable_cancellation() 
     instances::write(&home.join("worker.json"), &config).unwrap();
     let start = || {
         Child(
-            std::process::Command::new(env!("CARGO_BIN_EXE_fleet-control-lab"))
+            std::process::Command::new(env!("CARGO_BIN_EXE_fleet"))
+                .arg("cluster")
                 .arg("worker")
                 .arg("--home")
                 .arg(&home)
@@ -1089,9 +1132,6 @@ async fn queued_native_jobs_schedule_once_and_dependencies_wait_for_success() {
 
 #[path = "checkpoints.rs"]
 mod checkpoints;
-
-#[path = "upgrade.rs"]
-mod upgrade;
 
 #[path = "storage.rs"]
 mod storage;

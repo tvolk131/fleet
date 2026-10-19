@@ -276,18 +276,7 @@ impl Worker {
         Ok(())
     }
     async fn capture_final_outputs(&self, a: &Assignment) -> Result<Option<Manifest>> {
-        let proto::Response::Outputs(files) = self
-            .agent
-            .handle(
-                self.config.registration.peer.identity,
-                proto::Request::Outputs {
-                    job: a.execution.clone(),
-                },
-            )
-            .await?
-        else {
-            bail!("unexpected final outputs reply")
-        };
+        let files = self.backend.outputs(&a.execution).await?;
         if files.is_empty() {
             return Ok(None);
         }

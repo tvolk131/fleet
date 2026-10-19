@@ -373,25 +373,6 @@ pub fn run(a: tart::Options) -> Result<()> {
     l.stop("controller", true)?;
     let cached_restart = (|| -> Result<()> {
         l.stop("adapter-a", false)?;
-        if let Some(baseline) = &a.baseline_binary {
-            let old = output(
-                baseline,
-                &[
-                    "tunnels".into(),
-                    "run".into(),
-                    "--adapter-home".into(),
-                    l.s("adapter-a"),
-                ],
-                None,
-                10,
-            )?;
-            ensure!(
-                !old.status.success()
-                    && String::from_utf8_lossy(&old.stderr).contains("No such file"),
-                "old adapter accepted VM configuration"
-            );
-            l.phase("previous_host_adapter_refuses_vm_attachment_home");
-        }
         // Cached policy survives both controller loss and an adapter restart.
         l.start("adapter-a", None)?;
         // Tart may keep the old guest command's stdin open after the host dies.

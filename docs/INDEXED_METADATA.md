@@ -26,8 +26,8 @@ do not create receipts or authorize execution.
 
 ## Layout and atomicity
 
-Compatibility generation five activates physical metadata layout 14. The application State format
-remains 12: physical layout, wire compatibility and application behavior are separate concepts.
+The baseline family uses physical and application format 1. Physical layout, wire compatibility and
+application behavior remain separate concepts even when their version numbers match.
 The `meta` table holds identity, version, membership and a resource header. `state_rows` holds keyed
 jobs, assignments, checkpoints, workers, membership operations, producer cursors, VM operations,
 artifact records and history catalogs. `request_receipts` holds permanent receipts. Changed resource
@@ -40,14 +40,14 @@ removes request-history-sized reads and rewrites from that path; it does not cla
 work is independent of the number of jobs or artifacts. Only changed resource rows are rewritten.
 Existing VM metadata admission limits and worker-view size limits still apply.
 
-Workers migrate their native and guest execution markers into `execution_markers`, keyed by
-execution domain and ID. Migration and the worker's accepted generation commit together. Subsequent
-marker lookups/writes avoid loading marker history. Worker resource reconciliation still uses its
+Workers store native and guest execution markers in `execution_markers`, keyed by execution domain
+and ID. Marker lookups/writes avoid loading marker history. The offline baseline importer preserves
+markers from the existing installation; fresh workers use indexed markers from initialization. Worker resource reconciliation still uses its
 existing journal and checks against regressing assignments, outcomes and acknowledgements.
 
 ## Reads
 
-At generation five the normal client/GUI resource view excludes receipt history, and a job lookup
+The normal client/GUI resource view excludes receipt history, and a job lookup
 returns that job's view instead of every job. Raw resource/receipt point reads and bounded pages are
 available through the JSON CLI. All network queries require administrator authentication and a
 quorum read barrier. Inspect only selects the compatible protocol; it does not authorize an action
@@ -81,12 +81,12 @@ These are **live keyset pages**, each with its observed applied index. They do n
 database between calls. Concurrent insertion before the cursor may not appear, and an updated
 resource or released receipt is observed as of the page that reads it. Cluster/collection mismatch
 is rejected, including after emergency authority replacement. Use a snapshot/backup for a consistent
-complete image. The legacy full `cluster read` export remains for small diagnostics and qualification;
+complete image. The full diagnostic `cluster read` export remains for small diagnostics and qualification;
 it is intentionally not the normal request-history access path and remains frame-size bounded.
 
 ## Snapshots, recovery and upgrades
 
-Generation-five Raft snapshots stream a header and sorted, length-bounded records through private
+Raft snapshots stream a header and sorted, length-bounded records through private
 unlinked temporary files. The digest covers the entire file. Redb stores snapshot data in 64 KiB
 chunks rather than one serialized byte vector. Snapshot capture uses a consistent read transaction;
 publication cannot replace a newer installed snapshot. Installation validates identity, generation,
@@ -101,12 +101,10 @@ cadence. This trades a longer retained Raft log for fewer full-history scans and
 Snapshots still cost time and disk proportional to retained history; the point-read measurements
 below do not measure that amortized background work or promise unlimited write throughput.
 
-Install the binary on replicas first, then prepare and activate generation five using the existing
-rolling-upgrade commands. Before activation, both the state and saved snapshot remain readable by
-the previous 3..4 executable. Activation atomically copies existing receipts/resources into the
-indexed tables. After activation, older executables refuse the physical format before writing.
-Workers switch marker layout when they accept generation five. The pinned previous-release fixture
-qualifies rollback before activation and refusal afterward, including live work and snapshots.
+All of these layouts are present from baseline generation 1. The [baseline importer](BASELINE.md)
+converts the sole earlier installation offline. [Rolling upgrade qualification](ROLLING_UPGRADES.md)
+uses explicit future-version fixtures to test rollback before activation and refusal afterward,
+including live work and snapshots.
 
 Emergency recovery exports the complete applied image, including permanent receipts, and preserves
 the existing authority-transition rules. A known old-origin request returns its previous result;
@@ -118,7 +116,7 @@ without changing receipt identity or retention.
 
 ## Qualification
 
-`tests/control/indexed.rs` covers activation, atomic abort, duplicate/conflicting/released retries,
+`tests/control/indexed.rs` covers atomic apply/abort, duplicate/conflicting/released retries,
 pagination, restart, snapshot restore and recovery receipt preservation. A three-replica test
 transfers a snapshot larger than 64 MiB over iroh, then loses its leader and retries a request;
 large catch-up batches must split instead of retrying an oversized frame forever. Normal CI runs

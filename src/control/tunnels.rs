@@ -16,7 +16,7 @@ pub mod transport;
 
 /// Generation two was already advertised by the previous release. New variants
 /// must wait for generation three, after every voter has installed this binary.
-pub const GENERATION: u32 = 3;
+pub const GENERATION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Adapter {

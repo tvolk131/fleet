@@ -1,4 +1,0 @@
-{
-  "revision": "892e36024d3c0fd8a79d50b32ad2000121903f1f",
-  "purpose": "Previous host-only service adapter; must refuse a VM attachment home without binding guest ports on the host."
-}

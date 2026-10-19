@@ -149,16 +149,14 @@ log expiry; this milestone does not add job-record garbage collection.
 
 ## Upgrade and qualification
 
-Durable history introduced format 10. The current physical format is **12**. [Rolling upgrades](ROLLING_UPGRADES.md) support adjacent cluster generations with explicit activation. The explicit offline
-[upgrade procedure](CHECKPOINT_JOBS.md#explicit-format-567891011-upgrade) accepts idle format 5–11 singleton
-state and preserves identities, receipts, jobs and checkpoints. No installed service is upgraded by
-qualification. Existing loose log files remain locally readable when available, but are not
-retroactively copied into archives. Historical metric records that were never captured cannot be
-reconstructed from live probe snapshots.
+Durable history is part of [baseline generation 1](BASELINE.md). The offline importer preserves jobs,
+checkpoints and receipts; qualification never upgrades the installed service. Existing loose log files
+remain locally readable when available, but are not retroactively archived. Metric records that were
+never captured cannot be reconstructed from live probes.
 
 Coverage includes bounded capture and UTF-8 boundaries, crash-tail repair, JSONL replay/rotation/gaps,
 policy revisions, pin pressure, cross-attempt retention, deletion compaction, notification rollover,
-format-9 migration, GUI rendering/stale responses, and a three-replica native worker/storage scenario
+GUI rendering/stale responses, and a three-replica native worker/storage scenario
 that reads through the public client after the source goes offline and storage restarts, then expires
 payloads while preserving attempts.
 

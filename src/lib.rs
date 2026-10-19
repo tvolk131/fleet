@@ -1,25 +1,25 @@
 //! Fleet: replicated workload intent, independently reconciled workers and storage,
 //! and authenticated clients over iroh. See `docs/DISTRIBUTED_CONTROL_PLANE.md`.
 
-pub mod agent;
+pub mod backend;
 pub mod blobs;
 pub mod checkpoint;
 #[cfg(feature = "control-plane")]
 pub mod control;
-pub mod coordinator;
 pub mod events;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod history;
+pub mod inputs;
 pub mod instances;
 pub mod jobs;
 pub mod keys;
 pub mod probes;
-pub mod proto;
 pub mod supervise;
 pub mod suspend;
 pub mod system;
 pub mod vm_job;
+pub mod worker_data;
 
 use iroh::endpoint::Connection;
 use serde::{Deserialize, Serialize};

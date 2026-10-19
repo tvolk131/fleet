@@ -61,13 +61,6 @@ fn stop(f: &Fixture) {
 
 #[test]
 fn validation_and_protocol_refuse_unsafe_or_unsupported_guest_requests() {
-    use fleet::proto::{Protocol, Request, too_new};
-    let request = Request::InstanceGuest(guest::Request::Storage);
-    assert_eq!(
-        too_new(&request, Protocol { major: 3, minor: 4 }),
-        Some(("InstanceGuest", 5))
-    );
-    assert_eq!(too_new(&request, PROTOCOL), None);
     for spec in [
         S::Download {
             version: None,
@@ -368,14 +361,12 @@ fn storage_inventory_distinguishes_sparse_capacity_and_ignores_symlinks() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn every_guest_endpoint_checks_instance_owner_over_authenticated_transport() {
+async fn every_guest_backend_operation_checks_instance_owner() {
     use fleet::{
-        agent::{Agent, AgentConfig},
+        backend::{Backend, BackendConfig},
         blobs,
-        proto::{ALPN, Request, Response},
     };
-    use iroh::{Endpoint, RelayMode, SecretKey, endpoint::presets, protocol::Router};
-    use std::{collections::HashSet, sync::Arc};
+    use iroh::SecretKey;
     let f = Fixture::new();
     let owner = SecretKey::generate();
     let other = SecretKey::generate();
@@ -388,32 +379,15 @@ async fn every_guest_endpoint_checks_instance_owner_over_authenticated_transport
     )
     .unwrap();
     let store = blobs::open(&f.home.join("blobs")).await.unwrap();
-    let endpoint = Endpoint::builder(presets::Minimal)
-        .relay_mode(RelayMode::Disabled)
-        .bind()
-        .await
-        .unwrap();
-    let agent = Agent::start(
-        Arc::new(HashSet::from([owner.public(), other.public()])),
+    let agent = Backend::start(
         hello(),
-        AgentConfig {
+        BackendConfig {
             home: f.home.clone(),
             supervisor: env!("CARGO_BIN_EXE_fleet").into(),
             store: store.clone(),
         },
     )
     .unwrap();
-    let router = Router::builder(endpoint).accept(ALPN, agent).spawn();
-    let stranger = Endpoint::builder(presets::Minimal)
-        .secret_key(other)
-        .relay_mode(RelayMode::Disabled)
-        .bind()
-        .await
-        .unwrap();
-    let connection = stranger
-        .connect(router.endpoint().addr(), ALPN)
-        .await
-        .unwrap();
     use guest::Request as G;
     for request in [
         G::Ready {
@@ -443,13 +417,11 @@ async fn every_guest_endpoint_checks_instance_owner_over_authenticated_transport
             spec: command("pass"),
         },
     ] {
-        let Response::Error(error) =
-            fleet::proto::request(&connection, &Request::InstanceGuest(request))
-                .await
-                .unwrap()
-        else {
-            panic!("non-owner was allowed");
-        };
+        let error = agent
+            .guest(other.public(), request)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("different coordinator"), "{error}");
     }
     assert!(!f.home.join("instances/private/operations/x").exists());
@@ -470,8 +442,7 @@ async fn every_guest_endpoint_checks_instance_owner_over_authenticated_transport
     tokio::task::spawn_blocking(move || wait_state(&home, "private", State::Deleted))
         .await
         .unwrap();
-    stranger.close().await;
-    router.shutdown().await.unwrap();
+    drop(agent);
     store.shutdown().await.unwrap();
 }
 

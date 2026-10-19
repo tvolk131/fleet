@@ -1,6 +1,6 @@
 # Multi machine control plane deployment
 
-`fleet-control-lab` can run replicas and workers on separate machines using authenticated iroh QUIC
+`fleet cluster` can run replicas and workers on separate machines using authenticated iroh QUIC
 over explicit IP addresses. The M4 Pro and M1 Pro use the macOS ARM binary; the Pi uses a separately
 built Linux ARM binary from the same source and lockfile. The CLI, GUI, JSON automation, and persistent
 service roles use this transport; see
@@ -32,14 +32,14 @@ remain enforced by the worker's existing Tart/Softnet backend.
 Build one qualified release for each OS/architecture:
 
 ```sh
-cargo build --release --locked --features control-plane --bin fleet-control-lab
+cargo build --release --locked --features control-plane --bin fleet
 ```
 
 Choose a fresh staging directory and explicit addresses in replica ID order. Preparation validates
 remote addresses without trying to bind those interfaces on the administrator's machine:
 
 ```sh
-fleet-control-lab init --home /tmp/fleet-control-example --replicas 3 \
+fleet cluster init --home /tmp/fleet-control-example --replicas 3 \
   --address 192.0.2.11:28460 \
   --address 192.0.2.12:28460 \
   --address 192.0.2.13:28460
@@ -58,7 +58,7 @@ persistent local disks; `/tmp` is for experiments and may be RAM-backed or clear
 Start every replica with its own home and configuration:
 
 ```sh
-fleet-control-lab serve --home /absolute/private/node-2 \
+fleet cluster serve --home /absolute/private/node-2 \
   --config /absolute/private/node-2/config.json
 ```
 
@@ -81,9 +81,9 @@ agent packaging and launchd installation remain part of the later installed-serv
 Before running workloads, inspect every replica and verify that all have applied the initial membership:
 
 ```sh
-fleet-control-lab inspect --key /absolute/client/node.key \
+fleet cluster inspect --key /absolute/client/node.key \
   --config /absolute/client/config.json --replica 3
-fleet-control-lab read --key /absolute/client/node.key --config /absolute/client/config.json
+fleet cluster read --key /absolute/client/node.key --config /absolute/client/config.json
 ```
 
 `inspect` targets exactly the requested pinned replica, including when quorum is unavailable. It reports
@@ -97,7 +97,7 @@ commands omit `--replica` and handle discovery, leader routing and retries inter
 Copy a public cluster configuration to the worker host, then prepare a separate home there:
 
 ```sh
-fleet-control-lab prepare-worker --home /absolute/private/worker \
+fleet cluster prepare-worker --home /absolute/private/worker \
   --config /absolute/public/cluster.json --id example-worker \
   --cpu-slots 1 --memory-mb 256 --bind 192.0.2.12:28480
 ```
@@ -111,7 +111,7 @@ old coordinator and the new cluster. Qualification workloads are tiny, explicitl
 For replica rotation, run this on the new replica's host:
 
 ```sh
-fleet-control-lab prepare-replica --home /absolute/private/node-4 \
+fleet cluster prepare-replica --home /absolute/private/node-4 \
   --config /absolute/public/cluster.json --id 4 --bind 192.0.2.12:28464
 ```
 

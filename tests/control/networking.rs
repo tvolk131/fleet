@@ -24,7 +24,8 @@ fn advertised_contacts_reject_wildcards_multicast_and_zero_ports() {
 #[test]
 fn initial_remote_contacts_are_prepared_without_binding_remote_interfaces() {
     let home = Home::new();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fleet-control-lab"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fleet"))
+        .arg("cluster")
         .args(["init", "--home"])
         .arg(&home.0)
         .args([
@@ -56,7 +57,8 @@ fn initial_remote_contacts_are_prepared_without_binding_remote_interfaces() {
         assert_eq!(saved.peers, config.peers);
     }
     let bad = Home::new();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fleet-control-lab"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fleet"))
+        .arg("cluster")
         .args(["init", "--home"])
         .arg(&bad.0)
         .args(["--replicas", "1", "--address", "0.0.0.0:28001"])

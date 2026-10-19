@@ -45,7 +45,7 @@ async fn until(c: &mut Cluster, w: &mut Worker, what: &str, mut ready: impl FnMu
     }
 }
 
-async fn data(c: &Cluster, config: &WorkerConfig, request: DataRequest) -> proto::Response {
+async fn data(c: &Cluster, config: &WorkerConfig, request: DataRequest) -> worker_data::Response {
     data_call(
         &c.client.endpoint,
         &c.config.cluster,
@@ -65,7 +65,7 @@ async fn progress(
 ) -> u64 {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     loop {
-        let proto::Response::Events { events, last, .. } = data(
+        let worker_data::Response::Events { events, last, .. } = data(
             c,
             config,
             DataRequest::Events {
@@ -131,7 +131,7 @@ async fn vm_observations_replay_and_same_size_outputs_survive_restart_and_cancel
     })
     .await;
     let cursor = progress(&c, &config, &a.execution, 0, 2.0).await;
-    let proto::Response::Outputs(first) = data(
+    let worker_data::Response::Outputs(first) = data(
         &c,
         &config,
         DataRequest::Outputs {
@@ -196,7 +196,7 @@ async fn vm_observations_replay_and_same_size_outputs_survive_restart_and_cancel
     })
     .await;
     progress(&c, &config, &a.execution, cursor, 3.0).await;
-    let proto::Response::Outputs(second) = data(
+    let worker_data::Response::Outputs(second) = data(
         &c,
         &config,
         DataRequest::Outputs {
@@ -251,7 +251,7 @@ async fn vm_observations_replay_and_same_size_outputs_survive_restart_and_cancel
         std::fs::read(final_capture.join("out/result")).unwrap(),
         b"v2"
     );
-    let proto::Response::Logs { data, .. } = data(
+    let worker_data::Response::Logs { data, .. } = data(
         &c,
         &config,
         DataRequest::Logs {
@@ -323,7 +323,7 @@ async fn vm_failures_release_capacity_only_after_cleanup() {
             instances::State::Deleted
         );
         if id == "unsafe-output" {
-            let proto::Response::Outputs(files) = data(
+            let worker_data::Response::Outputs(files) = data(
                 &c,
                 &config,
                 DataRequest::Outputs {
@@ -335,7 +335,7 @@ async fn vm_failures_release_capacity_only_after_cleanup() {
                 panic!()
             };
             assert!(files.is_empty());
-            let proto::Response::Logs { data, .. } = data(
+            let worker_data::Response::Logs { data, .. } = data(
                 &c,
                 &config,
                 DataRequest::Logs {

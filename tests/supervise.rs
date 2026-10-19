@@ -144,14 +144,3 @@ fn wrapper_exit_does_not_abandon_its_stubborn_descendant() {
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(fs::read(j.dir.join("work/heartbeat")).unwrap(), heartbeat);
 }
-#[test]
-fn custom_grace_is_version_gated_including_zero() {
-    let old = fleet::proto::Protocol { major: 3, minor: 1 };
-    for seconds in [0, 10, 120] {
-        assert!(
-            fleet::proto::job_too_new(&serde_json::json!({"shutdown_grace_seconds": seconds}), old)
-                .is_some()
-        );
-    }
-    assert!(fleet::proto::job_too_new(&serde_json::json!({}), old).is_none());
-}

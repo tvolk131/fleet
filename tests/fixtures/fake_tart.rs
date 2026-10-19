@@ -201,8 +201,7 @@ fn run() -> Result<()> {
                 println!("{}", fleet_guest::READY);
                 return Ok(());
             }
-            let legacy = args[3] == "/usr/bin/python3";
-            if !legacy {
+            {
                 let name = Path::new(&args[3])
                     .file_name()
                     .context("helper executable required")?;
@@ -222,22 +221,8 @@ fn run() -> Result<()> {
             }
             let mut request: Value =
                 serde_json::from_str(args.last().context("request required")?)?;
-            if legacy && request["kind"] == "ready" {
-                println!("fleet-guest-v1");
-                return Ok(());
-            }
-            // The immutable historical baseline has a scripted guest envelope. At this mock
-            // boundary its fixed helper is emulated by Rust; no interpreter is executed.
             if request["kind"] == "exec" {
                 let argv = request["argv"].as_array_mut().context("argv required")?;
-                if argv.len() == 5
-                    && argv[0] == "/usr/bin/python3"
-                    && argv[1] == "-I"
-                    && argv[2] == "-c"
-                {
-                    let data = argv[4].clone();
-                    *argv = vec![json!(helper), json!("--job"), data];
-                }
                 if argv.len() == 3 && argv[1] == "--job" {
                     let mut observation: Value =
                         serde_json::from_str(argv[2].as_str().context("observation required")?)?;

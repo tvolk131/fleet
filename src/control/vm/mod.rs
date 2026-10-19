@@ -14,7 +14,7 @@ use std::{
 pub mod client;
 #[cfg(test)]
 mod tests;
-pub const GENERATION: u32 = 4;
+pub const GENERATION: u32 = 1;
 pub const RETENTION: u64 = 7 * 86400;
 pub const MAX_OPERATIONS: usize = 4096;
 pub const MAX_RETAINED: usize = 128;

@@ -5,8 +5,8 @@ use super::{
     workload::*,
 };
 use crate::{
-    agent::{Agent, AgentConfig},
-    blobs, instances, jobs, proto, vm_job,
+    backend::{Backend, BackendConfig},
+    blobs, instances, jobs, vm_job, worker_data,
 };
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{
@@ -28,12 +28,28 @@ mod history;
 mod reclaim;
 mod vm;
 
-pub const DATA_ALPN: &[u8] = b"fleet/worker-data/1";
+pub const DATA_ALPN: &[u8] = b"fleet/baseline/worker-data/1";
 const JOURNAL: TableDefinition<&str, &[u8]> = TableDefinition::new("worker_journal");
 const MAX_FRAME: usize = 8 << 20;
 
-pub(crate) fn supported_format(format: u64) -> bool {
-    u32::try_from(format).is_ok_and(vm::supported)
+/// Reject foreign families and unsupported observed generations before opening for writes.
+pub fn preflight(path: &Path) -> Result<()> {
+    if let Some(raw) = super::version::preflight(path, "worker_journal")? {
+        ensure!(
+            raw["state"]["format"]
+                .as_u64()
+                .is_some_and(|f| u32::try_from(f).is_ok_and(vm::supported))
+                && raw["state"]["family"] == super::FAMILY,
+            "worker metadata format mismatch; explicit baseline migration required"
+        );
+        let generation = raw["state"]["generation"]
+            .as_u64()
+            .context("missing worker generation")?;
+        if generation != 0 {
+            super::version::Software::current().require(u32::try_from(generation)?)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,12 +63,11 @@ pub struct WorkerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JournalState {
+    family: String,
     #[serde(default)]
     vm: super::vm::Catalog,
     #[serde(default)]
     generation: u32,
-    #[serde(default)]
-    vm_attempted: BTreeSet<String>,
     #[serde(default)]
     artifacts: BTreeMap<String, super::artifact::Manifest>,
     #[serde(default)]
@@ -70,7 +85,6 @@ struct JournalState {
     sequence: u64,
     assignments: BTreeMap<String, Assignment>,
     observations: BTreeMap<String, (u64, Observation)>,
-    attempted: BTreeSet<String>,
     outbox: BTreeMap<u64, Report>,
 }
 
@@ -88,14 +102,7 @@ impl Journal {
                 "backend exists without worker journal; explicit recovery required"
             );
         }
-        if let Some(raw) = super::version::preflight(&path, "worker_journal")? {
-            ensure!(
-                raw["state"]["format"]
-                    .as_u64()
-                    .is_some_and(|f| vm::supported(f as u32)),
-                "worker metadata format mismatch; explicit baseline migration required"
-            );
-        }
+        preflight(&path)?;
         let db = Database::create(path)?;
         {
             let tx = db.begin_read()?;
@@ -103,20 +110,16 @@ impl Journal {
                 && let Some(value) = table.get("state")?
             {
                 let state: JournalState = serde_json::from_slice(value.value())?;
-                if state.format == super::store::indexed::FORMAT {
+                ensure!(state.family == super::FAMILY, "incompatible worker family");
+                {
                     ensure!(
                         table
                             .get("execution_format")?
-                            .is_some_and(|v| v.value() == b"14"),
+                            .is_some_and(|v| v.value() == b"1"),
                         "missing execution layout marker"
                     );
                     tx.open_table(EXECUTIONS)
                         .context("execution markers missing; explicit recovery required")?;
-                } else {
-                    ensure!(
-                        table.get("execution_format")?.is_none(),
-                        "worker journal layout regressed"
-                    );
                 }
             }
         }
@@ -141,9 +144,9 @@ impl Journal {
                     "worker journal has no durable identity; explicit recovery required"
                 );
                 let state = JournalState {
+                    family: super::FAMILY.into(),
                     vm: Default::default(),
                     generation: 0,
-                    vm_attempted: BTreeSet::new(),
                     artifacts: BTreeMap::new(),
                     deleted_artifacts: BTreeSet::new(),
                     starts_allowed: true,
@@ -159,10 +162,11 @@ impl Journal {
                     sequence: 0,
                     assignments: BTreeMap::new(),
                     observations: BTreeMap::new(),
-                    attempted: BTreeSet::new(),
                     outbox: BTreeMap::new(),
                 };
                 table.insert("state", serde_json::to_vec(&state)?.as_slice())?;
+                table.insert("execution_format", b"1".as_slice())?;
+                tx.open_table(EXECUTIONS)?;
             }
         }
         tx.commit()?;
@@ -182,21 +186,7 @@ impl Journal {
             let mut table = tx.open_table(JOURNAL)?;
             let mut state: JournalState =
                 serde_json::from_slice(table.get("state")?.context("missing journal")?.value())?;
-            let indexed = state.format == super::store::indexed::FORMAT;
             f(&mut state)?;
-            // Explicit recovery can bind to an older surviving authority image. That must never
-            // downgrade the physical marker layout and let an old binary overlook executions.
-            if indexed || state.generation >= super::store::indexed::GENERATION {
-                state.format = super::store::indexed::FORMAT;
-                table.insert("execution_format", b"14".as_slice())?;
-                let mut markers = tx.open_table(EXECUTIONS)?;
-                for id in std::mem::take(&mut state.attempted) {
-                    markers.insert((0, id.as_str()), true)?;
-                }
-                for id in std::mem::take(&mut state.vm_attempted) {
-                    markers.insert((1, id.as_str()), true)?;
-                }
-            }
             table.insert("state", serde_json::to_vec(&state)?.as_slice())?;
         }
         tx.commit()?;
@@ -204,49 +194,20 @@ impl Journal {
     }
     fn attempted(&self, vm: bool, id: &str) -> Result<bool> {
         let tx = self.db.begin_read()?;
-        let table = tx.open_table(JOURNAL)?;
-        if table.get("execution_format")?.is_some() {
-            Ok(tx
-                .open_table(EXECUTIONS)?
-                .get((u8::from(vm), id))?
-                .is_some())
-        } else {
-            let state: JournalState =
-                serde_json::from_slice(table.get("state")?.context("missing journal")?.value())?;
-            Ok(if vm {
-                state.vm_attempted.contains(id)
-            } else {
-                state.attempted.contains(id)
-            })
-        }
+        Ok(tx
+            .open_table(EXECUTIONS)?
+            .get((u8::from(vm), id))?
+            .is_some())
     }
     fn mark_attempted(&self, vm: bool, id: &str, present: bool) -> Result<()> {
         let mut tx = self.db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         {
-            let mut table = tx.open_table(JOURNAL)?;
-            if table.get("execution_format")?.is_some() {
-                let mut markers = tx.open_table(EXECUTIONS)?;
-                if present {
-                    markers.insert((u8::from(vm), id), true)?;
-                } else {
-                    markers.remove((u8::from(vm), id))?;
-                }
+            let mut markers = tx.open_table(EXECUTIONS)?;
+            if present {
+                markers.insert((u8::from(vm), id), true)?;
             } else {
-                let mut state: JournalState = serde_json::from_slice(
-                    table.get("state")?.context("missing journal")?.value(),
-                )?;
-                let set = if vm {
-                    &mut state.vm_attempted
-                } else {
-                    &mut state.attempted
-                };
-                if present {
-                    set.insert(id.into());
-                } else {
-                    set.remove(id);
-                }
-                table.insert("state", serde_json::to_vec(&state)?.as_slice())?;
+                markers.remove((u8::from(vm), id))?;
             }
         }
         tx.commit()?;
@@ -296,9 +257,6 @@ impl Journal {
             }
             s.vm = view.vm;
             s.generation = view.generation;
-            if s.generation >= super::vm::GENERATION {
-                s.format = vm::FORMAT;
-            }
             for old in s.assignments.values() {
                 let new = view
                     .assignments
@@ -421,7 +379,7 @@ struct DataHandler {
     home: PathBuf,
     cluster: String,
     allow: Arc<HashSet<EndpointId>>,
-    agent: Agent,
+    backend: Backend,
     store: iroh_blobs::api::Store,
 }
 impl ProtocolHandler for DataHandler {
@@ -440,19 +398,19 @@ impl ProtocolHandler for DataHandler {
                     ensure!(frame.cluster == self.cluster, "cluster mismatch");
                     let special = match &frame.request {
                         DataRequest::VmInput{id}=> {
-                            let _gate=self.agent.blob_guard().await;
+                            let _gate=self.backend.blob_guard().await;
                             let op=self.vm_access.read().expect("VM access").operations.get(id).cloned().context("operation has not reached worker")?;
                             ensure!(!op.released,"operation input was released");
                             let instances::guest::Spec::Upload{hash,size,..}=op.spec else {bail!("not an upload");};
                             self.store.tags().set(vm::input_tag(id),iroh_blobs::HashAndFormat::raw(hash)).await?;
                             let complete=matches!(self.store.blobs().status(hash).await?,iroh_blobs::api::blobs::BlobStatus::Complete{size:stored} if size==stored);
                             self.store.sync_db().await?;
-                            Some(proto::Response::Missing(if complete {vec![]} else {vec![hash]}))
+                            Some(worker_data::Response::Missing(if complete {vec![]} else {vec![hash]}))
                         }
                         DataRequest::VmLogs{id,stderr,from}=>{
                             let op=self.vm_access.read().expect("VM access").operations.get(id).cloned().context("unknown operation")?;
                             ensure!(!op.released,"operation output was released");
-                            Some(proto::Response::InstanceGuest(instances::guest::Response::Logs(instances::guest::logs(&self.home.join("backend"),&op.execution,&op.backend_id(),*stderr,*from)?)))
+                            Some(worker_data::Response::InstanceGuest(instances::guest::Response::Logs(instances::guest::logs(&self.home.join("backend"),&op.execution,&op.backend_id(),*stderr,*from)?)))
                         }
                         DataRequest::History {
                             execution,
@@ -461,59 +419,37 @@ impl ProtocolHandler for DataHandler {
                             max,
                         } => {
                             let dir = jobs::dir(&self.home.join("backend"), execution)?;
-                            Some(proto::Response::History(crate::history::read(
+                            Some(worker_data::Response::History(crate::history::read(
                                 &dir,
                                 *stream,
                                 *from,
                                 *max as usize,
                             )?))
                         }
-                        DataRequest::Storage => Some(proto::Response::StorageReport(
+                        DataRequest::Storage => Some(worker_data::Response::StorageReport(
                             jobs::read_json(&self.home.join("storage-report.json"))?
                                 .unwrap_or(serde_json::Value::Null),
                         )),
                         DataRequest::ReserveInputs { hashes } => {
-                            Some(self.agent.reserve_inputs(hashes).await?)
+                            Some(self.backend.reserve_inputs(hashes).await?)
                         }
                         _ => None,
                     };
                     let response = if let Some(response) = special {
                         response
                     } else {
-                        let request = match frame.request {
-                            DataRequest::VmInput{..} | DataRequest::VmLogs{..} | DataRequest::Storage
-                            | DataRequest::ReserveInputs { .. }
-                            | DataRequest::History { .. } => {
-                                unreachable!()
-                            }
-                            DataRequest::Status => proto::Request::Status,
-                            DataRequest::Jobs => proto::Request::Jobs,
-                            DataRequest::Instances => proto::Request::Instances,
-                            DataRequest::Logs {
-                                execution,
-                                stderr,
-                                from,
-                                max,
-                            } => proto::Request::Logs {
-                                job: execution,
-                                stderr,
-                                from,
-                                max,
-                            },
-                            DataRequest::Outputs { execution } => {
-                                proto::Request::Outputs { job: execution }
-                            }
-                            DataRequest::Events { since, wait_ms } => {
-                                proto::Request::Events { since, wait_ms }
-                            }
-                            DataRequest::Missing { hashes } => proto::Request::Missing { hashes },
-                        };
-                        self.agent
-                            .handle(peer, request)
-                            .await
-                            .unwrap_or_else(|e| proto::Response::Error(format!("{e:#}")))
+                        match frame.request {
+                            DataRequest::VmInput{..} | DataRequest::VmLogs{..} | DataRequest::Storage | DataRequest::ReserveInputs{..} | DataRequest::History{..} => unreachable!(),
+                            DataRequest::Status => self.backend.status().await?,
+                            DataRequest::Jobs => worker_data::Response::Jobs(jobs::list(&self.home.join("backend"))?),
+                            DataRequest::Instances => worker_data::Response::Instances(instances::list(&self.home.join("backend"))?),
+                            DataRequest::Logs { execution,stderr,from,max } => self.backend.logs(&execution,stderr,from,max).await?,
+                            DataRequest::Outputs {execution} => worker_data::Response::Outputs(self.backend.outputs(&execution).await?),
+                            DataRequest::Events {since,wait_ms} => self.backend.events(since,wait_ms).await,
+                            DataRequest::Missing {hashes} => worker_data::Response::Missing(self.backend.missing(&hashes).await?),
+                        }
                     };
-                    if matches!(&response, proto::Response::Missing(hashes) if hashes.is_empty()) {
+                    if matches!(&response, worker_data::Response::Missing(hashes) if hashes.is_empty()) {
                         // A staging acknowledgement must survive worker process restart.
                         self.store.sync_db().await?;
                     }
@@ -523,9 +459,9 @@ impl ProtocolHandler for DataHandler {
                 let response = match result {
                     Ok(Ok(response)) => response,
                     Ok(Err(e)) => {
-                        proto::Response::Error(format!("{e:#}").chars().take(1024).collect())
+                        worker_data::Response::Error(format!("{e:#}").chars().take(1024).collect())
                     }
-                    Err(_) => proto::Response::Error("worker data request timed out".into()),
+                    Err(_) => worker_data::Response::Error("worker data request timed out".into()),
                 };
                 let bytes = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
                 if bytes.len() > MAX_FRAME {
@@ -548,7 +484,7 @@ pub async fn data_call(
     cluster: &str,
     worker: &Peer,
     request: DataRequest,
-) -> Result<proto::Response> {
+) -> Result<worker_data::Response> {
     tokio::time::timeout(Duration::from_secs(30), async {
         let connection = endpoint.connect(worker.addr(), DATA_ALPN).await?;
         let (mut send, mut recv) = connection.open_bi().await?;
@@ -561,7 +497,7 @@ pub async fn data_call(
         send.finish()?;
         let response = serde_json::from_slice(&recv.read_to_end(MAX_FRAME).await?)?;
         connection.close(0u32.into(), b"read complete");
-        if let proto::Response::Error(e) = response {
+        if let worker_data::Response::Error(e) = response {
             bail!("worker: {e}");
         }
         Ok(response)
@@ -578,7 +514,7 @@ pub struct Worker {
     pub router: Router,
     pub store: iroh_blobs::api::Store,
     journal: Journal,
-    agent: Agent,
+    backend: Backend,
     artifact_access: Arc<std::sync::RwLock<super::artifact_io::Access>>,
     storage_view: Option<WorkerView>,
     vm_adapters: BTreeMap<String, super::tunnels::agent::Agent>,
@@ -650,14 +586,14 @@ impl Worker {
             mutation,
         };
         if state.registration != next {
-            super::upgrade::backup_version(&home.join("worker.redb"), super::FORMAT)?;
+            crate::keys::backup_version(&home.join("worker.redb"), super::FORMAT)?;
             journal.change(|s| {
                 s.registration = next.clone();
                 Ok(())
             })?;
         }
         if config.registration != next {
-            super::upgrade::backup_version(&path, super::FORMAT)?;
+            crate::keys::backup_version(&path, super::FORMAT)?;
             config.registration = next;
             instances::write(&path, &config)?;
         }
@@ -665,45 +601,6 @@ impl Worker {
         Ok(request)
     }
 
-    pub(crate) fn upgrade_v5(
-        db: &Database,
-        home: &Path,
-        expected: &super::State,
-        preview: bool,
-    ) -> Result<()> {
-        let tx = db.begin_read()?;
-        let table = tx.open_table(JOURNAL)?;
-        let raw: serde_json::Value =
-            serde_json::from_slice(table.get("state")?.context("missing worker state")?.value())?;
-        let source_format = raw["format"].as_u64().context("worker format missing")? as u32;
-        let already = vm::supported(source_format);
-        let converted = if already {
-            raw
-        } else {
-            super::upgrade::journal(raw)?
-        };
-        let state: JournalState = serde_json::from_value(converted)?;
-        ensure!(
-            state.cluster == expected.cluster
-                && expected.workers.get(&state.registration.id) == Some(&state.registration),
-            "worker does not belong to this controller state"
-        );
-        if already {
-            return Ok(());
-        }
-        if preview {
-            return Ok(());
-        }
-        drop(table);
-        drop(tx);
-        super::upgrade::backup_version(&home.join("worker.redb"), source_format)?;
-        let mut tx = db.begin_write()?;
-        tx.set_durability(Durability::Immediate)?;
-        tx.open_table(JOURNAL)?
-            .insert("state", serde_json::to_vec(&state)?.as_slice())?;
-        tx.commit()?;
-        Ok(())
-    }
     /// Preparation creates the journal before enrollment/start. A missing journal on a later
     /// startup is never treated as a fresh worker with the old incarnation.
     pub fn initialize(home: &Path, config: &WorkerConfig) -> Result<()> {
@@ -770,7 +667,11 @@ impl Worker {
         Ok(())
     }
 
-    pub async fn start(home: &Path, config: WorkerConfig, mut hello: proto::Hello) -> Result<Self> {
+    pub async fn start(
+        home: &Path,
+        config: WorkerConfig,
+        mut hello: worker_data::Hello,
+    ) -> Result<Self> {
         config.registration.validate()?;
         ensure!(
             home.join("node.key").is_file(),
@@ -843,10 +744,9 @@ impl Worker {
                 .collect::<HashSet<_>>(),
         );
         let (store, reclamation) = blobs::open_managed(&home.join("blobs")).await?;
-        let agent = Agent::start_managed(
-            allow.clone(),
+        let execution_backend = Backend::start_managed(
             hello,
-            AgentConfig {
+            BackendConfig {
                 home: backend,
                 supervisor: config.supervisor.clone(),
                 store: store.clone(),
@@ -877,7 +777,7 @@ impl Worker {
                     home: home.into(),
                     cluster: config.cluster.clone(),
                     allow: allow.clone(),
-                    agent: agent.clone(),
+                    backend: execution_backend.clone(),
                     store: store.clone(),
                 },
             )
@@ -897,7 +797,7 @@ impl Worker {
             router,
             store,
             journal,
-            agent,
+            backend: execution_backend,
             artifact_access,
             storage_view: None,
             vm_adapters: BTreeMap::new(),
@@ -1185,14 +1085,8 @@ impl Worker {
                     }
                 } else if a.desired == Desired::Job(JobDesired::Cancelled) {
                     if spec.vm.is_some() {
-                        self.agent
-                            .handle(
-                                owner,
-                                proto::Request::CancelVmJob {
-                                    job: id.clone(),
-                                    spec: spec.clone(),
-                                },
-                            )
+                        self.backend
+                            .cancel_vm_job(owner, id.clone(), *spec.clone())
                             .await?;
                     } else if !dir.join("job.json").exists() {
                         return Ok(Observation {
@@ -1206,26 +1100,16 @@ impl Worker {
                     if !attempted {
                         self.restore_inputs(a).await?;
                         self.restore_checkpoint(a).await?;
-                        let hashes = spec.inputs.values().map(|i| i.hash).collect();
-                        if let proto::Response::Missing(missing) = self
-                            .agent
-                            .handle(owner, proto::Request::Missing { hashes })
-                            .await?
-                        {
-                            ensure!(missing.is_empty(), "waiting for verified input blobs");
-                        }
+                        let hashes: Vec<_> = spec.inputs.values().map(|i| i.hash).collect();
+                        ensure!(
+                            self.backend.missing(&hashes).await?.is_empty(),
+                            "waiting for verified input blobs"
+                        );
                         self.journal.mark_attempted(false, &a.id, true)?;
                     }
                     let submitted = self
-                        .agent
-                        .handle(
-                            owner,
-                            proto::Request::SubmitAllocated {
-                                spec: spec.clone(),
-                                id: Some(id.clone()),
-                                gpu: *gpu,
-                            },
-                        )
+                        .backend
+                        .submit(owner, *spec.clone(), Some(id.clone()), Some(*gpu))
                         .await;
                     if submitted.is_err()
                         && !dir.join("job.json").exists()
@@ -1292,7 +1176,7 @@ impl Worker {
                 if !attempted {
                     self.journal.mark_attempted(false, &a.id, true)?;
                 }
-                let created = self.agent.reserve_instance(owner, id, spec.clone()).await;
+                let created = self.backend.reserve_instance(owner, id, spec.clone()).await;
                 if created.is_err() && !dir.join("desired.json").exists() {
                     self.journal.mark_attempted(false, &a.id, false)?;
                 }
@@ -1323,15 +1207,8 @@ impl Worker {
                     Desired::Job(_) => bail!("invalid instance intent"),
                 };
                 if info.record.desired != desired {
-                    self.agent
-                        .handle(
-                            owner,
-                            proto::Request::InstanceSet {
-                                id: id.clone(),
-                                desired,
-                                revision: info.record.revision,
-                            },
-                        )
+                    self.backend
+                        .set_instance(owner, id, desired, info.record.revision)
                         .await?;
                 } else {
                     instances::ensure_controller(&home, id, &self.config.supervisor)?;
@@ -1396,7 +1273,7 @@ pub async fn push_inputs(
     )
     .await?;
     ensure!(
-        matches!(reserved, proto::Response::Missing(ref missing) if missing.is_empty()),
+        matches!(reserved, worker_data::Response::Missing(ref missing) if missing.is_empty()),
         "input reservation failed: {reserved:?}"
     );
     let connection = blobs::push(store, endpoint, worker.addr(), &hashes).await?;
@@ -1411,7 +1288,7 @@ pub async fn push_inputs(
             },
         )
         .await?;
-        if matches!(reply, proto::Response::Missing(ref missing) if missing.is_empty()) {
+        if matches!(reply, worker_data::Response::Missing(ref missing) if missing.is_empty()) {
             break;
         }
         ensure!(tokio::time::Instant::now() < end, "input import timed out");
@@ -1431,7 +1308,7 @@ pub async fn fetch_outputs(
     execution: &str,
     destination: &Path,
 ) -> Result<Vec<jobs::OutputFile>> {
-    let proto::Response::Outputs(files) = data_call(
+    let worker_data::Response::Outputs(files) = data_call(
         endpoint,
         cluster,
         worker,

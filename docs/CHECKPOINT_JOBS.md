@@ -138,46 +138,19 @@ after confirmed deletion; host checkpoint storage is retained separately and is 
 with explicit artifact retention/pinning and safe cleanup available through the storage catalog.
 Tart networking and VM isolation are unchanged.
 
-## Explicit format-5/6/7/8/9/10/11 upgrade
+## Baseline and existing state
 
-The model uses control-plane/worker physical format 12. Within this baseline, [rolling upgrades](ROLLING_UPGRADES.md) support adjacent cluster generations. Older physical formats require the offline procedure below. Fresh homes need no
-migration. For an existing format-5, format-6, format-7, format-8, format-9, format-10 or format-11 installation:
-
-1. Finish or cancel queued/active jobs and stop or delete persistent VMs. Formats 6–11 can also retain suspended jobs. Do not upgrade under training.
-2. If needed, cooperatively shrink to a single voter using the old binary and let it settle.
-3. Stop controller, worker, and client-staging services. Preserve old binaries and service definitions.
-4. Run the new binary offline, listing all applicable worker and client homes:
-
-   ```sh
-   fleet cluster upgrade --controller-home /absolute/controller \
-     --worker-home /absolute/worker --client-home /absolute/client
-   ```
-
-5. Start the new binary and verify history and idle state before submitting work. Add freshly prepared
-   replicas to grow back to three. Never start an old replica against the upgraded cluster.
-
-The command locks and validates every selected database before writing, backs up each changed file with
-`.v5-backup`, `.v6-backup`, `.v7-backup`, `.v8-backup`, `.v9-backup`, `.v10-backup` or `.v11-backup` (a unique suffix prevents overwriting an earlier backup), and converts it transactionally.
-It preserves cluster identity, applied log boundary, votes/membership, receipts, backend execution IDs,
-and completed job history. Each old job's existing assignment becomes its first attempt. A current-format snapshot
-replaces the compacted historical log; original raw log bytes remain in the backup. Repeating the command
-skips already-converted databases, allowing recovery from interruption between database commits.
-
-It refuses active/uncertain work, unapplied log suffixes, mixed cluster identities, nonempty prototype
-job databases, pending membership operations, and format-5/6/7/8/9/10/11 installations bound to emergency recovery
-history. Those need a separately reviewed migration, not an override. Historical released receipt
-tombstones remain non-executable; a transformed old request may report a fingerprint conflict rather
-than an expired receipt. Full retained receipts and saved requests are rehashed for the typed commands.
-
-Rollback before accepting new work requires stopping every upgraded role and restoring all matching
-backups and the old binary together. Do not roll back after executing new work: that would discard
-accepted history. Backups are operator recovery material, not files to publish or upload to CI.
+New installations use [baseline family format 1](BASELINE.md), including checkpoints, portable inputs,
+history, storage lifecycle and permanent request receipts. The sole existing installation has a
+separate offline importer that preserves suspended jobs, checkpoint metadata and execution fences.
+Historical format-by-format runtime migrations are removed. Future compatible releases use explicit
+[rolling generation upgrades](ROLLING_UPGRADES.md).
 
 ## Qualification
 
 `cargo test --all-features --locked` covers metadata transitions, recovery, idempotency, corrupt manifests,
-worker restart, leader loss, immutable attempts, resource-release ordering, and offline upgrade refusal
-and preservation. CI also runs:
+worker restart, leader loss, immutable attempts and resource-release ordering. The separate importer
+tests verify preservation and refusal. CI also runs:
 
 ```sh
 target/debug/fleet-qualify checkpoint --fake --backup-restore --binary "$PWD/target/debug/fleet" \

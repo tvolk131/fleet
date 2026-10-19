@@ -117,15 +117,8 @@ pub async fn run(path: &Path) -> Result<()> {
         let cfg: Config = serde_json::from_slice(&std::fs::read(home.join("config.json"))?)?;
         super::Store::preflight(&home.join("control.redb"), &cfg.cluster, cfg.id)?;
     }
-    if let Some(home) = &config.worker_home
-        && let Some(raw) = super::version::preflight(&home.join("worker.redb"), "worker_journal")?
-    {
-        ensure!(
-            raw["state"]["format"]
-                .as_u64()
-                .is_some_and(super::runtime::supported_format),
-            "worker metadata needs explicit baseline migration"
-        );
+    if let Some(home) = &config.worker_home {
+        super::runtime::preflight(&home.join("worker.redb"))?;
     }
     let replica = if let Some(home) = &config.controller_home {
         let cfg: Config = serde_json::from_slice(&std::fs::read(home.join("config.json"))?)?;

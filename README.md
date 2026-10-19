@@ -7,10 +7,9 @@ Its control plane uses Raft over authenticated iroh connections and a redb datab
 One voter or a three-voter majority represents the same logical cluster. Worker supervision continues
 when controllers are unavailable; new assignments require quorum.
 
-Fleet 0.2 is a breaking release with fresh cluster and worker homes. The normal `fleet` CLI and desktop GUI
-use the replicated API. Automation uses the CLI’s JSON interface. The old SQLite coordinator and protocols are not migrated.
-Keep existing work under its old installation until it drains, then transfer that machine's capacity.
-See [setup, operations, and handoff](docs/NORMAL_FLEET.md).
+Fleet's consolidated baseline uses one current metadata layout and format family. The separate
+[offline importer](docs/BASELINE.md) preserves the existing installation's metadata during an explicit
+idle cutover. Normal runtime code does not retain historical migrations. See [setup and operations](docs/NORMAL_FLEET.md).
 
 ```sh
 cargo build --release --features gui --bin fleet --bin fleet-guest  # omit gui on headless hosts
@@ -70,11 +69,12 @@ or public-internet-only networking policies remain unchanged.
 - [Private named services for Tart VMs](docs/VM_SERVICE_NETWORKING.md)
 - [Current regression coverage](docs/TEST_COVERAGE.md)
 
-Testing: `cargo test --workspace --all-features --locked`;
+Build the explicit test tools with `cargo build --workspace --all-features --bins --locked`, then run
+`cargo test --workspace --all-features --locked`;
 `cargo clippy --workspace --all-features --all-targets --locked -- -D warnings`.
 The suite includes the public JSON CLI contracts. The guest helper, test workloads, and qualification runner are also Rust binaries.
-`fleet-control-lab` is retained for fault qualification. The retired CLI, GUI, standalone daemon,
-and their installers are removed. Normal clients always use the replicated control plane.
+The qualification runner and importer live in the separate, unpublished `fleet-tools` package.
+Normal clients always use the replicated control plane; the retired coordinator and agent RPC are removed.
 
 Rolling checkpoint retention is opt-in; see [rolling storage](docs/ROLLING_STORAGE.md) for budgets, pins, reclamation and storage reports.
 

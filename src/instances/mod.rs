@@ -6,7 +6,7 @@ pub mod runtime;
 pub mod storage;
 mod tart;
 
-use crate::{jobs, proto::Hello};
+use crate::{jobs, worker_data::Hello};
 use anyhow::{Context, Result, bail};
 pub use network::Network;
 use serde::{Deserialize, Serialize};

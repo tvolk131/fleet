@@ -1,13 +1,10 @@
 # Control plane membership
 
-The isolated `fleet-control-lab` now supports replacing replicas, expanding one voter to three
-(normal quorum: two), and reducing three voters to one. Cluster identity, jobs, worker assignments,
-and request history survive these changes. This changes controller membership only; it neither moves
-workloads nor enrolls or removes real workers. Installed Fleet services and training runs are separate.
-
-Membership originally qualified format 2. The current executable uses queue/recovery format 6; use fresh
-homes or the [explicit idle format-5 upgrade](CHECKPOINT_JOBS.md#explicit-format-5-upgrade). The administrator allowlist remains explicit and static on each replica. This milestone
-does not introduce general ACL management, rolling upgrades, or production deployment.
+The replicated control plane supports replacing replicas, expanding one voter to three (normal
+quorum: two), and reducing three voters to one. Cluster identity, jobs, assignments and request
+history survive these changes. Membership changes neither move workloads nor enroll/remove workers.
+The administrator allowlist remains explicit and static on each replica. See [baseline compatibility](BASELINE.md),
+[rolling upgrades](ROLLING_UPGRADES.md) and [normal services](NORMAL_FLEET.md) for their separate contracts.
 
 ## Contract
 
@@ -69,13 +66,13 @@ authenticated membership discovery and keep their assignments through controller
 
 ## Replace a replica and shrink the cluster
 
-Start the three-process lab from [CONTROL_PLANE_LAB.md](CONTROL_PLANE_LAB.md), retaining `lab_dir` and
+Start the three-process lab from [QUALIFICATION.md](QUALIFICATION.md), retaining `lab_dir` and
 its process IDs. Set `cluster_origin` to the `cluster` value in the client configuration and preserve it
 when retrying the same request. Prepare and start replica 4 in another empty home:
 
 ```sh
-target/debug/fleet-control-lab prepare-replica --home "$lab_dir/node-4" --config "$lab_dir/client/config.json" --id 4
-target/debug/fleet-control-lab serve --home "$lab_dir/node-4" --config "$lab_dir/node-4/config.json" >"$lab_dir/node-4.log" 2>&1 &
+target/debug/fleet cluster prepare-replica --home "$lab_dir/node-4" --config "$lab_dir/client/config.json" --id 4
+target/debug/fleet cluster serve --home "$lab_dir/node-4" --config "$lab_dir/node-4/config.json" >"$lab_dir/node-4.log" 2>&1 &
 lab_pid_4=$!
 ```
 

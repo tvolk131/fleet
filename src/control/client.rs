@@ -6,7 +6,7 @@ use super::{
     runtime::{self, DataRequest},
     workload::*,
 };
-use crate::{coordinator::JobFile, instances};
+use crate::{inputs::JobFile, instances};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -353,7 +353,7 @@ impl AppClient {
         );
         let lock_home = home.to_path_buf();
         let identity_lock = tokio::task::spawn_blocking(move || {
-            crate::keys::lock_coordinator(&lock_home, Duration::from_secs(30))
+            crate::keys::lock_client(&lock_home, Duration::from_secs(30))
         })
         .await??;
         let transport = Client::with_cache(
@@ -405,11 +405,6 @@ impl AppClient {
     }
     async fn tunnel_status(&mut self) -> Result<super::tunnels::status::Snapshot> {
         let started = std::time::Instant::now();
-        let state = self.read().await?;
-        // Keep new GUI/status clients usable against the previous release before activation.
-        if state.version.active < super::tunnels::GENERATION {
-            return Ok(state.tunnel_status(&Default::default(), 0));
-        }
         match self
             .transport
             .call(super::network::Message::TunnelStatus, WAIT)
@@ -502,7 +497,7 @@ impl AppClient {
             ApiRequest::VmManage { action, .. } => {
                 ensure!(
                     self.read().await?.version.active >= super::vm::GENERATION,
-                    "activate generation 4 before managing VM services or operations"
+                    "VM services and operations require baseline generation 1"
                 );
                 Mutation::Vm(action.clone())
             }
@@ -518,7 +513,7 @@ impl AppClient {
             } => {
                 ensure!(
                     self.read().await?.version.active >= super::vm::GENERATION,
-                    "activate generation 4 before managing VM operations"
+                    "VM operations require baseline generation 1"
                 );
                 let spec = super::vm::client::prepare_upload(&self.home, source, path, *executable)
                     .await?;
@@ -673,12 +668,8 @@ impl AppClient {
                 let _blob_lock = instances::try_lock(&self.home.join("blobs.lock"))?
                     .context("another client is preparing or staging inputs; retry")?;
                 let store = crate::blobs::open(&self.home.join("blobs")).await?;
-                let c = crate::coordinator::Coordinator::new(
-                    self.transport.endpoint.clone(),
-                    store.clone(),
-                );
                 let prepared = async {
-                    let spec = c.prepare(job).await?;
+                    let spec = crate::inputs::prepare(&store, job).await?;
                     let inputs = if spec.vm.as_ref().and_then(|v| v.runtime.as_ref()).is_some() {
                         let mut files = Vec::new();
                         for (path, input) in &spec.inputs {
@@ -931,13 +922,7 @@ impl AppClient {
     }
     pub async fn execute(&mut self, api: ApiRequest) -> Result<Value> {
         match &api {
-            ApiRequest::Metadata { query } => {
-                ensure!(
-                    self.transport.indexed_queries(WAIT).await?,
-                    "activate generation 5 before querying indexed metadata"
-                );
-                self.transport.query(query.clone(), WAIT).await
-            }
+            ApiRequest::Metadata { query } => self.transport.query(query.clone(), WAIT).await,
             ApiRequest::ReplaceTunnels { .. } => self.prepare_mutation(&api).await,
             ApiRequest::Tunnels => {
                 let state = self.read().await?;
@@ -978,7 +963,7 @@ impl AppClient {
                     )
                     .await;
                     workers.push(match report {
-                        Ok(Ok(crate::proto::Response::StorageReport(report))) => {
+                        Ok(Ok(crate::worker_data::Response::StorageReport(report))) => {
                             json!({"worker":w.id,"report":report,"error":null})
                         }
                         other => json!({"worker":w.id,"report":null,"error":format!("{other:?}")}),
@@ -1152,14 +1137,9 @@ impl AppClient {
             }
             ApiRequest::Queue => Ok(json!(job_views(&self.read().await?))),
             ApiRequest::Job { id } => {
-                if self.transport.indexed_queries(WAIT).await? {
-                    self.transport
-                        .query(super::store::query::Query::Job { id: id.clone() }, WAIT)
-                        .await
-                } else {
-                    let state = self.read().await?;
-                    Ok(job_view(&state, state.jobs.get(id).context("unknown job")?))
-                }
+                self.transport
+                    .query(super::store::query::Query::Job { id: id.clone() }, WAIT)
+                    .await
             }
             ApiRequest::Workers => {
                 let state = self.read().await?;

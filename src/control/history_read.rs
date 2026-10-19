@@ -84,7 +84,7 @@ impl AppClient {
                     let bytes=std::fs::read(destination.join("data"))?;
                     let offset=(from-start) as usize;
                     let n=(max as usize).clamp(1,crate::history::READ_BYTES).min(bytes.len()-offset);
-                    let (data,next)=crate::agent::log_text(&bytes[offset..offset+n],from+n as u64,end);
+                    let (data,next)=crate::backend::log_text(&bytes[offset..offset+n],from+n as u64,end);
                     Ok::<_,anyhow::Error>(json!({"data":data,"next":next,"done":closed && next>=observed,"gap":null,"archived":state.durable_artifact(chunk),"observed":observed}))
                 }.await;
                 if destination.exists() {
@@ -119,7 +119,7 @@ impl AppClient {
             .workers
             .get(&a.worker)
             .context("unknown attempt worker")?;
-        let crate::proto::Response::History(r) = data_call(
+        let crate::worker_data::Response::History(r) = data_call(
             &self.transport.endpoint,
             &state.cluster,
             &worker.peer,
@@ -135,7 +135,7 @@ impl AppClient {
         else {
             anyhow::bail!("unexpected history response")
         };
-        let (data, next) = crate::agent::log_text(
+        let (data, next) = crate::backend::log_text(
             &r.data,
             r.next,
             if r.data.len() < (max as usize).clamp(1, crate::history::READ_BYTES) {

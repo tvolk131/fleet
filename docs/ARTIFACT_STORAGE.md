@@ -272,16 +272,12 @@ The normal `fleet api` interface exposes `storage`, `artifacts`, `enroll_storage
 `review_storage_recovery`. Mutations require an explicit request ID and applicable revision/fingerprint.
 Use `retry` after an unknown mutation outcome; do not invent a new request ID to bypass uncertainty.
 
-The physical metadata format is 12, with wire protocol 1 and explicit [rolling generation upgrades](ROLLING_UPGRADES.md). The explicit offline singleton upgrade
-accepts idle formats 5–11; formats 6–11 may include suspended jobs. It preserves checkpoint metadata and
-receipts, registers existing checkpoints as source artifacts, and creates versioned backups. It refuses
-recovery-bound old-format installations pending a separately reviewed migration. See
-[the upgrade procedure](CHECKPOINT_JOBS.md#explicit-format-567891011-upgrade).
+Storage lifecycle is part of [baseline generation 1](BASELINE.md). The separate offline importer
+preserves existing artifacts, receipts and worker execution fences.
 
-Rust qualification additionally covers replacement across leader loss, restart and stale access, explicit lost data, identity reuse rejection, copy-count preservation, and format-10 upgrade.
-Rust qualification covers three-replica checkpoint backup/export/resume with the original worker payloads
-and blob cache unavailable, leader loss, immutable attempt history, pins/expiry/cleanup, quotas,
-authentication, interrupted staging, corruption/peer repair, signed recovery/review, and format-6/7 upgrade.
+Rust qualification covers replacement across leader loss, restart and stale access, explicit lost data,
+identity reuse rejection, copy-count preservation, backup-only restore, immutable attempt history,
+pins/expiry/cleanup, quotas, authentication, interrupted staging, corruption/peer repair and recovery review.
 The JSON CLI/service scenario is also run in CI on Linux and macOS:
 
 ```sh

@@ -8,7 +8,7 @@ use serde_json::json;
 impl Worker {
     pub(super) async fn reclaim_and_report_storage(&self) -> Result<()> {
         let view = self.storage_view.as_ref().context("missing storage view")?;
-        let _gate = self.agent.blob_guard().await;
+        let _gate = self.backend.blob_guard().await;
         let saved = self.journal.read()?;
         let mut candidates = HashSet::<Hash>::new();
         for a in view

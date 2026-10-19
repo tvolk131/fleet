@@ -30,7 +30,6 @@ pub mod snapshot;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
-pub const MAX_SNAPSHOT: usize = 64 << 20;
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -38,15 +37,10 @@ pub struct Store {
     db: Arc<Database>,
     // Held inside the blocking task, even if the awaiting future is cancelled.
     writes: Arc<tokio::sync::Mutex<()>>,
+    // Blocking jobs outlive cancelled callers; shutdown must wait for their database handles.
+    activity: Arc<tokio::sync::RwLock<()>>,
     fail_state_commit: Arc<AtomicBool>,
     hold_joint_apply: Arc<AtomicBool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SavedSnapshot {
-    meta: SnapshotMeta<u64, BasicNode>,
-    hash: String,
-    data: Vec<u8>,
 }
 
 fn read<T: DeserializeOwned>(
@@ -77,7 +71,8 @@ impl Store {
         if let Some(raw) = super::version::preflight(path, "meta")? {
             ensure!(
                 raw["identity"] == serde_json::json!([FORMAT, cluster, node])
-                    || raw["identity"] == serde_json::json!([indexed::FORMAT, cluster, node]),
+                    && raw["state"]["family"] == super::FAMILY
+                    && raw["state"]["format"] == FORMAT,
                 "database identity or format mismatch; explicit baseline migration required"
             );
             let version: super::version::ClusterVersion =
@@ -99,8 +94,17 @@ impl Store {
         revision: u64,
         target: u32,
     ) -> Result<(), StorageError<u64>> {
+        self.prepare_version_for(revision, target, super::version::Software::current())
+            .await
+    }
+    async fn prepare_version_for(
+        &self,
+        revision: u64,
+        target: u32,
+        software: super::version::Software,
+    ) -> Result<(), StorageError<u64>> {
         self.blocking(true, move |db| {
-            super::version::Software::current().require(target)?;
+            software.require(target)?;
             let mut tx = db.begin_write()?;
             tx.set_durability(Durability::Immediate)?;
             {
@@ -122,80 +126,6 @@ impl Store {
         })
         .await
     }
-    /// Convert an idle singleton at its applied boundary. Historical log bytes remain in the backup;
-    /// the new snapshot anchors the same term/index, identity, membership, receipts, and worker IDs.
-    pub(crate) fn upgrade_v5(db: &Database, path: &Path, preview: bool) -> Result<State> {
-        let tx = db.begin_read()?;
-        let table = tx.open_table(META)?;
-        let identity: (u32, String, u64) =
-            read(&table, "identity")?.context("missing controller identity")?;
-        if identity.0 == FORMAT || identity.0 == indexed::FORMAT {
-            let state = indexed::read_state(&tx, true)?;
-            super::version::Software::current().require(state.version.required(identity.2))?;
-            return Ok(state);
-        }
-        ensure!(matches!(identity.0, 5..=11), "unsupported source format");
-        let state = super::upgrade::state(read(&table, "state")?.context("missing state")?)?;
-        let applied = state
-            .last_applied
-            .context("controller has never applied a committed state")?;
-        ensure!(
-            state.cluster == identity.1
-                && state.membership.voter_ids().collect::<Vec<_>>() == vec![identity.2],
-            "upgrade requires the surviving sole voter"
-        );
-        let committed: Option<LogId<u64>> =
-            read::<Option<LogId<u64>>>(&table, "committed")?.flatten();
-        ensure!(
-            committed.is_none_or(|c| c.index <= applied.index),
-            "apply committed entries with the old binary before upgrade"
-        );
-        let logs = tx.open_table(LOG)?;
-        ensure!(
-            logs.last()?
-                .is_none_or(|(index, _)| index.value() <= applied.index),
-            "unapplied log suffix; let the old singleton settle before upgrading"
-        );
-        super::version::Software::current().require(state.version.active)?;
-        let data = serde_json::to_vec(&state)?;
-        ensure!(
-            data.len() <= MAX_SNAPSHOT,
-            "upgraded metadata exceeds snapshot limit"
-        );
-        if preview {
-            return Ok(state);
-        }
-        drop(logs);
-        drop(table);
-        drop(tx);
-        super::upgrade::backup_version(path, identity.0)?;
-        let hash = snapshot_id(&data);
-        let mut tx = db.begin_write()?;
-        tx.set_durability(Durability::Immediate)?;
-        {
-            let mut meta = tx.open_table(META)?;
-            put(&mut meta, "identity", &(FORMAT, identity.1, identity.2))?;
-            put(&mut meta, "state", &state)?;
-            put(
-                &mut meta,
-                "snapshot",
-                &SavedSnapshot {
-                    meta: SnapshotMeta {
-                        last_log_id: Some(applied),
-                        last_membership: state.membership.clone(),
-                        snapshot_id: hash.clone(),
-                    },
-                    hash,
-                    data,
-                },
-            )?;
-            put(&mut meta, "purged", &applied)?;
-            put(&mut meta, "committed", &Some(applied))?;
-        }
-        tx.open_table(LOG)?.retain(|_, _| false)?;
-        tx.commit()?;
-        Ok(state)
-    }
     /// Acquire redb's exclusive process lock without creating or initializing a missing source.
     /// Only the applied image is exported; a locally present log suffix is not proof of commit.
     pub fn recovery_source(path: &Path, cluster: &str, node: u64, backup: &Path) -> Result<State> {
@@ -205,9 +135,7 @@ impl Store {
         let table = tx.open_table(META)?;
         let identity: (u32, String, u64) = read(&table, "identity")?.context("missing identity")?;
         ensure!(
-            matches!(identity.0, FORMAT | indexed::FORMAT)
-                && identity.1 == cluster
-                && identity.2 == node,
+            identity.0 == FORMAT && identity.1 == cluster && identity.2 == node,
             "source identity/format mismatch"
         );
         let state = indexed::read_state(&tx, true)?;
@@ -234,7 +162,7 @@ impl Store {
             let mut tx = db.begin_write()?;
             tx.set_durability(Durability::Immediate)?;
             {
-                let mut table = tx.open_table(META)?;
+                let table = tx.open_table(META)?;
                 let old: State = read(&table, "state")?.context("missing state")?;
                 ensure!(
                     old == State::new(state.cluster.clone()) && tx.open_table(LOG)?.is_empty()?,
@@ -246,15 +174,8 @@ impl Store {
                         && state.membership.log_id().is_none(),
                     "invalid recovery seed"
                 );
-                if state.version.active >= indexed::GENERATION {
-                    let (_, cluster, node): (u32, String, u64) =
-                        read(&table, "identity")?.context("missing identity")?;
-                    put(&mut table, "identity", &(indexed::FORMAT, cluster, node))?;
-                    drop(table);
-                    indexed::persist(&tx, &state)?;
-                } else {
-                    put(&mut table, "state", &state)?;
-                }
+                drop(table);
+                indexed::persist(&tx, &state)?;
             }
             tx.commit()?;
             Ok(())
@@ -265,6 +186,14 @@ impl Store {
     /// State and request receipts share one transaction. A future table/index layout can change
     /// this storage detail without changing deterministic command application.
     pub fn open(path: &Path, cluster: &str, node: u64) -> Result<Self> {
+        Self::open_for(path, cluster, node, super::version::Software::current())
+    }
+    fn open_for(
+        path: &Path,
+        cluster: &str,
+        node: u64,
+        software: super::version::Software,
+    ) -> Result<Self> {
         ensure!(!cluster.is_empty(), "empty cluster ID");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -279,8 +208,23 @@ impl Store {
         startup_lock
             .try_lock()
             .context("controller database is already in use")?;
-        Self::preflight(path, cluster, node)?;
+        Self::preflight_for(path, cluster, node, software)?;
         let db = Database::create(path)?;
+        {
+            let tx = db.begin_read()?;
+            if let Ok(table) = tx.open_table(META) {
+                ensure!(
+                    table.get("identity")?.is_some() && table.get("state")?.is_some(),
+                    "incomplete controller metadata; explicit recovery required"
+                );
+                tx.open_table(LOG)
+                    .context("Raft log missing; explicit recovery required")?;
+                tx.open_table(indexed::ROWS)
+                    .context("resource rows missing; explicit recovery required")?;
+                tx.open_table(indexed::RECEIPTS)
+                    .context("request receipts missing; explicit recovery required")?;
+            }
+        }
         let mut tx = db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         {
@@ -289,9 +233,7 @@ impl Store {
                 read::<(u32, String, u64)>(&table, "identity")?
             {
                 ensure!(
-                    matches!(version, FORMAT | indexed::FORMAT)
-                        && old_cluster == cluster
-                        && old_node == node,
+                    version == FORMAT && old_cluster == cluster && old_node == node,
                     "database identity or format mismatch"
                 );
             } else {
@@ -299,12 +241,15 @@ impl Store {
                 put(&mut table, "state", &State::new(cluster.into()))?;
             }
             tx.open_table(LOG)?;
+            tx.open_table(indexed::ROWS)?;
+            tx.open_table(indexed::RECEIPTS)?;
         }
         tx.commit()?;
         Ok(Self {
             _startup_lock: Arc::new(startup_lock),
             db: Arc::new(db),
             writes: Arc::new(tokio::sync::Mutex::new(())),
+            activity: Arc::new(tokio::sync::RwLock::new(())),
             fail_state_commit: Arc::new(AtomicBool::new(false)),
             hold_joint_apply: Arc::new(AtomicBool::new(false)),
         })
@@ -325,6 +270,7 @@ impl Store {
         write: bool,
         f: impl FnOnce(&Database) -> Result<T> + Send + 'static,
     ) -> Result<T, StorageError<u64>> {
+        let activity = self.activity.clone().read_owned().await;
         let guard = if write {
             Some(self.writes.clone().lock_owned().await)
         } else {
@@ -332,12 +278,20 @@ impl Store {
         };
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
+            let _activity = activity;
             let _guard = guard;
-            f(&db)
+            // Drop the database handle before signaling that the blocking job has drained.
+            let owned_db = db;
+            f(&owned_db)
         })
         .await
         .map_err(|e| StorageIOError::read(&e))?
         .map_err(|e| StorageIOError::write(&std::io::Error::other(format!("{e:#}"))).into())
+    }
+
+    /// Call after all producers have stopped. Cancellation cannot stop a redb blocking job.
+    pub(crate) async fn drain(&self) {
+        let _drained = self.activity.write().await;
     }
 
     pub async fn state(&self) -> Result<State, StorageError<u64>> {
@@ -370,26 +324,16 @@ impl Store {
                 bytes <= budget,
                 "resource export exceeds network budget; use metadata pages"
             );
-            let (format, _, _): (u32, String, u64) =
-                read(&tx.open_table(META)?, "identity")?.context("missing identity")?;
-            if format == indexed::FORMAT {
-                for row in tx.open_table(indexed::RECEIPTS)?.iter()? {
-                    let (key, value) = row?;
-                    bytes += serde_json::to_vec(key.value())?.len() + value.value().len() + 2;
-                    ensure!(
-                        bytes <= budget,
-                        "request history exceeds network budget; use metadata pages"
-                    );
-                    state
-                        .receipts
-                        .insert(key.value().into(), serde_json::from_slice(value.value())?);
-                }
-            } else {
-                state = indexed::read_state(&tx, true)?;
+            for row in tx.open_table(indexed::RECEIPTS)?.iter()? {
+                let (key, value) = row?;
+                bytes += serde_json::to_vec(key.value())?.len() + value.value().len() + 2;
                 ensure!(
-                    serde_json::to_vec(&state)?.len() <= budget,
-                    "state export exceeds network budget; use metadata pages"
+                    bytes <= budget,
+                    "request history exceeds network budget; use metadata pages"
                 );
+                state
+                    .receipts
+                    .insert(key.value().into(), serde_json::from_slice(value.value())?);
             }
             Ok(state)
         })
@@ -551,39 +495,26 @@ impl RaftStateMachine<TypeConfig> for Store {
                 let replies = {
                     let table = tx.open_table(META)?;
                     let mut state: State = read(&table, "state")?.context("missing state")?;
-                    let (format, cluster, node): (u32, String, u64) =
+                    let (_, _, node): (u32, String, u64) =
                         read(&table, "identity")?.context("missing identity")?;
                     drop(table);
-                    let mut indexed = format == indexed::FORMAT;
-                    if indexed {
-                        state = indexed::hydrate(state, &tx.open_table(indexed::ROWS)?)?;
-                    }
+                    state = indexed::hydrate(state, &tx.open_table(indexed::ROWS)?)?;
                     let mut replies = Vec::new();
                     for entry in entries {
                         state.last_applied = Some(entry.log_id);
                         replies.push(match entry.payload {
                             EntryPayload::Normal(command) => {
-                                if indexed {
-                                    indexed::load_receipts(
-                                        &mut state,
-                                        &command,
-                                        &tx.open_table(indexed::RECEIPTS)?,
-                                    )?;
-                                }
+                                indexed::load_receipts(
+                                    &mut state,
+                                    &command,
+                                    &tx.open_table(indexed::RECEIPTS)?,
+                                )?;
                                 let reply = state.apply(command, entry.log_id.index);
-                                if indexed {
-                                    let mut receipts = tx.open_table(indexed::RECEIPTS)?;
-                                    for (key, receipt) in &state.receipts {
-                                        put(&mut receipts, key, receipt)?;
-                                    }
-                                    state.receipts.clear();
-                                } else if state.version.active >= indexed::GENERATION {
-                                    // Activation migrates all old receipts atomically. Later entries
-                                    // in this batch already use point lookups against the new table.
-                                    indexed::persist(&tx, &state)?;
-                                    state.receipts.clear();
-                                    indexed = true;
+                                let mut receipts = tx.open_table(indexed::RECEIPTS)?;
+                                for (key, receipt) in &state.receipts {
+                                    put(&mut receipts, key, receipt)?;
                                 }
+                                state.receipts.clear();
                                 reply
                             }
                             EntryPayload::Membership(m) => {
@@ -604,13 +535,8 @@ impl RaftStateMachine<TypeConfig> for Store {
                     }) {
                         table.remove("version_prepared")?;
                     }
-                    if indexed {
-                        put(&mut table, "identity", &(indexed::FORMAT, cluster, node))?;
-                        drop(table);
-                        indexed::persist(&tx, &state)?;
-                    } else {
-                        put(&mut table, "state", &state)?;
-                    }
+                    drop(table);
+                    indexed::persist(&tx, &state)?;
                     replies
                 };
                 ensure!(
@@ -660,10 +586,6 @@ impl RaftStateMachine<TypeConfig> for Store {
     }
 }
 
-fn snapshot_id(data: &[u8]) -> String {
-    blake3::hash(data).to_hex().to_string()
-}
-
 impl RaftSnapshotBuilder<TypeConfig> for Store {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
         // Capture through redb MVCC without blocking command application. Publication checks that
@@ -679,13 +601,109 @@ mod version_tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     #[tokio::test]
+    async fn drain_waits_for_database_work_after_its_caller_is_cancelled() {
+        let home = std::env::temp_dir().join(format!(
+            "fleet-control-drain-{:032x}",
+            rand::random::<u128>()
+        ));
+        let path = home.join("control.redb");
+        let store = Store::open(&path, "cluster", 1).unwrap();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let caller = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .blocking(false, move |db| {
+                        let _read = db.begin_read()?;
+                        started.send(()).unwrap();
+                        held.recv().unwrap();
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        entered.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let mut drain = tokio::spawn({
+            let store = store.clone();
+            async move { store.drain().await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut drain)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        drain.await.unwrap();
+        drop(store);
+        drop(Store::open(&path, "cluster", 1).unwrap());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn missing_receipts_cannot_be_reinitialized_as_empty_history() {
+        let home = std::env::temp_dir().join(format!(
+            "fleet-control-missing-receipts-{:032x}",
+            rand::random::<u128>()
+        ));
+        let path = home.join("control.redb");
+        drop(Store::open(&path, "cluster", 1).unwrap());
+        {
+            let db = Database::open(&path).unwrap();
+            let tx = db.begin_write().unwrap();
+            tx.delete_table(indexed::RECEIPTS).unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(
+            Store::open(&path, "cluster", 1)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("request receipts missing")
+        );
+        let db = Database::open(&path).unwrap();
+        assert!(
+            db.begin_read()
+                .unwrap()
+                .open_table(indexed::RECEIPTS)
+                .is_err()
+        );
+        drop(db);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn identical_numbers_do_not_accept_a_foreign_format_family() {
+        let path = std::env::temp_dir().join(format!(
+            "fleet-control-family-{:032x}.redb",
+            rand::random::<u128>()
+        ));
+        let store = Store::open(&path, "cluster", 1).unwrap();
+        let tx = store.db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(META).unwrap();
+            let mut state: State = read(&table, "state").unwrap().unwrap();
+            state.family = "foreign".into();
+            put(&mut table, "state", &state).unwrap();
+        }
+        tx.commit().unwrap();
+        drop(store);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(Store::open(&path, "cluster", 1).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn unacknowledged_preparation_blocks_old_binary_until_abort_is_applied() {
         let home = std::env::temp_dir().join(format!(
             "fleet-control-version-promise-{:032x}",
             rand::random::<u128>()
         ));
         let path = home.join("control.redb");
-        let mut store = Store::open(&path, "cluster", 1).unwrap();
+        let mut store = Store::open_for(&path, "cluster", 1, Software { min: 1, max: 2 }).unwrap();
         let log = |index| LogId::new(openraft::CommittedLeaderId::new(1, 1), index);
         let peer = Peer {
             identity: iroh::SecretKey::generate().public(),
@@ -717,13 +735,17 @@ mod version_tests {
                 "prepare",
                 Mutation::PrepareVersion {
                     expected_revision: 0,
-                    target: crate::control::version::MAX,
+                    target: crate::control::version::MIN + 1,
                 },
             )])
             .await
             .unwrap();
         store
-            .prepare_version(1, crate::control::version::MAX)
+            .prepare_version_for(
+                1,
+                crate::control::version::MIN + 1,
+                Software { min: 1, max: 2 },
+            )
             .await
             .unwrap();
         assert!(
@@ -740,12 +762,12 @@ mod version_tests {
         drop(store);
         let bytes = std::fs::read(&path).unwrap();
         let old = Software {
-            min: crate::control::version::MIN - 1,
+            min: crate::control::version::MIN,
             max: crate::control::version::MIN,
         };
         assert!(Store::preflight_for(&path, "cluster", 1, old).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        let mut store = Store::open(&path, "cluster", 1).unwrap();
+        let mut store = Store::open_for(&path, "cluster", 1, Software { min: 1, max: 2 }).unwrap();
         store
             .apply([command(
                 "abort",

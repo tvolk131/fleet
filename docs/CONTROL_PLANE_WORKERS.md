@@ -96,13 +96,13 @@ outputs; per-user ACLs and reader-key rotation are not implemented.
 
 ## Start an isolated worker
 
-First build and initialize replicas as described in [the lab guide](CONTROL_PLANE_LAB.md). Keep its
+First build and initialize replicas as described in [the lab guide](QUALIFICATION.md). Keep its
 `lab_dir`, client identity, and running replicas. Prepare a CPU-only worker:
 
 ```sh
-target/debug/fleet-control-lab prepare-worker --home "$lab_dir/worker" --config "$lab_dir/client/config.json" --id canary --cpu-slots 2 --memory-mb 1024
-target/debug/fleet-control-lab request --key "$lab_dir/client/node.key" --config "$lab_dir/client/config.json" --request "$lab_dir/worker/enroll.json"
-target/debug/fleet-control-lab worker --home "$lab_dir/worker"
+target/debug/fleet cluster prepare-worker --home "$lab_dir/worker" --config "$lab_dir/client/config.json" --id canary --cpu-slots 2 --memory-mb 1024
+target/debug/fleet cluster request --key "$lab_dir/client/node.key" --config "$lab_dir/client/config.json" --request "$lab_dir/worker/enroll.json"
+target/debug/fleet cluster worker --home "$lab_dir/worker"
 ```
 
 Preparation refuses a populated home and generates a separate key/incarnation and durable journal. It does not enroll or
@@ -127,9 +127,9 @@ Save a job file compatible with the existing local job-file schema (local inputs
 ```
 
 ```sh
-target/debug/fleet-control-lab submit-job --key "$lab_dir/client/node.key" --config "$lab_dir/client/config.json" --data-home "$lab_dir/client-data" --job /absolute/path/to/job.json --worker canary --id example --request-id example-submit --memory-mb 128
-target/debug/fleet-control-lab read --key "$lab_dir/client/node.key" --config "$lab_dir/client/config.json"
-target/debug/fleet-control-lab fetch --key "$lab_dir/client/node.key" --config "$lab_dir/client/config.json" --data-home "$lab_dir/client-data" --assignment example --destination "$lab_dir/capture-1"
+target/debug/fleet cluster submit-job --key "$lab_dir/client/node.key" --config "$lab_dir/client/config.json" --data-home "$lab_dir/client-data" --job /absolute/path/to/job.json --worker canary --id example --request-id example-submit --memory-mb 128
+target/debug/fleet cluster read --key "$lab_dir/client/node.key" --config "$lab_dir/client/config.json"
+target/debug/fleet cluster fetch --key "$lab_dir/client/node.key" --config "$lab_dir/client/config.json" --data-home "$lab_dir/client-data" --assignment example --destination "$lab_dir/capture-1"
 ```
 
 `submit-job` durably saves the prepared request under `client-data/requests/` before transfer/submission.
@@ -182,7 +182,6 @@ VM jobs, captures live metrics/files, kills a replica leader and worker, cancels
 deletes a persistent instance. It cleans up only its own resources. It does not reserve capacity through a
 second coordinator; run it only with the physical machine idle and no legacy queue waiting to start.
 
-The normal queue uses storage/protocol format **8** (`fleet/control/8`); the read-only data ALPN is
-`fleet/worker-data/1`. Use fresh homes or the [explicit idle format-5/6/7/8 upgrade](CHECKPOINT_JOBS.md#explicit-format-5678-upgrade).
-There is no format-1/2/3 importer, automatic worker adoption, or mixed-release rollout. Physical
-power-failure qualification remains separate from the process-failure tests.
+The current [baseline family](BASELINE.md) uses `fleet/baseline/control/1` and the read-only data ALPN
+`fleet/baseline/worker-data/1`. Future releases use explicit [rolling upgrades](ROLLING_UPGRADES.md).
+Physical power-failure qualification remains separate from process-failure tests.

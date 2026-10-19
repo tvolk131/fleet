@@ -66,4 +66,5 @@ the guest have separate lifetimes. The trainer must prune its own guest checkpoi
 guest manifest scan remains bounded to 256 matching files and 100,000 visited entries. A backup on
 another directory of the M4 qualifies the protocol but does not protect against loss of that machine.
 
-Rolling storage introduced format 8; [portable jobs](PORTABLE_JOBS.md) introduced format 9; [durable history](DURABLE_HISTORY.md) introduced format 10; [storage-agent lifecycle](ARTIFACT_STORAGE.md#replace-and-retire-a-storage-agent) introduced format 11. Physical format 12 establishes [rolling upgrades](ROLLING_UPGRADES.md). Upgrade older formats through the explicit offline metadata migration. Experiments use separate state homes and workloads.
+Rolling storage is part of [baseline generation 1](BASELINE.md). The separate importer preserves
+existing checkpoint metadata and receipts. Experiments use separate state homes and workloads.

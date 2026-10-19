@@ -2,7 +2,7 @@
 
 use std::{collections::HashSet, path::Path, process::Command};
 
-use crate::proto::{Hello, PROTOCOL, Status};
+use crate::worker_data::{Hello, Status};
 
 fn output(program: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(program).args(args).output().ok()?;
@@ -49,7 +49,7 @@ pub fn hello() -> Hello {
         .unwrap_or(0);
     Hello {
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
-        protocol: PROTOCOL,
+
         hostname: output("hostname", &[]).unwrap_or_default(),
         os: output("sw_vers", &["-productVersion"])
             .map(|v| format!("macOS {v}"))
