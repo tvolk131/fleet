@@ -264,6 +264,16 @@ enum Command {
     Supervise {
         dir: PathBuf,
     },
+    /// One VM's runner process, started detached by a driver. See `docs/VM_DRIVERS.md`.
+    #[command(hide = true)]
+    DriverRunner {
+        backend: String,
+        dir: PathBuf,
+        #[arg(long)]
+        lock_fd: Option<i32>,
+        #[arg(long)]
+        restore: Option<PathBuf>,
+    },
     #[command(hide = true)]
     InstanceController {
         instance_home: PathBuf,
@@ -631,6 +641,22 @@ async fn run(args: Args) -> Result<()> {
             };
         }
         Command::Supervise { dir } => return fleet::supervise::run(&dir),
+        Command::DriverRunner {
+            backend,
+            dir,
+            lock_fd,
+            restore,
+        } => {
+            let args = fleet::driver::runner::Args {
+                dir,
+                lock_fd,
+                restore,
+            };
+            return match backend.as_str() {
+                "fake" => fleet::driver::fake::run(args),
+                other => anyhow::bail!("unknown driver backend {other:?}"),
+            };
+        }
         Command::InstanceController { instance_home, id } => {
             return fleet::instances::run_controller(&instance_home, &id);
         }

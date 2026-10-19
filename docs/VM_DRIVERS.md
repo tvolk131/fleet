@@ -38,20 +38,29 @@ and its own VM registry each break a binding constraint.
 
 ## Process model
 
-Each running VM lives in its own **runner** process: `fleet instance-runner <home> <id>`.
+Each VM lives in its own **runner** process, `fleet driver-runner <backend> <instance dir>`,
+started detached in its own process group, so restarting the worker never touches guests.
 
-- Virtualization.framework ties a VM to the process (and dispatch queue) that created it; the VM
-  dies with that process. libkrun's `krun_start_enter` takes over the calling process and never
-  returns. Both force one process per VM, so the driver is a supervisor of runners, not a library
-  that holds VMs in the agent.
-- This matches the existing `instance-controller` (one process per instance, holding
-  `controller.lock`, detached into its own process group). The runner replaces it.
-- The runner is started detached, so restarting the worker does not kill guests. On start the
-  driver **adopts** runners it finds by lock file and control socket instead of starting new ones.
-- Only the runner binary needs the virtualization entitlement and code signature, not `fleet`.
-- The runner exposes a small control socket in the instance directory (`runner.sock`): `status`,
-  `stop {graceful|force}`, `save <path>`, and a vsock bridge. Its exit status and the tail of
-  `runner.log` explain a crash.
+- Virtualization.framework ties a VM to the process that created it, and libkrun's
+  `krun_start_enter` takes over the calling process. Either way one process per VM is forced, so
+  the driver supervises runners and never links a hypervisor itself.
+- The driver takes `runner.lock` before launching and hands the same open file to the runner as
+  descriptor 3, so the lock is held continuously from before launch until the runner is gone.
+  Lock held means a runner is alive; that is the only liveness test, so a reused pid is never
+  signalled.
+- The runner creates the network card, keeps the host end for the VM's whole life and serves the
+  control protocol (`driver/protocol.rs`): status, stop, network card, guest stream, save. On a
+  clean exit it writes `exit.json` with the reason.
+- A restarted worker adopts runners simply by observing them: there is nothing to reattach.
+- Control sockets live in `/tmp/fleet-<uid>/` (or `$FLEET_RUNTIME_DIR`), named by a hash of the
+  instance directory, because macOS limits Unix socket paths to 104 bytes. The directory must be
+  owned by the user with mode 0700.
+- Descriptors are passed with `SCM_RIGHTS`, and the runner keeps its copy open until the client
+  hangs up: on macOS, closing the sender's copy of a socket descriptor still in flight lost about
+  one in five of them in the conformance suite.
+- Open: `vz` and `krun` runners need an entitlement and (for `krun`) libkrun, which `fleet`
+  itself should not carry. They will likely be separate `fleet-runner-vz` and `fleet-runner-krun`
+  executables that the backends launch, speaking the same protocol.
 
 ## Storage and images
 
@@ -80,71 +89,42 @@ address carried over iroh.
 exposes `connect_guest(port) -> stream`; the runner bridges it from `runner.sock` to the
 hypervisor's vsock device. The guest protocol in `crates/fleet-guest` is unchanged.
 
-## Driver trait (draft)
+## Driver trait
 
-```rust
-pub trait Driver: Send + Sync {
-    /// What this host can run, for placement and admission.
-    fn capabilities(&self) -> Capabilities;
+Implemented in `src/driver/`: the `Driver` trait and its types (`mod.rs`), the runner protocol
+(`protocol.rs`), the generic runner (`runner.rs`), the `fake` backend (`fake.rs`) and the
+conformance suite (`conformance.rs`).
 
-    /// Every instance this driver finds on the host, including ones Fleet no longer knows about,
-    /// so the caller (not the driver) decides what to delete.
-    fn inventory(&self) -> Result<Vec<Observed>>;
-    fn observe(&self, id: &InstanceId) -> Result<Observed>;
+`RunnerDriver<B: Backend>` implements `Driver` for every backend. A `Backend` only declares its
+`Capabilities`, lays out an instance directory in `prepare`, and says how to launch its runner;
+inside the runner a backend implements `runner::Vm` (start or restore, request stop, connect to a
+guest port, save, wait).
 
-    /// Idempotent for the same (id, generation). May take minutes (macOS install) and reports
-    /// progress through `Observed`; a newer generation fences an older in-flight call.
-    fn prepare(&self, spec: &InstanceSpec) -> Result<()>;
-    fn start(&self, spec: &InstanceSpec, nic: NetworkCard) -> Result<()>;
-    fn stop(&self, id: &InstanceId, mode: StopMode) -> Result<()>;
-    fn delete(&self, id: &InstanceId) -> Result<()>;
+An instance directory holds `spec.json` (the recorded spec and generation), `start.json`
+(generation and pid of the last launch), `exit.json` (why the last runner ended), the two locks and
+`runner.log`. `observe` derives the phase from them:
 
-    /// Optional; gated by `Capabilities`.
-    fn save_state(&self, id: &InstanceId, to: &Path) -> Result<()>;
-    fn restore_state(&self, spec: &InstanceSpec, from: &Path, nic: NetworkCard) -> Result<()>;
-    fn snapshot_disks(&self, id: &InstanceId, to: &Path) -> Result<()>;
+| Runner lock | Files | Phase |
+| --- | --- | --- |
+| no `spec.json` | | `Absent` |
+| held | socket answers | `Running` or `Stopping` |
+| held | socket not answering yet | `Starting` |
+| free | `exit.json` says failed | `Failed` |
+| free | any other `exit.json`, or never started | `Stopped` |
+| free | `start.json` without `exit.json` | `Lost` |
 
-    fn connect_guest(&self, id: &InstanceId, port: u32) -> Result<UnixStream>;
-}
+Every call is fenced by generation: an older generation than `spec.json` gets `Error::Stale`.
+Repeating a generation with a different spec is rejected; `delete` forgets the generation.
+`Lost` stays visible until the next `start`, which boots afresh.
 
-pub struct InstanceSpec {
-    pub id: InstanceId,
-    /// Bumped by Fleet on every desired-state change; stale calls are rejected.
-    pub generation: u64,
-    pub image: ImageBundle,
-    pub cpus: u32,
-    pub memory_mb: u32,
-    pub disk_gb: u32,
-    pub mac: [u8; 6],
-}
-
-pub enum Phase { Absent, Preparing { progress: Option<f32> }, Stopped, Starting, Running, Stopping, Failed }
-
-pub struct Observed {
-    pub id: InstanceId,
-    pub generation: u64,
-    pub phase: Phase,
-    pub error: Option<String>,
-}
-
-pub struct Capabilities {
-    pub guests: BTreeSet<GuestOs>,
-    pub max_macos_guests: usize,
-    pub save_restore: bool,
-    pub gpu: Option<GpuKind>,
-}
-```
-
-Synchronous on purpose: every call either talks to a runner over a local socket or does local
-file work, and the worker already runs instance control on its own threads.
-
-The conformance suite (`tests/driver_conformance.rs`) is the real specification. It runs against
-`fake` everywhere, and against `vz` and `krun` where the host can, and covers: idempotent prepare
-and start, generation fencing, stop modes, adoption after the supervisor restarts, crash reporting,
-inventory finding orphans, frames flowing over the network card, guest channel round trip, and
-save/restore where advertised.
+`fleet::driver_conformance!(harness)` generates one test per case. A harness provides fresh
+drivers over shared state (a new driver stands in for a restarted worker) and two test images that
+follow the test-guest contract documented in `conformance.rs`. `tests/driver_conformance.rs` runs
+all 20 cases against `fake`; `vz` and `krun` will run the same cases with real images.
 
 ## Open questions
+
+Answered by the spikes below, except 2 (macOS install).
 
 1. **Adoption and crashes.** Can a restarted worker reliably reattach to a running runner, and
    does a hypervisor-side crash (guest panic, VZ error) show up distinctly from a runner crash?
