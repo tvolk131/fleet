@@ -400,7 +400,7 @@ pub fn spawn(raft: Raft, store: Store, presence: Presence) -> tokio::task::JoinH
             tokio::time::sleep(Duration::from_millis(250)).await;
             let attempt = async {
                 raft.ensure_linearizable().await?;
-                let state = store.state().await?;
+                let state = store.view().await?;
                 let now = crate::jobs::now();
                 if !state.history.attempts.is_empty()
                     && now.saturating_sub(state.history.swept_at) >= 60

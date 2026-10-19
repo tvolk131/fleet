@@ -31,7 +31,6 @@ pub mod workload;
 
 pub use model::{Command, Mutation, Reply, Request, State};
 pub use network::{Client, Config, Replica};
-use std::io::Cursor;
 pub use store::Store;
 
 openraft::declare_raft_types!(
@@ -40,6 +39,7 @@ openraft::declare_raft_types!(
         R = Reply,
         NodeId = u64,
         Node = openraft::BasicNode,
+        SnapshotData = tokio::fs::File,
 );
 
 pub type Raft = openraft::Raft<TypeConfig>;

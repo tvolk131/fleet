@@ -39,3 +39,11 @@ of a pending backend launch (fault injected through the private worker's launche
 network attachments, revocation/deletion and retained-result reclamation. CI runs the fake backend on
 both operating systems, including refusal by the actual previous worker executable without DB writes.
 `tests/control/tunnels.rs` also verifies that an established stream survives unrelated catalog changes.
+
+Generation-5 metadata coverage lives in `tests/control/indexed.rs`: atomic migration/application,
+permanent receipts and released decisions, conflicting retries, bounded pages, restart, snapshot
+replacement and recovery exports. The worker journal test migrates and reopens both native and guest
+execution markers. A three-replica test transfers a snapshot beyond 64 MiB over iroh, loses its
+leader, splits large catch-up batches and verifies idempotent retry and quorum-read refusal.
+The explicit million-receipt test reports lookup, reopen, snapshot and restore costs without using
+installed service homes.

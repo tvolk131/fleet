@@ -17,7 +17,9 @@ use iroh::{
 };
 use openraft::{
     BasicNode, RaftNetwork, RaftNetworkFactory,
-    error::{InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError},
+    error::{
+        InstallSnapshotError, NetworkError, PayloadTooLarge, RPCError, RaftError, RemoteError,
+    },
     network::RPCOption,
     raft::{
         AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
@@ -28,10 +30,25 @@ use serde::{Deserialize, Serialize};
 
 use super::discovery::save_cache;
 use super::membership::{MembershipView, spawn_reconciler};
-use super::{Command, Raft, Reply, Request, State, Store, TypeConfig, store::MAX_SNAPSHOT};
+use super::{Command, Raft, Reply, Request, State, Store, TypeConfig, store::snapshot::MAX_STREAM};
 
 pub const ALPN: &[u8] = b"fleet/control/rolling/1";
 const MAX_FRAME: usize = 8 << 20;
+// Leave room for the Raft entry, vote and protocol envelopes around an admitted command.
+const MAX_COMMAND: usize = 7 << 20;
+// Keep multi-entry batches small enough that serialization and transfer do not starve heartbeats.
+// A single larger admitted command is allowed through; the hard envelope limit still applies.
+const APPEND_BATCH_BYTES: usize = 1 << 20;
+const SNAPSHOT_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Debug)]
+struct FrameTooLarge;
+impl std::fmt::Display for FrameTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("control frame exceeds limit")
+    }
+}
+impl std::error::Error for FrameTooLarge {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Peer {
@@ -82,6 +99,7 @@ pub enum Message {
     Snapshot(InstallSnapshotRequest<TypeConfig>),
     Write(Box<Request>),
     Read,
+    Query(super::store::query::Query),
     /// Local diagnostics can be stale and never authorize worker action or a membership change.
     Inspect,
     TunnelRead {
@@ -132,6 +150,7 @@ pub enum Answer {
     Snapshot(Result<InstallSnapshotResponse<u64>, RaftError<u64, InstallSnapshotError>>),
     Write(Result<Reply, ApiError>),
     Read(Result<Box<State>, ApiError>),
+    Query(Result<serde_json::Value, ApiError>),
     Inspect(ReplicaStatus),
     TunnelRead(Result<super::tunnels::View, ApiError>),
     TunnelObserve(Result<Reply, ApiError>),
@@ -196,7 +215,9 @@ async fn exchange_generation(
         cluster: cluster.into(),
         message,
     })?;
-    ensure!(bytes.len() <= MAX_FRAME, "control frame exceeds lab limit");
+    if bytes.len() > MAX_FRAME {
+        return Err(FrameTooLarge.into());
+    }
     let (mut send, mut recv) = connection.open_bi().await?;
     send.write_all(&bytes).await?;
     send.finish()?;
@@ -312,7 +333,7 @@ impl Network {
                         .await?,
                 );
             }
-            let generation = self.factory.store.state().await?.version.active;
+            let generation = self.factory.store.header().await?.version.active;
             Ok(exchange_generation(
                 self.connection.as_ref().expect("connected"),
                 &self.factory.cluster,
@@ -343,11 +364,27 @@ impl RaftNetwork<TypeConfig> for Network {
         rpc: AppendEntriesRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        match self
-            .send(Message::Append(rpc), option)
-            .await
-            .map_err(|e| self.failure(e))?
-        {
+        let count = rpc.entries.len();
+        let mut bytes = 0;
+        for (i, entry) in rpc.entries.iter().enumerate() {
+            bytes += serde_json::to_vec(entry)
+                .map_err(|e| self.failure(e))?
+                .len();
+            if i > 0 && bytes > APPEND_BATCH_BYTES {
+                return Err(RPCError::PayloadTooLarge(
+                    PayloadTooLarge::new_entries_hint(i as u64),
+                ));
+            }
+        }
+        match self.send(Message::Append(rpc), option).await.map_err(|e| {
+            if count > 1 && e.downcast_ref::<FrameTooLarge>().is_some() {
+                // Retrying the same oversized batch cannot make progress. OpenRaft retries
+                // with fewer entries while preserving their order and log identities.
+                RPCError::PayloadTooLarge(PayloadTooLarge::new_entries_hint((count / 2) as u64))
+            } else {
+                self.failure(e)
+            }
+        })? {
             Answer::Append(r) => {
                 r.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
             }
@@ -412,7 +449,7 @@ impl std::fmt::Debug for Handler {
 
 impl Handler {
     async fn peers(&self) -> Result<BTreeMap<u64, Peer>> {
-        let state = self.store.state().await?;
+        let state = self.store.header().await?;
         Ok(if state.membership.log_id().is_none() {
             self.config.peers.clone()
         } else {
@@ -449,7 +486,7 @@ impl Handler {
                     "replica traffic requires an unsupported cluster generation".into(),
                 );
             }
-            let state = match self.store.state().await {
+            let state = match self.store.header().await {
                 Ok(s) => s,
                 Err(e) => return Answer::Refused(e.to_string()),
             };
@@ -474,7 +511,7 @@ impl Handler {
                         leader: e.forward_to_leader().and_then(|f| f.leader_id),
                     }));
                 }
-                match self.store.state().await {
+                match self.store.view().await {
                     Ok(state) => Answer::TunnelStatus(Ok(state.tunnel_status(
                         &self.tunnel_presence,
                         self.raft.metrics().borrow().current_term,
@@ -490,7 +527,7 @@ impl Handler {
                         leader: e.forward_to_leader().and_then(|f| f.leader_id),
                     }));
                 }
-                let state = match self.store.state().await {
+                let state = match self.store.view().await {
                     Ok(s) => s,
                     Err(e) => return Answer::Refused(e.to_string()),
                 };
@@ -557,7 +594,7 @@ impl Handler {
                         leader: e.forward_to_leader().and_then(|f| f.leader_id),
                     }));
                 }
-                match self.store.state().await {
+                match self.store.view().await {
                     Ok(state) => Answer::TunnelRead(Ok(state.tunnel_view(&adapter, peer))),
                     Err(e) => Answer::Refused(e.to_string()),
                 }
@@ -567,7 +604,7 @@ impl Handler {
             }
             Message::Vote(rpc) if is_replica => Answer::Vote(self.raft.vote(rpc).await),
             Message::Snapshot(rpc) if is_replica => {
-                if rpc.offset.saturating_add(rpc.data.len() as u64) > MAX_SNAPSHOT as u64 {
+                if rpc.offset.saturating_add(rpc.data.len() as u64) > MAX_STREAM {
                     return Answer::Refused("snapshot exceeds lab limit".into());
                 }
                 Answer::Snapshot(self.raft.install_snapshot(rpc).await)
@@ -575,31 +612,41 @@ impl Handler {
             Message::Write(request)
                 if is_admin
                     || matches!(&request.mutation, super::Mutation::ReplicaPrepared {node, ..} if peers.get(node).is_some_and(|p|p.identity==peer))
-                    || matches!(&request.mutation, super::Mutation::VmReport(r) if self.store.state().await.ok().is_some_and(|s| s.vm_reporter(&peer.to_string(),r)))
-                    || matches!(&request.mutation, super::Mutation::HistoryReport(r) if self.store.state().await.ok().is_some_and(|s| s.history_reporter(&peer.to_string(),r)))
+                    || matches!(&request.mutation, super::Mutation::VmReport(r) if self.store.view().await.ok().is_some_and(|s| s.vm_reporter(&peer.to_string(),r)))
+                    || matches!(&request.mutation, super::Mutation::HistoryReport(r) if self.store.view().await.ok().is_some_and(|s| s.history_reporter(&peer.to_string(),r)))
                     || matches!(&request.mutation,
-                super::Mutation::WorkerReport(report) if self.store.state().await.ok().and_then(|s| s.workers.get(&report.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == report.incarnation))
-                    || matches!(&request.mutation, super::Mutation::ArtifactReady(ready) if self.store.state().await.ok().and_then(|s| ready.manifest.worker().and_then(|id| s.workers.get(id)).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == ready.incarnation))
-                    || matches!(&request.mutation, super::Mutation::ArtifactReport(report) if self.store.state().await.ok().is_some_and(|s| s.artifact_reporter(&peer.to_string(), &report.location, &report.incarnation)))
-                    || matches!(&request.mutation, super::Mutation::CheckpointReady(ready) if self.store.state().await.ok().and_then(|s| s.workers.get(&ready.checkpoint.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == ready.incarnation))
-                    || matches!(&request.mutation, super::Mutation::RecoverWorker(inventory) if self.store.state().await.ok().and_then(|s| s.workers.get(&inventory.registration.id).cloned()).is_some_and(|w| w.peer.identity == peer && w == inventory.registration)) =>
+                super::Mutation::WorkerReport(report) if self.store.view().await.ok().and_then(|s| s.workers.get(&report.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == report.incarnation))
+                    || matches!(&request.mutation, super::Mutation::ArtifactReady(ready) if self.store.view().await.ok().and_then(|s| ready.manifest.worker().and_then(|id| s.workers.get(id)).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == ready.incarnation))
+                    || matches!(&request.mutation, super::Mutation::ArtifactReport(report) if self.store.view().await.ok().is_some_and(|s| s.artifact_reporter(&peer.to_string(), &report.location, &report.incarnation)))
+                    || matches!(&request.mutation, super::Mutation::CheckpointReady(ready) if self.store.view().await.ok().and_then(|s| s.workers.get(&ready.checkpoint.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == ready.incarnation))
+                    || matches!(&request.mutation, super::Mutation::RecoverWorker(inventory) if self.store.view().await.ok().and_then(|s| s.workers.get(&inventory.registration.id).cloned()).is_some_and(|w| w.peer.identity == peer && w == inventory.registration)) =>
             {
                 if request.id.is_empty() || request.id.len() > 512 {
                     return Answer::Refused("request ID must contain 1 to 512 bytes".into());
                 }
-                let state = match self.store.state().await {
+                let state = match self.store.header().await {
                     Ok(s) => s,
                     Err(e) => return Answer::Refused(e.to_string()),
                 };
                 if request.mutation.minimum_generation() > state.version.active {
                     return Answer::Refused("operation requires an inactive cluster generation; request was not accepted".into());
                 }
+                let command = Command {
+                    principal: peer.to_string(),
+                    request: *request,
+                };
+                match serde_json::to_vec(&command) {
+                    Ok(bytes) if bytes.len() <= MAX_COMMAND => {}
+                    Ok(_) => {
+                        return Answer::Refused(
+                            "command exceeds 7 MiB limit; request was not accepted".into(),
+                        );
+                    }
+                    Err(e) => return Answer::Refused(e.to_string()),
+                }
                 Answer::Write(
                     self.raft
-                        .client_write(Command {
-                            principal: peer.to_string(),
-                            request: *request,
-                        })
+                        .client_write(command)
                         .await
                         .map(|r| r.data)
                         .map_err(|e| ApiError {
@@ -618,7 +665,7 @@ impl Handler {
                         leader: e.forward_to_leader().and_then(|f| f.leader_id),
                     }));
                 }
-                let state = match self.store.state().await {
+                let state = match self.store.view().await {
                     Ok(s) => s,
                     Err(e) => {
                         return Answer::WorkerRead(Err(ApiError {
@@ -731,7 +778,7 @@ impl Handler {
                         leader: e.forward_to_leader().and_then(|f| f.leader_id),
                     }));
                 }
-                let state = match self.store.state().await {
+                let state = match self.store.view().await {
                     Ok(s) => s,
                     Err(e) => return Answer::Refused(e.to_string()),
                 };
@@ -773,7 +820,7 @@ impl Handler {
                         leader: e.forward_to_leader().and_then(|f| f.leader_id),
                     }));
                 }
-                let state = match self.store.state().await {
+                let state = match self.store.view().await {
                     Ok(s) => s,
                     Err(e) => return Answer::Refused(e.to_string()),
                 };
@@ -807,6 +854,27 @@ impl Handler {
                 });
                 Answer::AuthorizeArtifact(Ok(permitted))
             }
+            Message::Query(query) if is_admin => {
+                if let Err(e) = self.raft.ensure_linearizable().await {
+                    return Answer::Query(Err(ApiError {
+                        message: e.to_string(),
+                        leader: e.forward_to_leader().and_then(|f| f.leader_id),
+                    }));
+                }
+                match self.store.header().await {
+                    Ok(state) if state.version.active >= super::store::indexed::GENERATION => (),
+                    Ok(_) => {
+                        return Answer::Refused(
+                            "indexed queries require active generation 5".into(),
+                        );
+                    }
+                    Err(e) => return Answer::Refused(e.to_string()),
+                }
+                match self.store.query(query).await {
+                    Ok(value) => Answer::Query(Ok(value)),
+                    Err(e) => Answer::Refused(e.to_string()),
+                }
+            }
             Message::Read if is_admin => {
                 if let Err(e) = self.raft.ensure_linearizable().await {
                     return Answer::Read(Err(ApiError {
@@ -814,20 +882,14 @@ impl Handler {
                         leader: e.forward_to_leader().and_then(|f| f.leader_id),
                     }));
                 }
-                Answer::Read(
-                    self.store
-                        .state()
-                        .await
-                        .map(Box::new)
-                        .map_err(|e| ApiError {
-                            message: e.to_string(),
-                            leader: None,
-                        }),
-                )
+                match self.store.export(MAX_FRAME / 2).await {
+                    Ok(state) => Answer::Read(Ok(Box::new(state))),
+                    Err(e) => Answer::Refused(e.to_string()),
+                }
             }
             Message::Inspect if is_admin => {
                 let metrics = self.raft.metrics().borrow().clone();
-                let state = match self.store.state().await {
+                let state = match self.store.header().await {
                     Ok(state) => state,
                     Err(error) => return Answer::Refused(error.to_string()),
                 };
@@ -861,7 +923,7 @@ impl ProtocolHandler for Handler {
             && !self.config.administrators.contains(&peer)
             && !self
                 .store
-                .state()
+                .view()
                 .await
                 .map(|s| {
                     s.workers.values().any(|w| w.peer.identity == peer)
@@ -876,12 +938,29 @@ impl ProtocolHandler for Handler {
         while let Ok((mut send, mut recv)) = connection.accept_bi().await {
             let handler = self.clone();
             tokio::spawn(async move {
-                let operation = async {
+                let receive = async {
                     if handler.blocked.read().expect("blocked").contains(&peer) {
                         bail!("injected partition");
                     }
                     let bytes = recv.read_to_end(MAX_FRAME).await?;
-                    let frame: Frame = serde_json::from_slice(&bytes)?;
+                    Ok::<Frame, anyhow::Error>(serde_json::from_slice(&bytes)?)
+                };
+                let frame = match tokio::time::timeout(Duration::from_secs(5), receive).await {
+                    Ok(Ok(frame)) => frame,
+                    Ok(Err(error)) => {
+                        tracing::debug!(%error, "control frame refused");
+                        return;
+                    }
+                    Err(_) => return,
+                };
+                // The final chunk waits for validation and an atomic disk install. Keep that
+                // acknowledgement separate from half-open-stream and ordinary request deadlines.
+                let timeout = if matches!(&frame.message, Message::Snapshot(rpc) if rpc.done) {
+                    SNAPSHOT_INSTALL_TIMEOUT
+                } else {
+                    Duration::from_secs(5)
+                };
+                let operation = async {
                     let answer = handler.answer(peer, frame).await;
                     if matches!(answer, Answer::Write(Ok(_)))
                         && handler.drop_write_reply.swap(false, Ordering::SeqCst)
@@ -891,17 +970,14 @@ impl ProtocolHandler for Handler {
                     }
                     let bytes = serde_json::to_vec(&WireAnswer {
                         answer,
-                        discovery: handler.store.state().await?.routing_view(),
+                        discovery: handler.store.header().await?.routing_view(),
                     })?;
                     ensure!(bytes.len() <= MAX_FRAME, "response exceeds lab limit");
                     send.write_all(&bytes).await?;
                     send.finish()?;
                     Ok::<_, anyhow::Error>(())
                 };
-                // Limits half-open streams and client writes waiting on a lost quorum.
-                if let Ok(Err(error)) =
-                    tokio::time::timeout(Duration::from_secs(5), operation).await
-                {
+                if let Ok(Err(error)) = tokio::time::timeout(timeout, operation).await {
                     tracing::debug!(%error, "control lab stream ended");
                 }
             });
@@ -954,7 +1030,7 @@ impl Replica {
         Store::preflight(&home.join("control.redb"), &config.cluster, config.id)?;
         let endpoint = connect_endpoint(key, peer.address).await?;
         let store = Store::open(&home.join("control.redb"), &config.cluster, config.id)?;
-        if let Some(recorded) = store.state().await?.configuration.catalog.get(&config.id) {
+        if let Some(recorded) = store.view().await?.configuration.catalog.get(&config.id) {
             ensure!(
                 recorded == peer,
                 "configured replica differs from its durable identity"
@@ -970,7 +1046,10 @@ impl Replica {
             election_timeout_max: 3000,
             max_payload_entries: 32,
             snapshot_max_chunk_size: 256 << 10,
-            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(100),
+            install_snapshot_timeout: SNAPSHOT_INSTALL_TIMEOUT.as_millis() as u64,
+            // Snapshots include permanent history. The old 100-entry lab cadence would turn
+            // every small burst of observations into a full-history disk rewrite.
+            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(10_000),
             max_in_snapshot_log_to_keep: 0,
             purge_batch_size: 1,
             ..Default::default()
@@ -1217,6 +1296,7 @@ impl Client {
                     Ok(Ok(
                         Answer::Write(Err(e))
                         | Answer::Read(Err(e))
+                        | Answer::Query(Err(e))
                         | Answer::WorkerRead(Err(e))
                         | Answer::StorageRead(Err(e))
                         | Answer::TunnelRead(Err(e))
@@ -1260,6 +1340,37 @@ impl Client {
         match self.call(Message::Read, deadline).await? {
             Answer::Read(Ok(state)) => Ok(*state),
             other => bail!("unexpected reply: {other:?}"),
+        }
+    }
+
+    pub async fn query(
+        &mut self,
+        query: super::store::query::Query,
+        deadline: Duration,
+    ) -> Result<serde_json::Value> {
+        match self.call(Message::Query(query), deadline).await? {
+            Answer::Query(Ok(value)) => Ok(value),
+            other => bail!("unexpected query reply: {other:?}"),
+        }
+    }
+
+    /// Inspect is only capability discovery; Query subsequently obtains a quorum read barrier.
+    pub async fn indexed_queries(&mut self, deadline: Duration) -> Result<bool> {
+        match self.call(Message::Inspect, deadline).await? {
+            Answer::Inspect(status) => {
+                Ok(status.version.active >= super::store::indexed::GENERATION)
+            }
+            other => bail!("unexpected inspect reply: {other:?}"),
+        }
+    }
+    pub async fn view(&mut self, deadline: Duration) -> Result<State> {
+        if self.indexed_queries(deadline).await? {
+            Ok(serde_json::from_value(
+                self.query(super::store::query::Query::View, deadline)
+                    .await?,
+            )?)
+        } else {
+            self.read(deadline).await
         }
     }
 

@@ -93,7 +93,12 @@ fn unchanged(l: &Lab, n: u64, binary: &Path) -> Result<()> {
     ] {
         let out = output(binary, &args, None, 60)?;
         ensure!(
-            !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("incompatible"),
+            !out.status.success() && {
+                let error = String::from_utf8_lossy(&out.stderr);
+                error.contains("incompatible")
+                    || error.contains("format mismatch")
+                    || error.contains("unsupported source format")
+            },
             "expected incompatible startup: {}",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -184,13 +189,11 @@ pub fn run(root: &Path, baseline: &Path, candidate: &Path, unsupported: &Path) -
     let initial_revision = l.state()?["version"]["revision"].as_u64().unwrap();
     l.binary = current;
     caught(&l, &[1, 2, 3])?;
-    let denied = l.envelope(
-        json!({"op":"vm_manage","request_id":"inactive-vm","action":{"kind":"sweep","as_of":0}}),
-    )?;
+    let denied = l.envelope(json!({"op":"metadata","query":{"kind":"stats"}}))?;
     ensure!(
         denied["ok"] == false
             && denied["outcome_unknown"] == false
-            && denied.to_string().contains("activate generation 4"),
+            && denied.to_string().contains("activate generation 5"),
         "future variant reached an older leader: {denied}"
     );
     for n in 1..=3 {
@@ -369,6 +372,10 @@ pub fn run(root: &Path, baseline: &Path, candidate: &Path, unsupported: &Path) -
     ensure!(
         l.state()?["version"]["active"] == NEXT,
         "generation not activated"
+    );
+    ensure!(
+        l.request(json!({"op":"metadata","query":{"kind":"stats"}}))?["indexed"] == true,
+        "metadata layout was not activated"
     );
     ensure!(l.request(json!({"op":"vm_manage","request_id":"activated-vm","action":{"kind":"sweep","as_of":0}}))?["reply"]=="Recorded","activated VM mutation failed");
     ensure!(

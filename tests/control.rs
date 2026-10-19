@@ -172,7 +172,11 @@ async fn invalid_snapshots_leave_state_and_vote_unchanged() {
     );
     assert_eq!(target.state().await.unwrap(), before);
     let mut snapshot = source.build_snapshot().await.unwrap();
-    snapshot.snapshot.get_mut()[0] ^= 1;
+    {
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+        snapshot.snapshot.rewind().await.unwrap();
+        snapshot.snapshot.write_all(b"!").await.unwrap();
+    }
     assert!(
         source
             .install_snapshot(&snapshot.meta, snapshot.snapshot)
@@ -1232,7 +1236,17 @@ async fn membership_learner_snapshot_preserves_pending_operation_and_receipts() 
             .await
             .unwrap()
             .expect("learner received compacted snapshot");
-        let state: State = serde_json::from_slice(snapshot.snapshot.get_ref()).unwrap();
+        let mut receiver = Store::open(
+            &c.home.0.join(format!("snapshot-inspect-{id}.redb")),
+            "cluster",
+            99,
+        )
+        .unwrap();
+        receiver
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let state = receiver.state().await.unwrap();
         assert!(state.membership_operations.contains_key(&operation));
         assert!(
             state.receipts[&key(
@@ -1539,6 +1553,8 @@ async fn simulation_place(client: &mut Client, job: &str) {
 #[path = "control/history_state.rs"]
 mod history_state;
 
+#[path = "control/indexed.rs"]
+mod indexed;
 #[path = "control/tunnels.rs"]
 mod tunnels;
 #[path = "control/versions.rs"]

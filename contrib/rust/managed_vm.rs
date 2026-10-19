@@ -171,7 +171,7 @@ pub fn run(a: tart::Options) -> Result<()> {
         |v| v["version"]["active"] == fleet::control::version::MIN,
         30,
     )?;
-    super::rolling::activate_to(&l, fleet::control::vm::GENERATION)?;
+    super::rolling::activate_to(&l, fleet::control::version::MAX)?;
     let mut settings = tart::settings(&l, &a)?;
     settings["memory_budget_mb"] = json!(if a.fake { 4096 } else { 8192 });
     let workers = if a.fake {
@@ -292,7 +292,7 @@ pub fn run(a: tart::Options) -> Result<()> {
         ensure!(
             !old.status.success()
                 && String::from_utf8_lossy(&old.stderr).contains("worker metadata"),
-            "previous binary accepted generation-four worker journal"
+            "previous binary accepted indexed worker journal"
         );
         ensure!(
             digest(&database)? == before,

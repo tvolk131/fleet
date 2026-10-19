@@ -21,6 +21,10 @@ const WAIT: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ApiRequest {
+    /// Bounded resource/receipt reads. Receipt keys include the authenticated client identity.
+    Metadata {
+        query: super::store::query::Query,
+    },
     Vm {
         #[serde(default)]
         instance: Option<String>,
@@ -397,7 +401,7 @@ impl AppClient {
         Ok(value)
     }
     pub async fn read(&mut self) -> Result<State> {
-        self.transport.read(WAIT).await
+        self.transport.view(WAIT).await
     }
     async fn tunnel_status(&mut self) -> Result<super::tunnels::status::Snapshot> {
         let started = std::time::Instant::now();
@@ -927,6 +931,13 @@ impl AppClient {
     }
     pub async fn execute(&mut self, api: ApiRequest) -> Result<Value> {
         match &api {
+            ApiRequest::Metadata { query } => {
+                ensure!(
+                    self.transport.indexed_queries(WAIT).await?,
+                    "activate generation 5 before querying indexed metadata"
+                );
+                self.transport.query(query.clone(), WAIT).await
+            }
             ApiRequest::ReplaceTunnels { .. } => self.prepare_mutation(&api).await,
             ApiRequest::Tunnels => {
                 let state = self.read().await?;
@@ -1140,10 +1151,16 @@ impl AppClient {
                     .await
             }
             ApiRequest::Queue => Ok(json!(job_views(&self.read().await?))),
-            ApiRequest::Job { id } => job_views(&self.read().await?)
-                .into_iter()
-                .find(|j| j["id"] == *id)
-                .context("unknown job"),
+            ApiRequest::Job { id } => {
+                if self.transport.indexed_queries(WAIT).await? {
+                    self.transport
+                        .query(super::store::query::Query::Job { id: id.clone() }, WAIT)
+                        .await
+                } else {
+                    let state = self.read().await?;
+                    Ok(job_view(&state, state.jobs.get(id).context("unknown job")?))
+                }
+            }
             ApiRequest::Workers => {
                 let state = self.read().await?;
                 let mut values = Vec::new();
@@ -1343,26 +1360,76 @@ impl AppClient {
     }
 }
 pub fn job_views(state: &State) -> Vec<Value> {
-    use super::queue::JobPhase;
     let mut jobs: Vec<_> = state.jobs.values().collect();
     jobs.sort_by_key(|j| j.submitted);
-    jobs.into_iter().map(|j| {
-        let a = j.current(state);
-        let phase = if j.phase == JobPhase::Active { a.and_then(|a|a.observed.as_ref()).map(|(_,o)|o.phase.label()).unwrap_or_else(|| "pending".into()) } else { format!("{:?}",j.phase).to_lowercase() };
-        let reasons = if j.phase == JobPhase::Queued { state.workers.keys().map(|w|(w.clone(),state.placement_candidate(&j.id,w).err().map(|e|e.to_string()).unwrap_or_else(||"waiting for worker poll and scheduler".into()))).collect::<BTreeMap<_,_>>() } else { BTreeMap::new() };
-        let attempts: Vec<_> = j.attempts.iter().filter_map(|id| state.assignments.get(id.as_ref())).collect();
-        let artifacts: Vec<_> = state.storage.artifacts.values().filter(|a| a.manifest.job() == Some(j.id.as_ref()) || j.attempts.iter().any(|id| Some(id.as_ref()) == a.manifest.attempt())).collect();
-        let resume_targets: BTreeMap<_,_> = if j.phase == JobPhase::Suspended && super::portable::runtime(&j.workload).is_some() { state.workers.keys().map(|worker| {
-            let mut probe=state.clone();
-            let error=match probe.resume_job_on(&j.id,j.revision,Some(worker)) {
-                Reply::Accepted {..} => probe.placement_candidate(&j.id,worker).err().map(|e| e.to_string()),
-                Reply::Rejected {reason} => Some(reason),
-                _ => Some("resume unavailable".into()),
-            };
-            (worker.clone(),error)
-        }).collect() } else { BTreeMap::new() };
-        json!({"resume_targets":resume_targets,"portable":super::portable::runtime(&j.workload),"input_bundle":j.input_bundle,"portable_ready":state.portable_ready(j).is_ok(),"portability_waiting":state.portable_ready(j).err().map(|e| e.to_string()),"resume_worker":j.resume_worker,"artifacts":artifacts,"id":j.id,"revision":j.revision,"phase":phase,"cancel_requested":matches!(j.phase,JobPhase::Cancelling|JobPhase::Cancelled),"priority":j.priority,"after":j.after,"workload":j.workload,"assignment":a,"attempts":attempts,"latest_checkpoint":latest_checkpoint(state,&j.id),"resume_from":j.resume_from,"waiting":reasons})
-    }).collect()
+    jobs.into_iter().map(|j| job_view(state, j)).collect()
+}
+pub fn job_view(state: &State, j: &super::queue::Job) -> Value {
+    use super::queue::JobPhase;
+    let a = j.current(state);
+    let phase = if j.phase == JobPhase::Active {
+        a.and_then(|a| a.observed.as_ref())
+            .map(|(_, o)| o.phase.label())
+            .unwrap_or_else(|| "pending".into())
+    } else {
+        format!("{:?}", j.phase).to_lowercase()
+    };
+    let reasons = if j.phase == JobPhase::Queued {
+        state
+            .workers
+            .keys()
+            .map(|w| {
+                (
+                    w.clone(),
+                    state
+                        .placement_candidate(&j.id, w)
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "waiting for worker poll and scheduler".into()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    } else {
+        BTreeMap::new()
+    };
+    let attempts: Vec<_> = j
+        .attempts
+        .iter()
+        .filter_map(|id| state.assignments.get(id.as_ref()))
+        .collect();
+    let artifacts: Vec<_> = state
+        .storage
+        .artifacts
+        .values()
+        .filter(|a| {
+            a.manifest.job() == Some(j.id.as_ref())
+                || j.attempts
+                    .iter()
+                    .any(|id| Some(id.as_ref()) == a.manifest.attempt())
+        })
+        .collect();
+    let resume_targets: BTreeMap<_, _> =
+        if j.phase == JobPhase::Suspended && super::portable::runtime(&j.workload).is_some() {
+            state
+                .workers
+                .keys()
+                .map(|worker| {
+                    let mut probe = state.clone();
+                    let error = match probe.resume_job_on(&j.id, j.revision, Some(worker)) {
+                        Reply::Accepted { .. } => probe
+                            .placement_candidate(&j.id, worker)
+                            .err()
+                            .map(|e| e.to_string()),
+                        Reply::Rejected { reason } => Some(reason),
+                        _ => Some("resume unavailable".into()),
+                    };
+                    (worker.clone(), error)
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+    json!({"resume_targets":resume_targets,"portable":super::portable::runtime(&j.workload),"input_bundle":j.input_bundle,"portable_ready":state.portable_ready(j).is_ok(),"portability_waiting":state.portable_ready(j).err().map(|e| e.to_string()),"resume_worker":j.resume_worker,"artifacts":artifacts,"id":j.id,"revision":j.revision,"phase":phase,"cancel_requested":matches!(j.phase,JobPhase::Cancelling|JobPhase::Cancelled),"priority":j.priority,"after":j.after,"workload":j.workload,"assignment":a,"attempts":attempts,"latest_checkpoint":latest_checkpoint(state,&j.id),"resume_from":j.resume_from,"waiting":reasons})
 }
 
 pub async fn call(home: &Path, request: ApiRequest) -> Result<Value> {

@@ -77,6 +77,7 @@ struct JournalState {
 pub struct Journal {
     db: Database,
 }
+const EXECUTIONS: TableDefinition<(u8, &str), bool> = TableDefinition::new("execution_markers");
 impl Journal {
     fn open(home: &Path, config: &WorkerConfig, initialize: bool) -> Result<Self> {
         std::fs::create_dir_all(home)?;
@@ -96,6 +97,29 @@ impl Journal {
             );
         }
         let db = Database::create(path)?;
+        {
+            let tx = db.begin_read()?;
+            if let Ok(table) = tx.open_table(JOURNAL)
+                && let Some(value) = table.get("state")?
+            {
+                let state: JournalState = serde_json::from_slice(value.value())?;
+                if state.format == super::store::indexed::FORMAT {
+                    ensure!(
+                        table
+                            .get("execution_format")?
+                            .is_some_and(|v| v.value() == b"14"),
+                        "missing execution layout marker"
+                    );
+                    tx.open_table(EXECUTIONS)
+                        .context("execution markers missing; explicit recovery required")?;
+                } else {
+                    ensure!(
+                        table.get("execution_format")?.is_none(),
+                        "worker journal layout regressed"
+                    );
+                }
+            }
+        }
         let mut tx = db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         {
@@ -158,8 +182,72 @@ impl Journal {
             let mut table = tx.open_table(JOURNAL)?;
             let mut state: JournalState =
                 serde_json::from_slice(table.get("state")?.context("missing journal")?.value())?;
+            let indexed = state.format == super::store::indexed::FORMAT;
             f(&mut state)?;
+            // Explicit recovery can bind to an older surviving authority image. That must never
+            // downgrade the physical marker layout and let an old binary overlook executions.
+            if indexed || state.generation >= super::store::indexed::GENERATION {
+                state.format = super::store::indexed::FORMAT;
+                table.insert("execution_format", b"14".as_slice())?;
+                let mut markers = tx.open_table(EXECUTIONS)?;
+                for id in std::mem::take(&mut state.attempted) {
+                    markers.insert((0, id.as_str()), true)?;
+                }
+                for id in std::mem::take(&mut state.vm_attempted) {
+                    markers.insert((1, id.as_str()), true)?;
+                }
+            }
             table.insert("state", serde_json::to_vec(&state)?.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    fn attempted(&self, vm: bool, id: &str) -> Result<bool> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(JOURNAL)?;
+        if table.get("execution_format")?.is_some() {
+            Ok(tx
+                .open_table(EXECUTIONS)?
+                .get((u8::from(vm), id))?
+                .is_some())
+        } else {
+            let state: JournalState =
+                serde_json::from_slice(table.get("state")?.context("missing journal")?.value())?;
+            Ok(if vm {
+                state.vm_attempted.contains(id)
+            } else {
+                state.attempted.contains(id)
+            })
+        }
+    }
+    fn mark_attempted(&self, vm: bool, id: &str, present: bool) -> Result<()> {
+        let mut tx = self.db.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        {
+            let mut table = tx.open_table(JOURNAL)?;
+            if table.get("execution_format")?.is_some() {
+                let mut markers = tx.open_table(EXECUTIONS)?;
+                if present {
+                    markers.insert((u8::from(vm), id), true)?;
+                } else {
+                    markers.remove((u8::from(vm), id))?;
+                }
+            } else {
+                let mut state: JournalState = serde_json::from_slice(
+                    table.get("state")?.context("missing journal")?.value(),
+                )?;
+                let set = if vm {
+                    &mut state.vm_attempted
+                } else {
+                    &mut state.attempted
+                };
+                if present {
+                    set.insert(id.into());
+                } else {
+                    set.remove(id);
+                }
+                table.insert("state", serde_json::to_vec(&state)?.as_slice())?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -1044,7 +1132,7 @@ impl Worker {
                 return Ok(old.clone());
             }
         }
-        let attempted = journal.attempted.contains(&a.id);
+        let attempted = self.journal.attempted(false, &a.id)?;
         let phase = match &a.workload {
             Workload::Job { spec, gpu, .. } => {
                 let dir = jobs::jobs_dir(&home).join(id);
@@ -1126,10 +1214,7 @@ impl Worker {
                         {
                             ensure!(missing.is_empty(), "waiting for verified input blobs");
                         }
-                        self.journal.change(|s| {
-                            s.attempted.insert(a.id.clone());
-                            Ok(())
-                        })?;
+                        self.journal.mark_attempted(false, &a.id, true)?;
                     }
                     let submitted = self
                         .agent
@@ -1150,10 +1235,7 @@ impl Worker {
                     {
                         // A returned pre-publication error proves no supervisor was launched.
                         // A process crash before this point leaves the attempt uncertain instead.
-                        self.journal.change(|s| {
-                            s.attempted.remove(&a.id);
-                            Ok(())
-                        })?;
+                        self.journal.mark_attempted(false, &a.id, false)?;
                     }
                     submitted?;
                 }
@@ -1208,17 +1290,11 @@ impl Worker {
                     });
                 }
                 if !attempted {
-                    self.journal.change(|s| {
-                        s.attempted.insert(a.id.clone());
-                        Ok(())
-                    })?;
+                    self.journal.mark_attempted(false, &a.id, true)?;
                 }
                 let created = self.agent.reserve_instance(owner, id, spec.clone()).await;
                 if created.is_err() && !dir.join("desired.json").exists() {
-                    self.journal.change(|s| {
-                        s.attempted.remove(&a.id);
-                        Ok(())
-                    })?;
+                    self.journal.mark_attempted(false, &a.id, false)?;
                 }
                 created?;
                 let info = instances::info(&home, id)?;
