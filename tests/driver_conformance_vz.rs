@@ -74,3 +74,75 @@ fleet::driver_conformance!(
     Vz::new(),
     #[ignore = "boots real VMs; run tests/vm-guest/build.sh, then pass --ignored"]
 );
+
+/// Fleet's own guest agent, the replacement for `tart exec`, running inside a real VM.
+#[test]
+#[ignore = "boots real VMs; run tests/vm-guest/build.sh, then pass --ignored"]
+fn guest_agent_runs_commands_over_vsock() {
+    use fleet::driver::{AGENT_PORT, GuestOs, InstanceId, InstanceSpec};
+    use std::time::{Duration, Instant};
+
+    let h = Vz::new();
+    let driver = h.driver();
+    let spec = InstanceSpec {
+        id: InstanceId::new("agent").unwrap(),
+        generation: 1,
+        guest: GuestOs::Linux,
+        image: h.images.join("agent"),
+        cpus: 1,
+        memory_mb: 512,
+        disk_gb: 1,
+        mac: [0x02, 0xf1, 0xee, 0x00, 0x00, 0x07],
+        mtu: 1500,
+    };
+    driver.start(&spec).unwrap();
+    let connect = || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            match driver.connect_guest(&spec.id, AGENT_PORT) {
+                Ok(stream) => return stream,
+                Err(e) if Instant::now() > deadline => panic!("no agent: {e}"),
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    };
+    let run = |argv: &[&str], input: &'static [u8]| {
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = fleet_guest::agent::client(connect(), &argv, input, &mut out, &mut err).unwrap();
+        (code, out, err)
+    };
+    let (code, out, _) = run(&["/init", "cat"], b"through vsock and back");
+    assert_eq!((code, out.as_slice()), (0, &b"through vsock and back"[..]));
+    assert_eq!(run(&["/init", "exit", "42"], b"").0, 42);
+    let (code, _, err) = run(&["/missing"], b"");
+    assert_eq!(code, 127, "{}", String::from_utf8_lossy(&err));
+
+    // `fleet guest-exec`, the drop-in for `tart exec -i`, over the same agent.
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_fleet"))
+        .arg("guest-exec")
+        .arg(h.root.join("instances/agent").canonicalize().unwrap())
+        .args(["--", "/init", "cat"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"via fleet guest-exec")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"via fleet guest-exec");
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fleet"))
+        .arg("guest-exec")
+        .arg(h.root.join("instances/agent").canonicalize().unwrap())
+        .args(["--", "/init", "exit", "3"])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(3));
+    driver.delete(&spec.id, 1).unwrap();
+}

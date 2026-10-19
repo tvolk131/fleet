@@ -274,6 +274,14 @@ enum Command {
         #[arg(long)]
         restore: Option<PathBuf>,
     },
+    /// Runs a command in a VM through Fleet's guest agent, with this process's stdio, and exits
+    /// with its status. The replacement for `tart exec -i`.
+    #[command(hide = true)]
+    GuestExec {
+        instance_dir: PathBuf,
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
     #[command(hide = true)]
     InstanceController {
         instance_home: PathBuf,
@@ -656,6 +664,17 @@ async fn run(args: Args) -> Result<()> {
                 "fake" => fleet::driver::fake::run(args),
                 other => anyhow::bail!("unknown driver backend {other:?}"),
             };
+        }
+        Command::GuestExec { instance_dir, argv } => {
+            let stream = fleet::driver::connect_guest(&instance_dir, fleet::driver::AGENT_PORT)?;
+            let code = fleet_guest::agent::client(
+                stream,
+                &argv,
+                std::io::stdin(),
+                std::io::stdout().lock(),
+                std::io::stderr().lock(),
+            )?;
+            std::process::exit(code);
         }
         Command::InstanceController { instance_home, id } => {
             return fleet::instances::run_controller(&instance_home, &id);

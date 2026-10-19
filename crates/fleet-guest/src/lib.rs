@@ -16,6 +16,7 @@ use std::{
 };
 
 pub const READY: &str = "fleet-guest-v2";
+pub mod agent;
 pub mod tunnel;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -55,6 +56,11 @@ pub fn main_args(mut args: impl Iterator<Item = String>) -> Result<i32> {
         // main exits immediately; never wait for another byte from a failed host.
         runtime.shutdown_background();
         result?;
+        return Ok(0);
+    }
+    if first == "--agent" {
+        ensure!(args.next().is_none(), "unexpected arguments");
+        agent::serve(agent::listen_vsock(agent::PORT)?)?;
         return Ok(0);
     }
     if first == "--job" {

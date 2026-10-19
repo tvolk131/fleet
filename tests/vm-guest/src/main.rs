@@ -6,7 +6,9 @@
 //! - eth0 carries a 0x88b5 frame every 250 ms, and each 0x88b5 frame received is answered with
 //!   `echo: ` followed by its payload;
 //! - vsock port 1024 is the agent port: `{"kind":"shutdown"}` powers off, unless the kernel
-//!   command line contains `fleet_test.ignore_stop`.
+//!   command line contains `fleet_test.ignore_stop`. With `fleet_test.agent` the real
+//!   `fleet_guest::agent` serves it instead, and `/init cat` and `/init exit N` are commands for it
+//!   to run.
 
 use std::{
     io::{Read, Write},
@@ -235,6 +237,15 @@ fn agent(request: &str, _: &mut std::fs::File) {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("cat") => {
+            let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::stdout());
+            std::process::exit(0);
+        }
+        Some("exit") => std::process::exit(args.get(1).and_then(|c| c.parse().ok()).unwrap_or(1)),
+        _ => {}
+    }
     mount("devtmpfs", "/dev", "devtmpfs");
     mount("proc", "/proc", "proc");
     mount("sysfs", "/sys", "sysfs");
@@ -244,7 +255,15 @@ fn main() {
             log(format!("network failed: {error}"));
         }
     });
-    std::thread::spawn(|| serve(AGENT_PORT, agent));
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    if cmdline.split_whitespace().any(|w| w == "fleet_test.agent") {
+        std::thread::spawn(|| {
+            let served = fleet_guest::agent::listen_vsock(AGENT_PORT).and_then(fleet_guest::agent::serve);
+            log(format!("fleet-guest agent ended: {served:?}"));
+        });
+    } else {
+        std::thread::spawn(|| serve(AGENT_PORT, agent));
+    }
     if let Err(error) = serve(ECHO_PORT, echo) {
         log(format!("echo port failed: {error}"));
     }

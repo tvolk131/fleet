@@ -681,6 +681,16 @@ impl<B: Backend> RunnerDriver<B> {
 
 /// Where an instance's runner listens. Unix socket paths are limited to 104 bytes on macOS, so
 /// sockets live in a short per-user directory, named by a hash of the instance directory.
+/// Connects to `port` in the guest of the runner serving `instance_dir`, without a driver: this
+/// is how `fleet guest-exec` reaches the guest agent.
+pub fn connect_guest(instance_dir: &Path, port: u32) -> Result<UnixStream> {
+    match protocol::call(&socket_path(instance_dir)?, &Request::Guest { port })? {
+        (Response::Ok, Some(fd)) => Ok(UnixStream::from(fd)),
+        (Response::Error { message }, _) => Err(Error::Other(anyhow::anyhow!(message))),
+        reply => Err(Error::Other(anyhow::anyhow!("unexpected reply {reply:?}"))),
+    }
+}
+
 pub fn socket_path(instance_dir: &Path) -> Result<PathBuf> {
     let base = match std::env::var_os("FLEET_RUNTIME_DIR") {
         Some(dir) => PathBuf::from(dir),

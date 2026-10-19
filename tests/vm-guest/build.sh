@@ -2,6 +2,7 @@
 # Builds the Linux test guest image bundles the driver conformance suite boots:
 #   target/vm-guest/standard/      powers off on a graceful stop request
 #   target/vm-guest/ignores-stop/  ignores it
+#   target/vm-guest/agent/         serves Fleet's real guest agent on the agent port
 # Needs the aarch64-unknown-linux-musl Rust target and zstd (only to fetch the kernel).
 # The kernel is Kata Containers' guest kernel; set FLEET_TEST_KERNEL to use a local copy.
 set -eu
@@ -35,4 +36,5 @@ bundle() {
 }
 bundle standard ""
 bundle ignores-stop " fleet_test.ignore_stop"
+bundle agent " fleet_test.agent"
 echo "test guest bundles in $out"

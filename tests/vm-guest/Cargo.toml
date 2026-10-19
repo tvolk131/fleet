@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 libc = "0.2"
+fleet-guest = { path = "../../crates/fleet-guest" }
 
 [profile.release]
 opt-level = "s"

@@ -5,6 +5,7 @@
 //!
 //! The Tart VM (`config.json`, `disk.img`, `nvram.bin`) is imported once into
 //! `target/vz-macos-image` as APFS clones. `FLEET_VZ_MACOS_IMAGE` names a bundle directly.
+//! The image needs Fleet's guest agent, installed once with `contrib/install-guest-agent.sh`.
 #![cfg(target_os = "macos")]
 
 use std::{
@@ -14,7 +15,7 @@ use std::{
 };
 
 use fleet::driver::{
-    Driver, GuestOs, InstanceId, InstanceSpec, Phase, RunnerDriver, StopMode,
+    AGENT_PORT, Driver, GuestOs, InstanceId, InstanceSpec, Phase, RunnerDriver, StopMode,
     vz::{self, VzBackend},
 };
 
@@ -92,8 +93,42 @@ fn macos_guest_boots_networks_saves_and_stops() {
     let (after, ethertype, len) = first_guest_frame(&card, Duration::from_secs(180))
         .expect("the guest sent nothing on its network card");
     println!("first guest frame after {after:?}: ethertype {ethertype:#06x}, {len} bytes");
+
+    // The agent starts once the guest has logged in.
+    let began = Instant::now();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = loop {
+        match driver.connect_guest(&spec.id, AGENT_PORT) {
+            Ok(stream) => {
+                let argv = [
+                    "/usr/bin/sw_vers".to_string(),
+                    "-productVersion".to_string(),
+                ];
+                break fleet_guest::agent::client(
+                    stream,
+                    &argv,
+                    std::io::empty(),
+                    &mut out,
+                    &mut err,
+                )
+                .unwrap();
+            }
+            Err(e) if began.elapsed() > Duration::from_secs(180) => {
+                panic!(
+                    "the guest agent never answered (installed with contrib/install-guest-agent.sh?): {e}"
+                )
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(500)),
+        }
+    };
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    println!(
+        "agent ran sw_vers after {:?}: {}",
+        began.elapsed(),
+        String::from_utf8_lossy(&out).trim()
+    );
     // Let it settle into its login session before saving.
-    std::thread::sleep(Duration::from_secs(20));
+    std::thread::sleep(Duration::from_secs(10));
 
     let state = root.join("macos-smoke.vzvmsave");
     let began = Instant::now();
