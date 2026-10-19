@@ -17,7 +17,9 @@ use iroh::{
 };
 use openraft::{
     BasicNode, RaftNetwork, RaftNetworkFactory,
-    error::{InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError},
+    error::{
+        InstallSnapshotError, NetworkError, PayloadTooLarge, RPCError, RaftError, RemoteError,
+    },
     network::RPCOption,
     raft::{
         AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
@@ -32,6 +34,21 @@ use super::{Command, Raft, Reply, Request, State, Store, TypeConfig, store::snap
 
 pub const ALPN: &[u8] = b"fleet/control/rolling/1";
 const MAX_FRAME: usize = 8 << 20;
+// Leave room for the Raft entry, vote and protocol envelopes around an admitted command.
+const MAX_COMMAND: usize = 7 << 20;
+// Keep multi-entry batches small enough that serialization and transfer do not starve heartbeats.
+// A single larger admitted command is allowed through; the hard envelope limit still applies.
+const APPEND_BATCH_BYTES: usize = 1 << 20;
+const SNAPSHOT_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Debug)]
+struct FrameTooLarge;
+impl std::fmt::Display for FrameTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("control frame exceeds limit")
+    }
+}
+impl std::error::Error for FrameTooLarge {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Peer {
@@ -198,7 +215,9 @@ async fn exchange_generation(
         cluster: cluster.into(),
         message,
     })?;
-    ensure!(bytes.len() <= MAX_FRAME, "control frame exceeds lab limit");
+    if bytes.len() > MAX_FRAME {
+        return Err(FrameTooLarge.into());
+    }
     let (mut send, mut recv) = connection.open_bi().await?;
     send.write_all(&bytes).await?;
     send.finish()?;
@@ -345,11 +364,27 @@ impl RaftNetwork<TypeConfig> for Network {
         rpc: AppendEntriesRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        match self
-            .send(Message::Append(rpc), option)
-            .await
-            .map_err(|e| self.failure(e))?
-        {
+        let count = rpc.entries.len();
+        let mut bytes = 0;
+        for (i, entry) in rpc.entries.iter().enumerate() {
+            bytes += serde_json::to_vec(entry)
+                .map_err(|e| self.failure(e))?
+                .len();
+            if i > 0 && bytes > APPEND_BATCH_BYTES {
+                return Err(RPCError::PayloadTooLarge(
+                    PayloadTooLarge::new_entries_hint(i as u64),
+                ));
+            }
+        }
+        match self.send(Message::Append(rpc), option).await.map_err(|e| {
+            if count > 1 && e.downcast_ref::<FrameTooLarge>().is_some() {
+                // Retrying the same oversized batch cannot make progress. OpenRaft retries
+                // with fewer entries while preserving their order and log identities.
+                RPCError::PayloadTooLarge(PayloadTooLarge::new_entries_hint((count / 2) as u64))
+            } else {
+                self.failure(e)
+            }
+        })? {
             Answer::Append(r) => {
                 r.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
             }
@@ -451,7 +486,7 @@ impl Handler {
                     "replica traffic requires an unsupported cluster generation".into(),
                 );
             }
-            let state = match self.store.view().await {
+            let state = match self.store.header().await {
                 Ok(s) => s,
                 Err(e) => return Answer::Refused(e.to_string()),
             };
@@ -589,19 +624,29 @@ impl Handler {
                 if request.id.is_empty() || request.id.len() > 512 {
                     return Answer::Refused("request ID must contain 1 to 512 bytes".into());
                 }
-                let state = match self.store.view().await {
+                let state = match self.store.header().await {
                     Ok(s) => s,
                     Err(e) => return Answer::Refused(e.to_string()),
                 };
                 if request.mutation.minimum_generation() > state.version.active {
                     return Answer::Refused("operation requires an inactive cluster generation; request was not accepted".into());
                 }
+                let command = Command {
+                    principal: peer.to_string(),
+                    request: *request,
+                };
+                match serde_json::to_vec(&command) {
+                    Ok(bytes) if bytes.len() <= MAX_COMMAND => {}
+                    Ok(_) => {
+                        return Answer::Refused(
+                            "command exceeds 7 MiB limit; request was not accepted".into(),
+                        );
+                    }
+                    Err(e) => return Answer::Refused(e.to_string()),
+                }
                 Answer::Write(
                     self.raft
-                        .client_write(Command {
-                            principal: peer.to_string(),
-                            request: *request,
-                        })
+                        .client_write(command)
                         .await
                         .map(|r| r.data)
                         .map_err(|e| ApiError {
@@ -893,12 +938,29 @@ impl ProtocolHandler for Handler {
         while let Ok((mut send, mut recv)) = connection.accept_bi().await {
             let handler = self.clone();
             tokio::spawn(async move {
-                let operation = async {
+                let receive = async {
                     if handler.blocked.read().expect("blocked").contains(&peer) {
                         bail!("injected partition");
                     }
                     let bytes = recv.read_to_end(MAX_FRAME).await?;
-                    let frame: Frame = serde_json::from_slice(&bytes)?;
+                    Ok::<Frame, anyhow::Error>(serde_json::from_slice(&bytes)?)
+                };
+                let frame = match tokio::time::timeout(Duration::from_secs(5), receive).await {
+                    Ok(Ok(frame)) => frame,
+                    Ok(Err(error)) => {
+                        tracing::debug!(%error, "control frame refused");
+                        return;
+                    }
+                    Err(_) => return,
+                };
+                // The final chunk waits for validation and an atomic disk install. Keep that
+                // acknowledgement separate from half-open-stream and ordinary request deadlines.
+                let timeout = if matches!(&frame.message, Message::Snapshot(rpc) if rpc.done) {
+                    SNAPSHOT_INSTALL_TIMEOUT
+                } else {
+                    Duration::from_secs(5)
+                };
+                let operation = async {
                     let answer = handler.answer(peer, frame).await;
                     if matches!(answer, Answer::Write(Ok(_)))
                         && handler.drop_write_reply.swap(false, Ordering::SeqCst)
@@ -915,10 +977,7 @@ impl ProtocolHandler for Handler {
                     send.finish()?;
                     Ok::<_, anyhow::Error>(())
                 };
-                // Limits half-open streams and client writes waiting on a lost quorum.
-                if let Ok(Err(error)) =
-                    tokio::time::timeout(Duration::from_secs(5), operation).await
-                {
+                if let Ok(Err(error)) = tokio::time::timeout(timeout, operation).await {
                     tracing::debug!(%error, "control lab stream ended");
                 }
             });
@@ -987,6 +1046,7 @@ impl Replica {
             election_timeout_max: 3000,
             max_payload_entries: 32,
             snapshot_max_chunk_size: 256 << 10,
+            install_snapshot_timeout: SNAPSHOT_INSTALL_TIMEOUT.as_millis() as u64,
             snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(100),
             max_in_snapshot_log_to_keep: 0,
             purge_batch_size: 1,

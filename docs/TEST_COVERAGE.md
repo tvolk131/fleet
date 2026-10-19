@@ -43,5 +43,7 @@ both operating systems, including refusal by the actual previous worker executab
 Generation-5 metadata coverage lives in `tests/control/indexed.rs`: atomic migration/application,
 permanent receipts and released decisions, conflicting retries, bounded pages, restart, snapshot
 replacement and recovery exports. The worker journal test migrates and reopens both native and guest
-execution markers. The explicit million-receipt test qualifies snapshots beyond 64 MiB and reports
-lookup, reopen and transfer costs without using installed service homes.
+execution markers. A three-replica test transfers a snapshot beyond 64 MiB over iroh, loses its
+leader, splits large catch-up batches and verifies idempotent retry and quorum-read refusal.
+The explicit million-receipt test reports lookup, reopen, snapshot and restore costs without using
+installed service homes.

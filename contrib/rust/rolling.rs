@@ -95,7 +95,9 @@ fn unchanged(l: &Lab, n: u64, binary: &Path) -> Result<()> {
         ensure!(
             !out.status.success() && {
                 let error = String::from_utf8_lossy(&out.stderr);
-                error.contains("incompatible") || error.contains("format mismatch")
+                error.contains("incompatible")
+                    || error.contains("format mismatch")
+                    || error.contains("unsupported source format")
             },
             "expected incompatible startup: {}",
             String::from_utf8_lossy(&out.stderr)

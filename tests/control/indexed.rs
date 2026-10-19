@@ -393,6 +393,10 @@ async fn indexed_history_scale_smoke() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn indexed_queries_and_receipts_survive_network_snapshot_and_leader_loss() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("openraft=warn,fleet::control::network=debug")
+        .with_test_writer()
+        .try_init();
     let mut c = Cluster::new(3).await;
     assert!(
         c.client
@@ -461,12 +465,43 @@ async fn indexed_queries_and_receipts_survive_network_snapshot_and_leader_loss()
     );
     let leader = c.leader().await;
     let follower = (1..=3).find(|id| *id != leader).unwrap();
+    let successor = (1..=3).find(|id| *id != leader && *id != follower).unwrap();
+    let oversized = Request {
+        origin: "cluster".into(),
+        id: "oversized-command".into(),
+        mutation: Mutation::Release {
+            request_id: "x".repeat(7 << 20),
+        },
+    };
+    assert!(
+        c.client
+            .write(oversized, WAIT)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("command exceeds")
+    );
+    assert_eq!(
+        c.client
+            .query(
+                Query::Receipt {
+                    principal: c.client.endpoint.id().to_string(),
+                    request_id: "oversized-command".into(),
+                },
+                WAIT
+            )
+            .await
+            .unwrap(),
+        serde_json::Value::Null
+    );
     c.replicas
         .remove(&follower)
         .unwrap()
         .shutdown()
         .await
         .unwrap();
+    // Exceed the former 64 MiB ceiling through the actual Raft transport, not just Store::install.
+    let absent = "x".repeat(650 << 10);
     for n in 0..110 {
         c.client
             .write(
@@ -474,7 +509,7 @@ async fn indexed_queries_and_receipts_survive_network_snapshot_and_leader_loss()
                     origin: "cluster".into(),
                     id: format!("history-{n}"),
                     mutation: Mutation::Release {
-                        request_id: "absent".into(),
+                        request_id: absent.clone(),
                     },
                 },
                 WAIT,
@@ -482,15 +517,18 @@ async fn indexed_queries_and_receipts_survive_network_snapshot_and_leader_loss()
             .await
             .unwrap();
     }
+    let barrier = c.client.query(Query::Stats, WAIT).await.unwrap()["applied"]["index"]
+        .as_u64()
+        .unwrap();
     c.replicas[&leader].raft.trigger().snapshot().await.unwrap();
-    tokio::time::timeout(WAIT, async {
+    tokio::time::timeout(WAIT * 12, async {
         loop {
             if c.replicas[&leader]
                 .raft
                 .metrics()
                 .borrow()
                 .purged
-                .is_some_and(|l| l.index > 100)
+                .is_some_and(|l| l.index >= barrier)
             {
                 break;
             }
@@ -500,7 +538,7 @@ async fn indexed_queries_and_receipts_survive_network_snapshot_and_leader_loss()
     .await
     .unwrap();
     c.start(follower).await;
-    tokio::time::timeout(WAIT, async {
+    tokio::time::timeout(WAIT * 12, async {
         loop {
             if c.replicas[&follower]
                 .store
@@ -509,6 +547,12 @@ async fn indexed_queries_and_receipts_survive_network_snapshot_and_leader_loss()
                 .unwrap()["receipts"]
                 .as_u64()
                 .is_some_and(|n| n >= 116)
+                && c.replicas[&follower]
+                    .raft
+                    .metrics()
+                    .borrow()
+                    .snapshot
+                    .is_some_and(|log| log.index >= barrier)
             {
                 break;
             }
@@ -525,16 +569,32 @@ async fn indexed_queries_and_receipts_survive_network_snapshot_and_leader_loss()
             .snapshot
             .is_some()
     );
+    let snapshot = c
+        .replicas
+        .get_mut(&follower)
+        .unwrap()
+        .store
+        .get_current_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(snapshot.snapshot.metadata().await.unwrap().len() > 64 << 20);
     c.replicas
         .remove(&leader)
         .unwrap()
         .shutdown()
         .await
         .unwrap();
-    assert_eq!(
-        c.client.write(request.clone(), WAIT).await.unwrap(),
-        accepted
-    );
+    // Prefer the survivor with the older snapshot. Its initial catch-up AppendEntries can exceed
+    // the frame budget even though every individual command fits; it must split and make progress.
+    c.replicas[&successor].raft.trigger().elect().await.unwrap();
+    let retried = c.client.write(request.clone(), WAIT).await;
+    if retried.is_err() {
+        for (id, replica) in &c.replicas {
+            eprintln!("replica {id}: {:?}", *replica.raft.metrics().borrow());
+        }
+    }
+    assert_eq!(retried.unwrap(), accepted);
     let principal = c.client.endpoint.id().to_string();
     assert_eq!(
         c.client
@@ -562,8 +622,17 @@ async fn indexed_queries_and_receipts_survive_network_snapshot_and_leader_loss()
         )
         .await
         .unwrap();
-    assert_eq!(page["items"].as_array().unwrap().len(), 20);
-    let leader = c.leader().await;
+    assert!((1..20).contains(&page["items"].as_array().unwrap().len()));
+    assert!(!page["next"].is_null());
+    c.client.query(Query::Stats, WAIT).await.unwrap();
+    let leader = c
+        .replicas
+        .values()
+        .find_map(|r| {
+            let m = r.raft.metrics().borrow().clone();
+            (m.current_leader == Some(m.id)).then_some(m.id)
+        })
+        .unwrap();
     let other = *c.replicas.keys().find(|id| **id != leader).unwrap();
     c.replicas.remove(&other).unwrap().shutdown().await.unwrap();
     assert!(

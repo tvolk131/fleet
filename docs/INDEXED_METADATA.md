@@ -69,6 +69,10 @@ For pages, `collection: null` selects receipts; a named resource collection sele
 Pass the returned `next` object unchanged as `cursor`. Pages allow 1–256 entries and approximately
 2 MiB of encoded values/keys. A record that cannot fit produces an explicit error; use its point
 query or offline export. The transport's existing 8 MiB frame bound still applies to point reads.
+New commands are limited to 7 MiB including their authenticated principal, leaving room for Raft
+envelopes. Oversized commands are refused before acceptance. If a replication batch exceeds the
+frame bound, the transport asks OpenRaft to retry smaller batches without changing log identities.
+Multi-entry batches target at most 1 MiB to avoid spending heartbeat deadlines on large transfers.
 
 These are **live keyset pages**, each with its observed applied index. They do not freeze the entire
 database between calls. Concurrent insertion before the cursor may not appear, and an updated
@@ -87,6 +91,8 @@ digest, ordering, duplicate keys, resource types and Raft metadata before commit
 tables and snapshot metadata together. The current safety bounds are 16 MiB per encoded record and
 64 GiB per snapshot. Disk must have room for the temporary file, replacement database pages and
 retained snapshot; streaming bounds memory, not disk usage or the duration of an install transaction.
+Snapshot RPCs have a separate two-minute installation deadline. Half-open streams and ordinary
+server requests retain their five-second bounds; heartbeat/election timing is unchanged.
 
 Install the binary on replicas first, then prepare and activate generation five using the existing
 rolling-upgrade commands. Before activation, both the state and saved snapshot remain readable by
@@ -106,8 +112,11 @@ without changing receipt identity or retention.
 ## Qualification
 
 `tests/control/indexed.rs` covers activation, atomic abort, duplicate/conflicting/released retries,
-pagination, restart, snapshot restore and recovery receipt preservation. Normal CI runs the
-10,000-receipt case on both platforms and the million-receipt case on Linux. The explicit large-history run is:
+pagination, restart, snapshot restore and recovery receipt preservation. A three-replica test
+transfers a snapshot larger than 64 MiB over iroh, then loses its leader and retries a request;
+large catch-up batches must split instead of retrying an oversized frame forever. Normal CI runs
+this scenario and the 10,000-receipt case on both platforms, plus the million-receipt case on Linux.
+The explicit large-history run is:
 
 ```sh
 cargo test --locked --test control indexed::indexed_million_receipts -- --ignored --nocapture --test-threads=1
