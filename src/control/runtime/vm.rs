@@ -266,6 +266,36 @@ impl Worker {
                     failure = Some(format!("operation attempt failed; not replayed: {e:#}"));
                 }
             }
+        } else {
+            let local = guest::inspect(&backend, &op.execution, &backend_id)?;
+            ensure!(
+                local.id == backend_id && local.instance == op.execution && local.spec == op.spec,
+                "backend operation differs from committed request"
+            );
+            if local.state == guest::OperationState::Pending {
+                if a.revision != op.instance_revision || !a.desired.running() {
+                    failure = Some("VM changed before execution; command was not started".into());
+                } else {
+                    // The backend durably writes Pending before spawning its supervisor.
+                    // Recover that launch gap only: inspect/start honor the supervisor lock
+                    // and attempted marker, so uncertain guest effects are never replayed.
+                    self.journal.change(|s| {
+                        s.vm_attempted.insert(op.id.clone());
+                        Ok(())
+                    })?;
+                    self.agent
+                        .handle(
+                            self.config.registration.peer.identity,
+                            proto::Request::InstanceGuest(guest::Request::Start {
+                                id: op.execution.clone(),
+                                operation: backend_id.clone(),
+                                revision: local.revision,
+                                spec: op.spec.clone(),
+                            }),
+                        )
+                        .await?;
+                }
+            }
         }
         if let Some(error) = failure {
             let outcome = Outcome {

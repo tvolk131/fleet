@@ -79,6 +79,79 @@ fn enforced(l: &Lab) -> Result<()> {
     );
     Ok(())
 }
+fn recover_pending_launch(l: &mut Lab, worker: &str) -> Result<()> {
+    // Confined fault injection: persist the backend request but replace its launcher
+    // with a successful no-op, reproducing a crash before supervisor execution.
+    l.stop(worker, false)?;
+    let config = l.root.join(worker).join("worker.json");
+    let original = read(&config)?;
+    let mut broken = original.clone();
+    broken["supervisor"] = json!("/usr/bin/true");
+    save(&config, &broken)?;
+    l.start(worker, None)?;
+    let marker = l.s("guest-a/pending-once");
+    let staged = (|| -> Result<_> {
+        exec(
+            l,
+            "a",
+            "pending-launch",
+            json!(["/bin/sh", "-c", format!("printf 'once\\n' >> '{marker}'")]),
+            false,
+        )?;
+        let operation: fleet::control::vm::Operation =
+            serde_json::from_value(op(l, "pending-launch")?)?;
+        let dir = fleet::instances::guest::operation_dir(
+            &l.root.join(worker).join("backend"),
+            &operation.execution,
+            &operation.backend_id(),
+        )?;
+        wait(
+            || {
+                let path = dir.join("operation.json");
+                if path.exists() {
+                    read(&path)
+                } else {
+                    Ok(Value::Null)
+                }
+            },
+            |v| v["state"] == "pending",
+            60,
+        )?;
+        Ok(dir)
+    })();
+    l.stop(worker, false)?;
+    let staged = staged.and_then(|dir| {
+        ensure!(
+            !dir.join("attempted").exists(),
+            "fault ran the guest command"
+        );
+        Ok(())
+    });
+    // Always restore the launcher so fixture cleanup can still delete its VMs.
+    save(&config, &original)?;
+    l.start(worker, None)?;
+    staged?;
+    finished(l, "pending-launch")?;
+    l.request(json!({"op":"retry","request_id":"request-pending-launch"}))?;
+    l.cli(&[
+        "--home",
+        &l.s("client"),
+        "instance",
+        "download",
+        "a",
+        &marker,
+        "--operation",
+        "pending-marker",
+    ])?;
+    finished(l, "pending-marker")?;
+    l.request(json!({"op":"vm_fetch","id":"pending-marker","destination":l.s("pending-capture")}))?;
+    ensure!(
+        fs::read(l.root.join("pending-capture/download"))? == b"once\n",
+        "pending launch was lost or replayed"
+    );
+    l.phase("pending_backend_launch_recovers_after_worker_restart_without_replay");
+    Ok(())
+}
 pub fn run(a: tart::Options) -> Result<()> {
     tart::real_guard(&a)?;
     let mut l = Lab::new(&a.home, &a.binary)?;
@@ -182,6 +255,7 @@ pub fn run(a: tart::Options) -> Result<()> {
         "download changed or retry used new source bytes"
     );
     l.phase("upload_retry_uses_saved_bytes_and_download_result_is_verified");
+    recover_pending_launch(&mut l, workers[0])?;
     let marker = l.s("guest-a/once");
     exec(
         &l,
@@ -382,7 +456,7 @@ pub fn run(a: tart::Options) -> Result<()> {
         "released result still available"
     );
     l.phase("explicit_retention_release_waits_for_worker_reclamation");
-    l.report(json!({"success":true,"real_tart":!a.fake,"physical_failure_domain":"one host; independent workers simulated when fake","public_interfaces_only":true,"binary_sha256":digest(&l.binary)?}))?;
+    l.report(json!({"success":true,"real_tart":!a.fake,"physical_failure_domain":"one host; independent workers simulated when fake","public_client_interfaces":true,"fault_injection":"private worker launcher exits before guest execution","binary_sha256":digest(&l.binary)?}))?;
     for name in workers.iter().copied().collect::<BTreeSet<_>>() {
         l.stop(name, false)?;
     }

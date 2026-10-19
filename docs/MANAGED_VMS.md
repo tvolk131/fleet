@@ -86,7 +86,9 @@ fleet instance inspect web
 Every operation has an immutable ID, VM lifecycle revision, argv/file specification, assigned worker,
 phase and result manifest. The control plane commits intent first. The worker durably records an attempt
 before asking the guest backend to execute. Detached guest supervisors and local records allow recovery
-after worker/controller restarts. An uncertain attempt is reported as interrupted; Fleet never blindly
+after worker/controller restarts. A pending backend record whose supervisor has not attempted guest
+execution can safely resume launching, provided the VM lifecycle revision still matches. An uncertain
+attempt is reported as interrupted; Fleet never blindly
 reruns it. This is replay protection, not a guarantee that arbitrary guest side effects happen exactly once.
 Use `fleet retry REQUEST_ID` for an unknown client outcome; a new operation ID requests new work.
 
@@ -150,6 +152,7 @@ fleet-qualify managed-vm --fake --binary /absolute/fleet --home /tmp/fleet-contr
 
 The qualifier uses public APIs, separate control-plane/worker homes and explicit fixture VMs. It covers
 input replay, retained download capture, controller outage and worker restart, command deduplication,
+and recovery of a pending launch using a no-op launcher in a private fixture worker configuration,
 private connection setup, revocation, deletion and reclamation. The same workflow accepts real Tart
 `--instances` and `--image-cache` settings and checks that no guest listener appears on the host.
 Real runs require idle installed workloads and never upgrade or stop the normal Fleet service.
