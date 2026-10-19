@@ -393,10 +393,11 @@ pub fn run_controller(home: &Path, id: &str) -> Result<()> {
                 let _ = c.kill();
                 let _ = c.wait();
             }
-            if instance.record.desired == Desired::Stopped
-                && instance.record.revision > 1
-                && state.is_none()
-            {
+            if instance.record.desired == Desired::Stopped && instance.record.revision > 1 {
+                // An explicit stop must also succeed after clone succeeded but
+                // configuration failed. The VM is confirmed stopped (or absent)
+                // here; retrying provisioning would make cancellation depend on
+                // repairing the original invalid configuration.
                 observe(home, &instance, State::Stopped, None)?;
                 return Ok(false);
             }
