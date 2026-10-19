@@ -122,7 +122,10 @@ fn run() -> Result<()> {
             fs::create_dir(&vm)?;
             fs::write(vm.join("disk"), "initial")?;
         }
-        "set" => ensure!(root.join("vms").join(&args[1]).is_dir(), "missing VM"),
+        "set" => {
+            ensure!(root.join("vms").join(&args[1]).is_dir(), "missing VM");
+            ensure!(!root.join("fail-set").exists(), "invalid VM configuration");
+        }
         "run" => {
             if root.join("fail-run").exists() {
                 eprintln!("The maximum supported number of virtual machines has been reached.");

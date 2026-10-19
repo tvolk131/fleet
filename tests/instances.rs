@@ -160,6 +160,32 @@ fn stopped(f: &Fixture, id: &str, spec: Spec) {
 }
 
 #[test]
+fn failed_configuration_can_be_stopped_and_deleted_without_reprovisioning() {
+    let mut f = Fixture::new();
+    let tart = f.home.join("instance-tart");
+    fs::create_dir_all(&tart).unwrap();
+    fs::write(tart.join("fail-set"), "").unwrap();
+    f.create("broken");
+    f.controller("broken");
+    f.wait("broken", State::Failed);
+    assert!(tart.join("vms/fleet-broken/disk").is_file());
+    assert!(!f.home.join("instances/broken/provisioned.json").exists());
+
+    f.set("broken", Desired::Stopped);
+    f.wait("broken", State::Stopped);
+    f.set("broken", Desired::Deleted);
+    f.wait("broken", State::Deleted);
+    assert!(!tart.join("vms/fleet-broken").exists());
+    let history = fs::read_to_string(tart.join("history")).unwrap();
+    assert_eq!(history.lines().filter(|l| l.starts_with("set ")).count(), 1);
+    assert_eq!(
+        history.lines().filter(|l| l.starts_with("clone ")).count(),
+        1
+    );
+    assert!(!history.lines().any(|l| l.starts_with("run ")));
+}
+
+#[test]
 fn gpu_modes_default_to_exclusive_and_gate_shared_on_protocol_3_4() {
     use fleet::proto::{Protocol, Request, too_new};
     let legacy = serde_json::to_value(spec()).unwrap();
