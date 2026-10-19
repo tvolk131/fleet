@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, time::Duration};
 
 pub const WIRE: u32 = 1;
-pub const MIN: u32 = 3;
-pub const MAX: u32 = 4;
+pub const MIN: u32 = 4;
+pub const MAX: u32 = 5;
 
 /// Inspect before opening the real database for writes. An unclean redb file needs
 /// repair; repair a private scratch copy under the source lock, never the source.
@@ -202,7 +202,7 @@ pub fn spawn(
     tokio::spawn(async move {
         loop {
             let tick = async {
-                let state = store.state().await?;
+                let state = store.view().await?;
                 let Some(p) = &state.version.pending else {
                     return Ok::<_, anyhow::Error>(());
                 };

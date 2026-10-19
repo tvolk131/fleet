@@ -82,6 +82,9 @@ jobs:
         run: cargo test --workspace --all-features --locked --no-fail-fast -- --test-threads=2 2>&1 | tee rust-tests.log
       - name: Worker library without the optional control plane
         run: cargo check --no-default-features --lib --locked
+      - name: Million-receipt snapshot and restore qualification
+        if: runner.os == 'Linux'
+        run: cargo test --all-features --locked --test control indexed::indexed_million_receipts -- --ignored --nocapture --test-threads=1 2>&1 | tee indexed-scale.log
       - name: Clippy
         run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
       - name: Three-replica CLI/service failure scenarios

@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use super::discovery::save_cache;
 use super::membership::{MembershipView, spawn_reconciler};
-use super::{Command, Raft, Reply, Request, State, Store, TypeConfig, store::MAX_SNAPSHOT};
+use super::{Command, Raft, Reply, Request, State, Store, TypeConfig, store::snapshot::MAX_STREAM};
 
 pub const ALPN: &[u8] = b"fleet/control/rolling/1";
 const MAX_FRAME: usize = 8 << 20;
@@ -82,6 +82,7 @@ pub enum Message {
     Snapshot(InstallSnapshotRequest<TypeConfig>),
     Write(Box<Request>),
     Read,
+    Query(super::store::query::Query),
     /// Local diagnostics can be stale and never authorize worker action or a membership change.
     Inspect,
     TunnelRead {
@@ -132,6 +133,7 @@ pub enum Answer {
     Snapshot(Result<InstallSnapshotResponse<u64>, RaftError<u64, InstallSnapshotError>>),
     Write(Result<Reply, ApiError>),
     Read(Result<Box<State>, ApiError>),
+    Query(Result<serde_json::Value, ApiError>),
     Inspect(ReplicaStatus),
     TunnelRead(Result<super::tunnels::View, ApiError>),
     TunnelObserve(Result<Reply, ApiError>),
@@ -312,7 +314,7 @@ impl Network {
                         .await?,
                 );
             }
-            let generation = self.factory.store.state().await?.version.active;
+            let generation = self.factory.store.header().await?.version.active;
             Ok(exchange_generation(
                 self.connection.as_ref().expect("connected"),
                 &self.factory.cluster,
@@ -412,7 +414,7 @@ impl std::fmt::Debug for Handler {
 
 impl Handler {
     async fn peers(&self) -> Result<BTreeMap<u64, Peer>> {
-        let state = self.store.state().await?;
+        let state = self.store.header().await?;
         Ok(if state.membership.log_id().is_none() {
             self.config.peers.clone()
         } else {
@@ -449,7 +451,7 @@ impl Handler {
                     "replica traffic requires an unsupported cluster generation".into(),
                 );
             }
-            let state = match self.store.state().await {
+            let state = match self.store.view().await {
                 Ok(s) => s,
                 Err(e) => return Answer::Refused(e.to_string()),
             };
@@ -474,7 +476,7 @@ impl Handler {
                         leader: e.forward_to_leader().and_then(|f| f.leader_id),
                     }));
                 }
-                match self.store.state().await {
+                match self.store.view().await {
                     Ok(state) => Answer::TunnelStatus(Ok(state.tunnel_status(
                         &self.tunnel_presence,
                         self.raft.metrics().borrow().current_term,
@@ -490,7 +492,7 @@ impl Handler {
                         leader: e.forward_to_leader().and_then(|f| f.leader_id),
                     }));
                 }
-                let state = match self.store.state().await {
+                let state = match self.store.view().await {
                     Ok(s) => s,
                     Err(e) => return Answer::Refused(e.to_string()),
                 };
@@ -557,7 +559,7 @@ impl Handler {
                         leader: e.forward_to_leader().and_then(|f| f.leader_id),
                     }));
                 }
-                match self.store.state().await {
+                match self.store.view().await {
                     Ok(state) => Answer::TunnelRead(Ok(state.tunnel_view(&adapter, peer))),
                     Err(e) => Answer::Refused(e.to_string()),
                 }
@@ -567,7 +569,7 @@ impl Handler {
             }
             Message::Vote(rpc) if is_replica => Answer::Vote(self.raft.vote(rpc).await),
             Message::Snapshot(rpc) if is_replica => {
-                if rpc.offset.saturating_add(rpc.data.len() as u64) > MAX_SNAPSHOT as u64 {
+                if rpc.offset.saturating_add(rpc.data.len() as u64) > MAX_STREAM {
                     return Answer::Refused("snapshot exceeds lab limit".into());
                 }
                 Answer::Snapshot(self.raft.install_snapshot(rpc).await)
@@ -575,19 +577,19 @@ impl Handler {
             Message::Write(request)
                 if is_admin
                     || matches!(&request.mutation, super::Mutation::ReplicaPrepared {node, ..} if peers.get(node).is_some_and(|p|p.identity==peer))
-                    || matches!(&request.mutation, super::Mutation::VmReport(r) if self.store.state().await.ok().is_some_and(|s| s.vm_reporter(&peer.to_string(),r)))
-                    || matches!(&request.mutation, super::Mutation::HistoryReport(r) if self.store.state().await.ok().is_some_and(|s| s.history_reporter(&peer.to_string(),r)))
+                    || matches!(&request.mutation, super::Mutation::VmReport(r) if self.store.view().await.ok().is_some_and(|s| s.vm_reporter(&peer.to_string(),r)))
+                    || matches!(&request.mutation, super::Mutation::HistoryReport(r) if self.store.view().await.ok().is_some_and(|s| s.history_reporter(&peer.to_string(),r)))
                     || matches!(&request.mutation,
-                super::Mutation::WorkerReport(report) if self.store.state().await.ok().and_then(|s| s.workers.get(&report.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == report.incarnation))
-                    || matches!(&request.mutation, super::Mutation::ArtifactReady(ready) if self.store.state().await.ok().and_then(|s| ready.manifest.worker().and_then(|id| s.workers.get(id)).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == ready.incarnation))
-                    || matches!(&request.mutation, super::Mutation::ArtifactReport(report) if self.store.state().await.ok().is_some_and(|s| s.artifact_reporter(&peer.to_string(), &report.location, &report.incarnation)))
-                    || matches!(&request.mutation, super::Mutation::CheckpointReady(ready) if self.store.state().await.ok().and_then(|s| s.workers.get(&ready.checkpoint.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == ready.incarnation))
-                    || matches!(&request.mutation, super::Mutation::RecoverWorker(inventory) if self.store.state().await.ok().and_then(|s| s.workers.get(&inventory.registration.id).cloned()).is_some_and(|w| w.peer.identity == peer && w == inventory.registration)) =>
+                super::Mutation::WorkerReport(report) if self.store.view().await.ok().and_then(|s| s.workers.get(&report.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == report.incarnation))
+                    || matches!(&request.mutation, super::Mutation::ArtifactReady(ready) if self.store.view().await.ok().and_then(|s| ready.manifest.worker().and_then(|id| s.workers.get(id)).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == ready.incarnation))
+                    || matches!(&request.mutation, super::Mutation::ArtifactReport(report) if self.store.view().await.ok().is_some_and(|s| s.artifact_reporter(&peer.to_string(), &report.location, &report.incarnation)))
+                    || matches!(&request.mutation, super::Mutation::CheckpointReady(ready) if self.store.view().await.ok().and_then(|s| s.workers.get(&ready.checkpoint.worker).cloned()).is_some_and(|w| w.peer.identity == peer && w.incarnation == ready.incarnation))
+                    || matches!(&request.mutation, super::Mutation::RecoverWorker(inventory) if self.store.view().await.ok().and_then(|s| s.workers.get(&inventory.registration.id).cloned()).is_some_and(|w| w.peer.identity == peer && w == inventory.registration)) =>
             {
                 if request.id.is_empty() || request.id.len() > 512 {
                     return Answer::Refused("request ID must contain 1 to 512 bytes".into());
                 }
-                let state = match self.store.state().await {
+                let state = match self.store.view().await {
                     Ok(s) => s,
                     Err(e) => return Answer::Refused(e.to_string()),
                 };
@@ -618,7 +620,7 @@ impl Handler {
                         leader: e.forward_to_leader().and_then(|f| f.leader_id),
                     }));
                 }
-                let state = match self.store.state().await {
+                let state = match self.store.view().await {
                     Ok(s) => s,
                     Err(e) => {
                         return Answer::WorkerRead(Err(ApiError {
@@ -731,7 +733,7 @@ impl Handler {
                         leader: e.forward_to_leader().and_then(|f| f.leader_id),
                     }));
                 }
-                let state = match self.store.state().await {
+                let state = match self.store.view().await {
                     Ok(s) => s,
                     Err(e) => return Answer::Refused(e.to_string()),
                 };
@@ -773,7 +775,7 @@ impl Handler {
                         leader: e.forward_to_leader().and_then(|f| f.leader_id),
                     }));
                 }
-                let state = match self.store.state().await {
+                let state = match self.store.view().await {
                     Ok(s) => s,
                     Err(e) => return Answer::Refused(e.to_string()),
                 };
@@ -807,6 +809,27 @@ impl Handler {
                 });
                 Answer::AuthorizeArtifact(Ok(permitted))
             }
+            Message::Query(query) if is_admin => {
+                if let Err(e) = self.raft.ensure_linearizable().await {
+                    return Answer::Query(Err(ApiError {
+                        message: e.to_string(),
+                        leader: e.forward_to_leader().and_then(|f| f.leader_id),
+                    }));
+                }
+                match self.store.header().await {
+                    Ok(state) if state.version.active >= super::store::indexed::GENERATION => (),
+                    Ok(_) => {
+                        return Answer::Refused(
+                            "indexed queries require active generation 5".into(),
+                        );
+                    }
+                    Err(e) => return Answer::Refused(e.to_string()),
+                }
+                match self.store.query(query).await {
+                    Ok(value) => Answer::Query(Ok(value)),
+                    Err(e) => Answer::Refused(e.to_string()),
+                }
+            }
             Message::Read if is_admin => {
                 if let Err(e) = self.raft.ensure_linearizable().await {
                     return Answer::Read(Err(ApiError {
@@ -814,20 +837,14 @@ impl Handler {
                         leader: e.forward_to_leader().and_then(|f| f.leader_id),
                     }));
                 }
-                Answer::Read(
-                    self.store
-                        .state()
-                        .await
-                        .map(Box::new)
-                        .map_err(|e| ApiError {
-                            message: e.to_string(),
-                            leader: None,
-                        }),
-                )
+                match self.store.export(MAX_FRAME / 2).await {
+                    Ok(state) => Answer::Read(Ok(Box::new(state))),
+                    Err(e) => Answer::Refused(e.to_string()),
+                }
             }
             Message::Inspect if is_admin => {
                 let metrics = self.raft.metrics().borrow().clone();
-                let state = match self.store.state().await {
+                let state = match self.store.header().await {
                     Ok(state) => state,
                     Err(error) => return Answer::Refused(error.to_string()),
                 };
@@ -861,7 +878,7 @@ impl ProtocolHandler for Handler {
             && !self.config.administrators.contains(&peer)
             && !self
                 .store
-                .state()
+                .view()
                 .await
                 .map(|s| {
                     s.workers.values().any(|w| w.peer.identity == peer)
@@ -891,7 +908,7 @@ impl ProtocolHandler for Handler {
                     }
                     let bytes = serde_json::to_vec(&WireAnswer {
                         answer,
-                        discovery: handler.store.state().await?.routing_view(),
+                        discovery: handler.store.header().await?.routing_view(),
                     })?;
                     ensure!(bytes.len() <= MAX_FRAME, "response exceeds lab limit");
                     send.write_all(&bytes).await?;
@@ -954,7 +971,7 @@ impl Replica {
         Store::preflight(&home.join("control.redb"), &config.cluster, config.id)?;
         let endpoint = connect_endpoint(key, peer.address).await?;
         let store = Store::open(&home.join("control.redb"), &config.cluster, config.id)?;
-        if let Some(recorded) = store.state().await?.configuration.catalog.get(&config.id) {
+        if let Some(recorded) = store.view().await?.configuration.catalog.get(&config.id) {
             ensure!(
                 recorded == peer,
                 "configured replica differs from its durable identity"
@@ -1217,6 +1234,7 @@ impl Client {
                     Ok(Ok(
                         Answer::Write(Err(e))
                         | Answer::Read(Err(e))
+                        | Answer::Query(Err(e))
                         | Answer::WorkerRead(Err(e))
                         | Answer::StorageRead(Err(e))
                         | Answer::TunnelRead(Err(e))
@@ -1260,6 +1278,37 @@ impl Client {
         match self.call(Message::Read, deadline).await? {
             Answer::Read(Ok(state)) => Ok(*state),
             other => bail!("unexpected reply: {other:?}"),
+        }
+    }
+
+    pub async fn query(
+        &mut self,
+        query: super::store::query::Query,
+        deadline: Duration,
+    ) -> Result<serde_json::Value> {
+        match self.call(Message::Query(query), deadline).await? {
+            Answer::Query(Ok(value)) => Ok(value),
+            other => bail!("unexpected query reply: {other:?}"),
+        }
+    }
+
+    /// Inspect is only capability discovery; Query subsequently obtains a quorum read barrier.
+    pub async fn indexed_queries(&mut self, deadline: Duration) -> Result<bool> {
+        match self.call(Message::Inspect, deadline).await? {
+            Answer::Inspect(status) => {
+                Ok(status.version.active >= super::store::indexed::GENERATION)
+            }
+            other => bail!("unexpected inspect reply: {other:?}"),
+        }
+    }
+    pub async fn view(&mut self, deadline: Duration) -> Result<State> {
+        if self.indexed_queries(deadline).await? {
+            Ok(serde_json::from_value(
+                self.query(super::store::query::Query::View, deadline)
+                    .await?,
+            )?)
+        } else {
+            self.read(deadline).await
         }
     }
 

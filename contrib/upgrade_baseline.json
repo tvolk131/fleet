@@ -1,5 +1,5 @@
 {
-  "revision": "2c009f58dde89fc19ea3274949da1070417fb5df",
-  "generation": 3,
-  "description": "Previous 2..3 release, activated to generation three before installing the 3..4 managed VM candidate."
+  "revision": "75b446fb160dcd3371242af187814a0a0e1df76d",
+  "generation": 4,
+  "description": "Previous 3..4 release, activated to generation four before installing the 4..5 indexed metadata candidate."
 }

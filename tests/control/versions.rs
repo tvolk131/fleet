@@ -1,5 +1,13 @@
 use super::*;
 
+pub(super) fn snapshot_file(bytes: Vec<u8>) -> Box<tokio::fs::File> {
+    use std::io::{Seek, Write};
+    let mut file = fleet::control::store::snapshot::temporary().unwrap();
+    file.write_all(&bytes).unwrap();
+    file.rewind().unwrap();
+    Box::new(tokio::fs::File::from_std(file))
+}
+
 fn request(id: &str, mutation: Mutation) -> Request {
     Request {
         origin: "cluster".into(),
@@ -85,7 +93,7 @@ async fn unsupported_snapshot_and_startup_leave_original_bytes_unchanged() {
     future.version.active = fleet::control::version::MAX + 1;
     let bytes = serde_json::to_vec(&future).unwrap();
     snapshot.meta.snapshot_id = blake3::hash(&bytes).to_hex().to_string();
-    snapshot.snapshot = Box::new(std::io::Cursor::new(bytes));
+    snapshot.snapshot = snapshot_file(bytes);
     assert!(
         store
             .install_snapshot(&snapshot.meta, snapshot.snapshot)
@@ -101,7 +109,7 @@ async fn unsupported_snapshot_and_startup_leave_original_bytes_unchanged() {
     let mut meta = stale.meta.clone();
     meta.snapshot_id = blake3::hash(&bytes).to_hex().to_string();
     store
-        .install_snapshot(&meta, Box::new(std::io::Cursor::new(bytes)))
+        .install_snapshot(&meta, snapshot_file(bytes))
         .await
         .unwrap();
     assert!(

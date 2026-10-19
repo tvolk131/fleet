@@ -8,7 +8,9 @@ use instances::guest;
 
 pub(super) const FORMAT: u32 = 13;
 pub(super) fn supported(format: u32) -> bool {
-    format == super::super::FORMAT || format == FORMAT
+    format == super::super::FORMAT
+        || format == FORMAT
+        || format == super::super::store::indexed::FORMAT
 }
 pub(super) fn input_tag(id: &str) -> String {
     format!("vm-input/{}", blake3::hash(id.as_bytes()).to_hex())
@@ -211,7 +213,7 @@ impl Worker {
             .context("operation assignment missing")?;
         let mut failure = None;
         if !dir.join("operation.json").exists() {
-            if saved.vm_attempted.contains(&op.id) {
+            if self.journal.attempted(true, &op.id)? {
                 failure=Some("worker attempted this operation but backend records are missing; guest effects are unknown; not replayed".to_string());
             } else if a.revision != op.instance_revision || !a.desired.running() {
                 failure = Some("VM changed before execution; command was not started".to_string());
@@ -244,10 +246,7 @@ impl Worker {
                 {
                     return Ok(None);
                 }
-                self.journal.change(|s| {
-                    s.vm_attempted.insert(op.id.clone());
-                    Ok(())
-                })?;
+                self.journal.mark_attempted(true, &op.id, true)?;
                 let started = self
                     .agent
                     .handle(
@@ -279,10 +278,7 @@ impl Worker {
                     // The backend durably writes Pending before spawning its supervisor.
                     // Recover that launch gap only: inspect/start honor the supervisor lock
                     // and attempted marker, so uncertain guest effects are never replayed.
-                    self.journal.change(|s| {
-                        s.vm_attempted.insert(op.id.clone());
-                        Ok(())
-                    })?;
+                    self.journal.mark_attempted(true, &op.id, true)?;
                     self.agent
                         .handle(
                             self.config.registration.peer.identity,
@@ -430,7 +426,40 @@ mod tests {
         view.vm.operations.get_mut("once").unwrap().released = false;
         assert!(j.accept(view).is_err());
         assert!(j.read().unwrap().vm.operations["once"].released);
+        // Upgrade preserves both execution domains, then future marker writes avoid the journal.
+        let mut view = serde_json::from_value::<WorkerView>(json!({
+            "generation":5,"vm":j.read().unwrap().vm,"history":{},"artifacts":[],"stores":{},"cleanup_allowed":true,
+            "starts_allowed":true,"checkpoints":[],"resume_checkpoints":{},"recovery_required":false,
+            "held":[],"registration":cfg.registration,"assignments":[],"acknowledged":0
+        })).unwrap();
+        j.mark_attempted(false, "native-before", true).unwrap();
+        j.accept(view.clone()).unwrap();
+        assert_eq!(
+            j.read().unwrap().format,
+            crate::control::store::indexed::FORMAT
+        );
+        assert!(j.read().unwrap().vm_attempted.is_empty());
+        assert!(j.read().unwrap().attempted.is_empty());
+        j.mark_attempted(true, "after", true).unwrap();
+        j.mark_attempted(false, "not-published", true).unwrap();
+        j.mark_attempted(false, "not-published", false).unwrap();
+        view.generation = 4;
+        assert!(j.accept(view).is_err());
         drop(j);
+        let j = Journal::open(&home, &cfg, false).unwrap();
+        assert!(j.attempted(true, "once").unwrap());
+        assert!(j.attempted(true, "after").unwrap());
+        assert!(j.attempted(false, "native-before").unwrap());
+        assert!(!j.attempted(false, "not-published").unwrap());
+        assert!(!j.attempted(false, "once").unwrap());
+        drop(j);
+        {
+            let db = Database::open(home.join("worker.redb")).unwrap();
+            let tx = db.begin_write().unwrap();
+            tx.delete_table(EXECUTIONS).unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(Journal::open(&home, &cfg, false).is_err());
         std::fs::remove_dir_all(home).unwrap();
     }
 }

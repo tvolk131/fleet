@@ -210,7 +210,7 @@ impl State {
 async fn reconcile(raft: &Raft, store: &Store) -> Result<()> {
     raft.ensure_linearizable().await?;
     let leadership = raft.metrics().borrow().vote;
-    let state = store.state().await?;
+    let state = store.view().await?;
     let Some(id) = state.configuration.active else {
         return Ok(());
     };
@@ -258,7 +258,7 @@ async fn reconcile(raft: &Raft, store: &Store) -> Result<()> {
                     "leadership changed"
                 );
                 ensure!(
-                    store.state().await?.configuration.active.as_ref() == Some(&id),
+                    store.view().await?.configuration.active.as_ref() == Some(&id),
                     "operation already reconciled"
                 );
                 let barrier = if state.membership.membership().get_node(node).is_some() {
@@ -294,7 +294,7 @@ async fn reconcile(raft: &Raft, store: &Store) -> Result<()> {
         "leadership changed"
     );
     ensure!(
-        store.state().await?.configuration.active.as_ref() == Some(&id),
+        store.view().await?.configuration.active.as_ref() == Some(&id),
         "operation already reconciled"
     );
     // If a previous leader left joint consensus committed, this finishes that same transition.

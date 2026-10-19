@@ -3,7 +3,6 @@
 
 use std::{
     fmt::Debug,
-    io::Cursor,
     ops::RangeBounds,
     path::Path,
     sync::{
@@ -24,6 +23,10 @@ use redb::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{Entry, FORMAT, Reply, State, TypeConfig};
+
+pub mod indexed;
+pub mod query;
+pub mod snapshot;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
@@ -73,7 +76,8 @@ impl Store {
     ) -> Result<()> {
         if let Some(raw) = super::version::preflight(path, "meta")? {
             ensure!(
-                raw["identity"] == serde_json::json!([FORMAT, cluster, node]),
+                raw["identity"] == serde_json::json!([FORMAT, cluster, node])
+                    || raw["identity"] == serde_json::json!([indexed::FORMAT, cluster, node]),
                 "database identity or format mismatch; explicit baseline migration required"
             );
             let version: super::version::ClusterVersion =
@@ -125,8 +129,8 @@ impl Store {
         let table = tx.open_table(META)?;
         let identity: (u32, String, u64) =
             read(&table, "identity")?.context("missing controller identity")?;
-        if identity.0 == FORMAT {
-            let state: State = read(&table, "state")?.context("missing state")?;
+        if identity.0 == FORMAT || identity.0 == indexed::FORMAT {
+            let state = indexed::read_state(&tx, true)?;
             super::version::Software::current().require(state.version.required(identity.2))?;
             return Ok(state);
         }
@@ -201,10 +205,12 @@ impl Store {
         let table = tx.open_table(META)?;
         let identity: (u32, String, u64) = read(&table, "identity")?.context("missing identity")?;
         ensure!(
-            identity == (FORMAT, cluster.into(), node),
+            matches!(identity.0, FORMAT | indexed::FORMAT)
+                && identity.1 == cluster
+                && identity.2 == node,
             "source identity/format mismatch"
         );
-        let state: State = read(&table, "state")?.context("missing applied state")?;
+        let state = indexed::read_state(&tx, true)?;
         ensure!(
             state.format == FORMAT
                 && state.cluster == cluster
@@ -240,7 +246,15 @@ impl Store {
                         && state.membership.log_id().is_none(),
                     "invalid recovery seed"
                 );
-                put(&mut table, "state", &state)?;
+                if state.version.active >= indexed::GENERATION {
+                    let (_, cluster, node): (u32, String, u64) =
+                        read(&table, "identity")?.context("missing identity")?;
+                    put(&mut table, "identity", &(indexed::FORMAT, cluster, node))?;
+                    drop(table);
+                    indexed::persist(&tx, &state)?;
+                } else {
+                    put(&mut table, "state", &state)?;
+                }
             }
             tx.commit()?;
             Ok(())
@@ -275,7 +289,9 @@ impl Store {
                 read::<(u32, String, u64)>(&table, "identity")?
             {
                 ensure!(
-                    (version, old_cluster.as_str(), old_node) == (FORMAT, cluster, node),
+                    matches!(version, FORMAT | indexed::FORMAT)
+                        && old_cluster == cluster
+                        && old_node == node,
                     "database identity or format mismatch"
                 );
             } else {
@@ -325,9 +341,57 @@ impl Store {
     }
 
     pub async fn state(&self) -> Result<State, StorageError<u64>> {
+        self.blocking(false, |db| indexed::read_state(&db.begin_read()?, true))
+            .await
+    }
+
+    /// Current resources without permanent receipt history. Use `state` only for explicit exports.
+    pub async fn view(&self) -> Result<State, StorageError<u64>> {
+        self.blocking(false, |db| indexed::read_state(&db.begin_read()?, false))
+            .await
+    }
+
+    /// Version/membership/routing reads need no resource catalog or receipt history.
+    pub async fn header(&self) -> Result<State, StorageError<u64>> {
         self.blocking(false, |db| {
+            read(&db.begin_read()?.open_table(META)?, "state")?.context("missing state")
+        })
+        .await
+    }
+
+    /// Bound the legacy network export before allocating permanent receipt history. Offline
+    /// recovery deliberately uses `state` and is not subject to the network frame budget.
+    pub async fn export(&self, budget: usize) -> Result<State, StorageError<u64>> {
+        self.blocking(false, move |db| {
             let tx = db.begin_read()?;
-            read(&tx.open_table(META)?, "state")?.context("missing state")
+            let mut state = indexed::read_state(&tx, false)?;
+            let mut bytes = serde_json::to_vec(&state)?.len();
+            ensure!(
+                bytes <= budget,
+                "resource export exceeds network budget; use metadata pages"
+            );
+            let (format, _, _): (u32, String, u64) =
+                read(&tx.open_table(META)?, "identity")?.context("missing identity")?;
+            if format == indexed::FORMAT {
+                for row in tx.open_table(indexed::RECEIPTS)?.iter()? {
+                    let (key, value) = row?;
+                    bytes += serde_json::to_vec(key.value())?.len() + value.value().len() + 2;
+                    ensure!(
+                        bytes <= budget,
+                        "request history exceeds network budget; use metadata pages"
+                    );
+                    state
+                        .receipts
+                        .insert(key.value().into(), serde_json::from_slice(value.value())?);
+                }
+            } else {
+                state = indexed::read_state(&tx, true)?;
+                ensure!(
+                    serde_json::to_vec(&state)?.len() <= budget,
+                    "state export exceeds network budget; use metadata pages"
+                );
+            }
+            Ok(state)
         })
         .await
     }
@@ -469,7 +533,7 @@ impl RaftStateMachine<TypeConfig> for Store {
     async fn applied_state(
         &mut self,
     ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
-        let state = self.state().await?;
+        let state = self.view().await?;
         Ok((state.last_applied, state.membership))
     }
     async fn apply<I>(&mut self, entries: I) -> Result<Vec<Reply>, StorageError<u64>>
@@ -485,14 +549,42 @@ impl RaftStateMachine<TypeConfig> for Store {
                 let mut tx = db.begin_write()?;
                 tx.set_durability(Durability::Immediate)?;
                 let replies = {
-                    let mut table = tx.open_table(META)?;
+                    let table = tx.open_table(META)?;
                     let mut state: State = read(&table, "state")?.context("missing state")?;
+                    let (format, cluster, node): (u32, String, u64) =
+                        read(&table, "identity")?.context("missing identity")?;
+                    drop(table);
+                    let mut indexed = format == indexed::FORMAT;
+                    if indexed {
+                        state = indexed::hydrate(state, &tx.open_table(indexed::ROWS)?)?;
+                    }
                     let mut replies = Vec::new();
                     for entry in entries {
                         state.last_applied = Some(entry.log_id);
                         replies.push(match entry.payload {
                             EntryPayload::Normal(command) => {
-                                state.apply(command, entry.log_id.index)
+                                if indexed {
+                                    indexed::load_receipts(
+                                        &mut state,
+                                        &command,
+                                        &tx.open_table(indexed::RECEIPTS)?,
+                                    )?;
+                                }
+                                let reply = state.apply(command, entry.log_id.index);
+                                if indexed {
+                                    let mut receipts = tx.open_table(indexed::RECEIPTS)?;
+                                    for (key, receipt) in &state.receipts {
+                                        put(&mut receipts, key, receipt)?;
+                                    }
+                                    state.receipts.clear();
+                                } else if state.version.active >= indexed::GENERATION {
+                                    // Activation migrates all old receipts atomically. Later entries
+                                    // in this batch already use point lookups against the new table.
+                                    indexed::persist(&tx, &state)?;
+                                    state.receipts.clear();
+                                    indexed = true;
+                                }
+                                reply
                             }
                             EntryPayload::Membership(m) => {
                                 state
@@ -502,8 +594,7 @@ impl RaftStateMachine<TypeConfig> for Store {
                             EntryPayload::Blank => Reply::Recorded,
                         });
                     }
-                    let (_, _, node): (u32, String, u64) =
-                        read(&table, "identity")?.context("missing identity")?;
+                    let mut table = tx.open_table(META)?;
                     super::version::Software::current().require(state.version.required(node))?;
                     // Abort/activation and the local promise change in the same transaction.
                     let prepared: Option<(u64, u32)> = read(&table, "version_prepared")?;
@@ -513,7 +604,13 @@ impl RaftStateMachine<TypeConfig> for Store {
                     }) {
                         table.remove("version_prepared")?;
                     }
-                    put(&mut table, "state", &state)?;
+                    if indexed {
+                        put(&mut table, "identity", &(indexed::FORMAT, cluster, node))?;
+                        drop(table);
+                        indexed::persist(&tx, &state)?;
+                    } else {
+                        put(&mut table, "state", &state)?;
+                    }
                     replies
                 };
                 ensure!(
@@ -534,91 +631,32 @@ impl RaftStateMachine<TypeConfig> for Store {
     }
     async fn begin_receiving_snapshot(
         &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<u64>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+    ) -> Result<Box<tokio::fs::File>, StorageError<u64>> {
+        self.blocking(false, |_| {
+            Ok(Box::new(tokio::fs::File::from_std(snapshot::temporary()?)))
+        })
+        .await
     }
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<u64, BasicNode>,
-        snapshot: Box<Cursor<Vec<u8>>>,
+        mut snapshot: Box<tokio::fs::File>,
     ) -> Result<(), StorageError<u64>> {
+        use tokio::io::AsyncWriteExt;
+        snapshot
+            .flush()
+            .await
+            .map_err(|e| StorageIOError::write(&e))?;
+        let file = snapshot.into_std().await;
         let meta = meta.clone();
-        let data = snapshot.into_inner();
         let fail = self.fail_state_commit.clone();
-        self.blocking(true, move |db| {
-            ensure!(data.len() <= MAX_SNAPSHOT, "snapshot exceeds lab limit");
-            let state: State = serde_json::from_slice(&data)?;
-            ensure!(
-                state.format == FORMAT
-                    && state.last_applied == meta.last_log_id
-                    && state.membership == meta.last_membership,
-                "snapshot metadata mismatch"
-            );
-            ensure!(
-                meta.snapshot_id == snapshot_id(&data),
-                "snapshot digest mismatch"
-            );
-            let mut tx = db.begin_write()?;
-            tx.set_durability(Durability::Immediate)?;
-            {
-                let mut table = tx.open_table(META)?;
-                let (_, cluster, node): (u32, String, u64) =
-                    read(&table, "identity")?.context("missing identity")?;
-                ensure!(cluster == state.cluster, "snapshot cluster mismatch");
-                let old: State = read(&table, "state")?.context("missing state")?;
-                ensure!(
-                    state.version.active >= old.version.active
-                        && state.version.revision >= old.version.revision,
-                    "snapshot cannot roll back the cluster generation or upgrade revision"
-                );
-                super::version::Software::current().require(state.version.required(node))?;
-                // A snapshot carries committed readiness. Preserve any still-current local promise.
-                let prepared: Option<(u64, u32)> = read(&table, "version_prepared")?;
-                if prepared.is_some_and(|(r, t)| {
-                    state.version.revision != r
-                        || state.version.pending.as_ref().is_none_or(|p| p.target != t)
-                }) {
-                    table.remove("version_prepared")?;
-                }
-                put(&mut table, "state", &state)?;
-                put(
-                    &mut table,
-                    "snapshot",
-                    &SavedSnapshot {
-                        meta,
-                        hash: snapshot_id(&data),
-                        data,
-                    },
-                )?;
-            }
-            // State and snapshot switch atomically; local votes and logs are untouched.
-            ensure!(
-                !fail.swap(false, Ordering::SeqCst),
-                "injected snapshot commit failure"
-            );
-            tx.commit()?;
-            Ok(())
-        })
-        .await
+        self.blocking(true, move |db| snapshot::install(db, meta, file, &fail))
+            .await
     }
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<u64>> {
-        let saved: Option<SavedSnapshot> = self.meta("snapshot").await?;
-        saved
-            .map(|s| {
-                if s.hash != snapshot_id(&s.data) {
-                    return Err(StorageIOError::read(&std::io::Error::other(
-                        "snapshot digest mismatch",
-                    ))
-                    .into());
-                }
-                Ok(Snapshot {
-                    meta: s.meta,
-                    snapshot: Box::new(Cursor::new(s.data)),
-                })
-            })
-            .transpose()
+        self.blocking(false, snapshot::current).await
     }
 }
 
@@ -628,40 +666,9 @@ fn snapshot_id(data: &[u8]) -> String {
 
 impl RaftSnapshotBuilder<TypeConfig> for Store {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
-        // Hold the storage write gate across capture and publication so older builders cannot
-        // replace a newer installed snapshot. For this small lab, serialization is acceptable.
-        self.blocking(true, |db| {
-            let mut tx = db.begin_write()?;
-            tx.set_durability(Durability::Immediate)?;
-            let (meta, data) = {
-                let mut table = tx.open_table(META)?;
-                let state: State = read(&table, "state")?.context("missing state")?;
-                let data = serde_json::to_vec(&state)?;
-                ensure!(data.len() <= MAX_SNAPSHOT, "snapshot exceeds lab limit");
-                let hash = snapshot_id(&data);
-                let meta = SnapshotMeta {
-                    last_log_id: state.last_applied,
-                    last_membership: state.membership,
-                    snapshot_id: hash.clone(),
-                };
-                put(
-                    &mut table,
-                    "snapshot",
-                    &SavedSnapshot {
-                        meta: meta.clone(),
-                        hash,
-                        data: data.clone(),
-                    },
-                )?;
-                (meta, data)
-            };
-            tx.commit()?;
-            Ok(Snapshot {
-                meta,
-                snapshot: Box::new(Cursor::new(data)),
-            })
-        })
-        .await
+        // Capture through redb MVCC without blocking command application. Publication checks that
+        // it cannot replace a newer installed/built snapshot under redb's single writer lock.
+        self.blocking(false, snapshot::build).await
     }
 }
 

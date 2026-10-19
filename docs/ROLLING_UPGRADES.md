@@ -15,7 +15,7 @@ unchanged. Every mutation explicitly declares its minimum generation; ingress re
 must not be emitted early. A Raft/redb dependency or physical-layout change requires its own explicit
 compatibility qualification; this mechanism is not permission to silently change those contracts.
 
-The first qualified transition was generation 1 to 2. It exercises activation and the downgrade floor; it deliberately keeps existing job/storage semantics and schemas unchanged. The current release supports generations 3 and 4; activate generation 3 with the previous release before installing it. Generation 3 enables the [service tunnel catalog](SERVICE_TUNNELS.md). Its commands cannot enter Raft before every current member has installed and durably prepared a capable executable.
+The first qualified transition was generation 1 to 2. It exercises activation and the downgrade floor; it deliberately keeps existing job/storage semantics and schemas unchanged. The current release supports generations 4 and 5; activate generation 4 with the previous release before installing it. Generation 3 enabled the [service tunnel catalog](SERVICE_TUNNELS.md). Future-generation commands cannot enter Raft before every current member has installed and durably prepared a capable executable.
 Old baseline workers, supervisors, storage agents and clients may continue serving during replica
 replacement. Future workload features must gate dispatch on the required agent capabilities.
 
@@ -26,7 +26,7 @@ replacement. Future workload features must gate dispatch on the required agent c
    the leader last. A leader election may temporarily delay requests; clients retry with saved IDs.
    Fleet does not download binaries, change OS services, or automatically restart other machines.
 3. Once the desired binaries are installed, run
-   `fleet upgrade prepare 4 --revision REVISION --request-id upgrade-prepare`. The actual revision is shown
+   `fleet upgrade prepare 5 --revision REVISION --request-id upgrade-prepare`. The actual revision is shown
    by `fleet versions`. This commits a pending operation and freezes membership changes. Preparation
    can wait for an offline/older member; normal jobs, storage transfers and other requests continue.
 4. Every current replica, including learners, writes a durable local preparation promise before
@@ -79,3 +79,8 @@ not a claim to have tested an unreleased product. Run these scenarios on Linux a
 Generation 4 enables [managed persistent VM operations and network connections](MANAGED_VMS.md).
 Its workers persist format 13 when accepting generation 4; the older worker refuses to reopen it.
 Controller physical format remains 12. Upgrade qualified worker binaries before using the new feature.
+
+Generation 5 activates [indexed permanent metadata](INDEXED_METADATA.md), controller physical format
+14 and indexed worker execution markers. It preserves request identity and replay semantics. The
+previous snapshot/state layout remains intact until activation; post-activation snapshots stream
+records through disk-backed files. The current release baseline is the shipped generation-4 release.

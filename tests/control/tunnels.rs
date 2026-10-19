@@ -329,30 +329,9 @@ async fn wait_reports_failure_timeout_success_scope_and_supersession_without_mut
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tunnel_catalog_is_gated_replicated_and_not_writable_by_adapters() {
+async fn tunnel_catalog_is_replicated_and_not_writable_by_adapters() {
     let mut c = Cluster::new(3).await;
-    let request = Request {
-        origin: "cluster".into(),
-        id: "too-early-managed-vm".into(),
-        mutation: Mutation::Vm(fleet::control::vm::Action::Sweep { as_of: 1 }),
-    };
-    assert!(
-        c.client
-            .write(request.clone(), WAIT)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("inactive")
-    );
-    assert!(
-        !c.client
-            .read(WAIT)
-            .await
-            .unwrap()
-            .receipts
-            .values()
-            .any(|r| r.command.as_ref().is_some_and(|v| v.get("Vm").is_some()))
-    );
+    // VM/tunnel behavior is already active at this release's generation-four floor.
     activate(&mut c).await;
     let adapter = descriptor(&c, "test-adapter").await;
     let t = Topology {
