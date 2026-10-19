@@ -169,7 +169,10 @@ pub fn run(a: tart::Options) -> Result<()> {
         |v| v["version"]["active"] == fleet::control::version::MIN,
         30,
     )?;
-    super::rolling::activate_to(&l, fleet::control::tunnels::GENERATION)?;
+    super::rolling::activate_to(
+        &l,
+        fleet::control::tunnels::GENERATION.max(fleet::control::version::MIN),
+    )?;
     let mut settings = tart::settings(&l, &a)?;
     settings["memory_budget_mb"] = if a.fake { 4096 } else { 8192 }.into();
     // Fake VMs allocate no RAM. Separate small logical workers let CI exercise

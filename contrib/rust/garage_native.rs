@@ -143,7 +143,10 @@ pub fn run(options: Options) -> Result<()> {
         |v| v["version"]["active"] == fleet::control::version::MIN,
         30,
     )?;
-    super::rolling::activate_to(&l, fleet::control::tunnels::GENERATION)?;
+    super::rolling::activate_to(
+        &l,
+        fleet::control::tunnels::GENERATION.max(fleet::control::version::MIN),
+    )?;
     let mut topology = json!({"adapters":{},"services":{"s3":{"owner":"storage","target":s3,"allowed":["client"]}},"routes":[{"adapter":"client","service":"s3","listen":listen}]});
     for id in ["storage", "client"] {
         save(
