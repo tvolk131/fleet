@@ -54,6 +54,93 @@ async fn queued(c: &mut Cluster, workload: Workload) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_attempt_retries_checkpoint_import_after_transient_failure_and_restart() {
+    let mut c = Cluster::new(1).await;
+    let (home, config) = prepare(&mut c, true).await;
+    let mut w = Worker::start(&home, config.clone(), hello()).await.unwrap();
+    assert!(matches!(
+        c.client
+            .write(assign("final-capture", resumable()), WAIT)
+            .await
+            .unwrap(),
+        Reply::Accepted { .. }
+    ));
+    desire(
+        &mut c,
+        "final-capture",
+        1,
+        Desired::Job(JobDesired::Cancelled),
+    )
+    .await;
+    let attempt = wait(
+        &mut c,
+        &mut w,
+        "final-capture",
+        WorkPhase::Job(AttemptPhase::Cancelled),
+    )
+    .await;
+    let dir = home.join("backend/jobs").join(&attempt.execution);
+    // A sealed capture exists, but its payload is temporarily unavailable when the terminal
+    // observation is already durable. Checkpoint import must remain retryable after completion.
+    let input = c.home.0.join("sealed-state");
+    std::fs::write(&input, b"7").unwrap();
+    let hash = fleet::blobs::hash_file(&input).unwrap();
+    let manifest = fleet::checkpoint::Manifest {
+        version: 1,
+        position: Some(7),
+        files: BTreeMap::from([(
+            "state".into(),
+            fleet::checkpoint::File {
+                size: 1,
+                sha256: fleet::instances::guest::sha256(&input).unwrap(),
+            },
+        )]),
+    };
+    let source = "cp/final/fleet.json";
+    let captured = fleet::checkpoint::Captured {
+        id: manifest.id(source).unwrap(),
+        source: source.into(),
+        manifest,
+        files: vec![jobs::OutputFile {
+            path: "state".into(),
+            hash,
+            size: 1,
+        }],
+        captured_at: jobs::now(),
+    };
+    captured.validate().unwrap();
+    instances::write(
+        &dir.join("vm-checkpoints.json"),
+        &serde_json::json!({
+            "generation":1,"transferred":1,"charged":[],"captured":{captured.id.clone():captured}
+        }),
+    )
+    .unwrap();
+    w.tick().await.unwrap();
+    assert!(c.client.read(WAIT).await.unwrap().checkpoints.is_empty());
+    w.shutdown().await.unwrap();
+    let files = fleet::vm_job::checkpoint_files_dir(&dir, &captured.id).unwrap();
+    std::fs::create_dir_all(&files).unwrap();
+    std::fs::copy(&input, files.join("state")).unwrap();
+    let mut w = Worker::start(&home, config, hello()).await.unwrap();
+    w.tick().await.unwrap();
+    let state = c.client.read(WAIT).await.unwrap();
+    assert_eq!(
+        state.checkpoints.len(),
+        1,
+        "terminal attempts must still retry sealed checkpoint import"
+    );
+    assert_eq!(state.checkpoints.values().next().unwrap().content, captured);
+    assert!(state.assignments["final-capture"].terminal());
+    assert!(matches!(
+        w.store.blobs().status(hash).await.unwrap(),
+        iroh_blobs::api::blobs::BlobStatus::Complete { size: 1 }
+    ));
+    w.shutdown().await.unwrap();
+    c.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn verified_checkpoint_survives_vm_deletion_worker_restart_and_leader_loss() {
     let mut c = Cluster::new(3).await;
     let (home, config) = prepare(&mut c, true).await;

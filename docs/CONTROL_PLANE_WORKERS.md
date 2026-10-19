@@ -61,11 +61,12 @@ snapshot. Workers keep their last accepted image across restart and discard inco
 Emergency authority rebinding clears the delivery cursor while preserving execution markers and the
 existing explicit recovery inventory/hold protocol. Request receipts do not depend on delivery-cache retention.
 
-The wire and per-tick work are bounded; complete projections and transfer bodies still occupy memory
+Wire pages and the synchronization exchange count per tick are bounded; complete projections and transfer bodies still occupy memory
 proportional to resource history. Projection construction, local journal reads and archival scans still
 hydrate resource metadata. This is not incremental database hydration or removal of historical records.
-Finished execution is excluded from repeated backend reconciliation once its terminal observation is
-durable locally. Artifact/history publication and reclamation continue separately.
+The existing backend reconciler short-circuits finished execution once its terminal observation is
+durable locally. Checkpoint import must still retry for those attempts; artifact/history publication
+and reclamation also continue independently of execution completion.
 
 ### Diagnostic delivery
 

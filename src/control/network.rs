@@ -1304,6 +1304,10 @@ impl Client {
     pub async fn call(&mut self, message: Message, deadline: Duration) -> Result<Answer> {
         let start = tokio::time::Instant::now();
         let mut last_error = String::new();
+        // Probe every replica quickly first, but don't perpetually cancel a valid slow request
+        // after one second. Later rounds allow more time, bounded by the caller's total deadline
+        // and the server's receive + ordinary operation budgets. Retries retain the same request.
+        let mut attempt_timeout = Duration::from_secs(1);
         while start.elapsed() < deadline {
             let mut ids: Vec<_> = self.peers.keys().copied().collect();
             // Try authenticated current members before fallback bootstrap seeds. After a restart,
@@ -1324,7 +1328,7 @@ impl Client {
                 if remaining.is_zero() {
                     break;
                 }
-                let result = tokio::time::timeout(remaining.min(Duration::from_secs(1)), async {
+                let result = tokio::time::timeout(remaining.min(attempt_timeout), async {
                     if self
                         .connections
                         .get(&id)
@@ -1370,6 +1374,7 @@ impl Client {
                     }
                 }
             }
+            attempt_timeout = (attempt_timeout * 2).min(Duration::from_secs(10));
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
         if matches!(message, Message::Write(_)) {
@@ -1447,6 +1452,81 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct SlowAnswer {
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ProtocolHandler for SlowAnswer {
+        async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+            while let Ok((mut send, mut receive)) = connection.accept_bi().await {
+                if receive.read_to_end(MAX_FRAME).await.is_err() {
+                    continue;
+                }
+                self.requests.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(1250)).await;
+                let answer = WireAnswer {
+                    answer: Answer::Write(Ok(Reply::Recorded)),
+                    discovery: State::new("slow-client".into()).routing_view(),
+                };
+                let _ = send.write_all(&serde_json::to_vec(&answer).unwrap()).await;
+                let _ = send.finish();
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_requests_make_progress_without_abandoning_the_overall_deadline() {
+        let endpoint = connect_endpoint(SecretKey::generate(), "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let peer = Peer {
+            identity: endpoint.id(),
+            address: endpoint.bound_sockets().into_iter().next().unwrap(),
+        };
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let router = Router::builder(endpoint)
+            .accept(
+                ALPN,
+                SlowAnswer {
+                    requests: requests.clone(),
+                },
+            )
+            .spawn();
+        let mut client = Client::new(
+            SecretKey::generate(),
+            "slow-client".into(),
+            BTreeMap::from([(1, peer)]),
+        )
+        .await
+        .unwrap();
+        let request = Request {
+            origin: "slow-client".into(),
+            id: "same-request".into(),
+            mutation: super::super::Mutation::Release {
+                request_id: "old".into(),
+            },
+        };
+        assert_eq!(
+            client
+                .write(request.clone(), Duration::from_secs(10))
+                .await
+                .unwrap(),
+            Reply::Recorded
+        );
+        assert!(requests.load(Ordering::SeqCst) >= 2);
+        let start = tokio::time::Instant::now();
+        let error = client
+            .write(request, Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("mutation outcome is unknown"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        client.endpoint.close().await;
+        router.shutdown().await.unwrap();
+    }
 
     #[derive(Debug)]
     struct HoldConnection;

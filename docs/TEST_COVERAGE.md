@@ -55,6 +55,9 @@ pagination, bounded deltas, base eviction, replica-cache loss, worker restart, c
 cursor rollback and atomic cursor/intent persistence. They also exercise a persisted legacy poisoned
 outbox through the actual worker on three local replicas. `tests/control/lifecycle_hardening.rs` verifies
 shared portable-input/reserved-path admission and immutable rejection/correction receipts through redb
-reopen. Existing native/Tart, checkpoint, storage, recovery and membership scenarios run through the same
+reopen. A terminal-attempt regression verifies sealed checkpoint import retries after transient failure
+and worker restart. The client transport test verifies that responses taking longer than the initial
+one-second replica probe can succeed while a short overall deadline still returns an unknown mutation
+outcome. Existing native/Tart, checkpoint, storage, recovery and membership scenarios run through the same
 new worker synchronization path. Fixtures use independent temporary homes; they do not open installed
 Fleet state or existing training runs.

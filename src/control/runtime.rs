@@ -946,15 +946,6 @@ impl Worker {
             return Ok(());
         }
         for a in journal.assignments.values() {
-            // Retain the historical record and execution fence, but don't repeatedly reconcile
-            // finished execution. Artifact/history publication and reclamation run separately.
-            if journal
-                .observations
-                .get(&a.id)
-                .is_some_and(|(revision, o)| *revision == a.revision && o.phase.terminal())
-            {
-                continue;
-            }
             if journal.held.contains(&a.id) || (!journal.starts_allowed && a.desired.running()) {
                 // Detached supervisors continue; this agent cannot initiate new Running effects
                 // until it has durably observed the administrator's recovery resume.
@@ -967,6 +958,8 @@ impl Worker {
                     detail: Some(format!("{e:#}").chars().take(1000).collect()),
                 },
             };
+            // reconcile() already short-circuits terminal execution. Sealed checkpoint import
+            // must still retry: a transient failure can coincide with the terminal observation.
             if let Err(e) = self.persist_checkpoints(a).await {
                 tracing::warn!(attempt=%a.id,error=%e,"checkpoint remains unavailable");
             }
