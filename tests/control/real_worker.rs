@@ -523,7 +523,8 @@ async fn enrolled_worker_cannot_submit_jobs_or_impersonate_another_journal() {
     let response = w
         .client
         .call(
-            Message::WorkerRead {
+            Message::WorkerSync {
+                request: fleet::control::worker_sync::Request::Poll { cursor: None },
                 worker: config.registration.id.clone(),
                 incarnation: "wrong".into(),
             },
@@ -541,7 +542,8 @@ async fn enrolled_worker_cannot_submit_jobs_or_impersonate_another_journal() {
     assert!(
         impostor
             .call(
-                Message::WorkerRead {
+                Message::WorkerSync {
+                    request: fleet::control::worker_sync::Request::Poll { cursor: None },
                     worker: config.registration.id.clone(),
                     incarnation: config.registration.incarnation.clone()
                 },
@@ -1150,3 +1152,6 @@ mod history;
 
 #[path = "storage_lifecycle.rs"]
 mod storage_lifecycle;
+
+#[path = "bounded_sync.rs"]
+mod bounded_sync;

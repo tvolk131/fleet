@@ -103,63 +103,66 @@ pub type Presence = Arc<Mutex<BTreeMap<String, Instant>>>;
 
 impl State {
     pub fn enqueue(&mut self, s: &Submission, index: u64) -> Reply {
-        let check = || -> Result<()> {
-            crate::instances::valid_id(&s.id)?;
-            ensure!(s.id.len() <= 48, "job ID must be at most 48 bytes");
-            ensure!(
-                !self.jobs.contains_key(&s.id) && !self.assignments.contains_key(&s.id),
-                "job ID already used"
-            );
-            let Workload::Job {
-                spec, memory_mb, ..
-            } = &s.workload
-            else {
-                anyhow::bail!("queue accepts jobs only")
-            };
-            spec.validate()?;
-            super::portable::validate_inputs(&s.id, &s.workload, s.inputs.as_ref())?;
-            if s.inputs.is_some() {
-                ensure!(
-                    !self.storage.policy.inputs.is_empty(),
-                    "configure input storage targets before submitting portable jobs"
-                );
-            }
-            ensure!(
-                !spec
-                    .inputs
-                    .keys()
-                    .any(|p| p == crate::checkpoint::INPUT_ROOT
-                        || p.starts_with(&format!("{}/", crate::checkpoint::INPUT_ROOT))),
-                "input path reserved for checkpoint staging"
-            );
-            ensure!(
-                spec.resume.is_none() && spec.preempt.is_none(),
-                "legacy checkpoint continuation and preemption are not supported"
-            );
-            ensure!(
-                spec.vm.is_some() || *memory_mb > 0,
-                "native memory reservation required"
-            );
-            if let Some(w) = &s.worker {
-                ensure!(self.workers.contains_key(w), "unknown target worker");
-            }
-            ensure!(
-                s.after.iter().all(|id| self.jobs.contains_key(id)),
-                "dependencies must refer to existing logical jobs"
-            );
-            Ok(())
+        let job = match self.admit_submission(s, index) {
+            Ok(job) => job,
+            Err(error) => return Reply::rejected(&error.to_string()),
         };
-        if let Err(e) = check() {
-            return Reply::rejected(&e.to_string());
-        }
         if let Some(m) = &s.inputs {
             self.register_artifact(m.clone());
         }
-        self.jobs.insert(s.id.clone(), s.job(index));
+        self.jobs.insert(s.id.clone(), job);
         Reply::Accepted {
             job: s.id.clone(),
             revision: 1,
         }
+    }
+
+    /// Every job construction path shares admission, including targeted administrative jobs.
+    pub(crate) fn admit_submission(&self, s: &Submission, index: u64) -> Result<Job> {
+        crate::instances::valid_id(&s.id)?;
+        ensure!(s.id.len() <= 48, "job ID must be at most 48 bytes");
+        ensure!(
+            !self.jobs.contains_key(&s.id) && !self.assignments.contains_key(&s.id),
+            "job ID already used"
+        );
+        let Workload::Job {
+            spec, memory_mb, ..
+        } = &s.workload
+        else {
+            anyhow::bail!("queue accepts jobs only")
+        };
+        spec.validate()?;
+        super::portable::validate_inputs(&s.id, &s.workload, s.inputs.as_ref())?;
+        if s.inputs.is_some() {
+            ensure!(
+                !self.storage.policy.inputs.is_empty(),
+                "configure input storage targets before submitting portable jobs"
+            );
+        }
+        ensure!(
+            !spec
+                .inputs
+                .keys()
+                .any(|p| p == crate::checkpoint::INPUT_ROOT
+                    || p.starts_with(&format!("{}/", crate::checkpoint::INPUT_ROOT))),
+            "input path reserved for checkpoint staging"
+        );
+        ensure!(
+            spec.resume.is_none() && spec.preempt.is_none(),
+            "legacy checkpoint continuation and preemption are not supported"
+        );
+        ensure!(
+            spec.vm.is_some() || *memory_mb > 0,
+            "native memory reservation required"
+        );
+        if let Some(w) = &s.worker {
+            ensure!(self.workers.contains_key(w), "unknown target worker");
+        }
+        ensure!(
+            s.after.iter().all(|id| self.jobs.contains_key(id)),
+            "dependencies must refer to existing logical jobs"
+        );
+        Ok(s.job(index))
     }
     pub fn current_attempt(&self, id: &str) -> Option<&Assignment> {
         self.jobs.get(id)?.current(self)

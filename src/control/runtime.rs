@@ -26,6 +26,8 @@ use std::{
 mod artifacts;
 mod history;
 mod reclaim;
+#[cfg(test)]
+mod sync_tests;
 mod vm;
 
 pub const DATA_ALPN: &[u8] = b"fleet/baseline/worker-data/1";
@@ -180,6 +182,40 @@ impl Journal {
         )?)
     }
     fn change(&self, f: impl FnOnce(&mut JournalState) -> Result<()>) -> Result<()> {
+        self.change_with_sync(f, None)
+    }
+    fn read_sync(&self) -> Result<Option<super::worker_sync::Saved>> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(JOURNAL)?;
+        table
+            .get("sync")?
+            .map(|v| serde_json::from_slice(v.value()).map_err(Into::into))
+            .transpose()
+    }
+    fn sync_pending(&self) -> Result<bool> {
+        Ok(self
+            .db
+            .begin_read()?
+            .open_table(JOURNAL)?
+            .get("sync_pending")?
+            .is_some())
+    }
+    fn begin_sync(&self) -> Result<()> {
+        if self.sync_pending()? {
+            return Ok(());
+        }
+        let mut tx = self.db.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        tx.open_table(JOURNAL)?
+            .insert("sync_pending", b"true".as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+    fn change_with_sync(
+        &self,
+        f: impl FnOnce(&mut JournalState) -> Result<()>,
+        sync: Option<Option<&super::worker_sync::Saved>>,
+    ) -> Result<()> {
         let mut tx = self.db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         {
@@ -188,6 +224,14 @@ impl Journal {
                 serde_json::from_slice(table.get("state")?.context("missing journal")?.value())?;
             f(&mut state)?;
             table.insert("state", serde_json::to_vec(&state)?.as_slice())?;
+            if let Some(sync) = sync {
+                table.remove("sync_pending")?;
+                if let Some(saved) = sync {
+                    table.insert("sync", serde_json::to_vec(saved)?.as_slice())?;
+                } else {
+                    table.remove("sync")?;
+                }
+            }
         }
         tx.commit()?;
         Ok(())
@@ -213,95 +257,103 @@ impl Journal {
         tx.commit()?;
         Ok(())
     }
-    fn accept(&self, view: WorkerView) -> Result<()> {
-        self.change(|s| {
-            ensure!(
-                view.registration == s.registration,
-                "enrollment differs from local worker configuration"
-            );
-            ensure!(
-                view.acknowledged >= s.acknowledged && view.acknowledged <= s.sequence,
-                "controller/worker journal rollback detected"
-            );
-            ensure!(
-                view.generation >= s.generation,
-                "controller generation regressed"
-            );
-            ensure!(
-                view.generation <= super::version::MAX,
-                "worker does not support controller generation"
-            );
-            for (id, old) in &s.vm.operations {
-                let new = view
-                    .vm
-                    .operations
-                    .get(id)
-                    .context("controller lost an accepted VM operation")?;
+    fn accept(&self, view: WorkerView, sync: Option<&super::worker_sync::Saved>) -> Result<()> {
+        self.change_with_sync(
+            |s| {
                 ensure!(
-                    new.spec == old.spec
-                        && new.ordinal == old.ordinal
-                        && new.instance == old.instance
-                        && new.execution == old.execution
-                        && new.instance_revision == old.instance_revision
-                        && new.worker == old.worker
-                        && new.incarnation == old.incarnation
-                        && new.retention_seconds == old.retention_seconds
-                        && (!old.released || new.released)
-                        && (!old.reclaimed || new.reclaimed)
-                        && (!old.outcome.phase.terminal() || new.outcome == old.outcome)
-                        && (new.revision != old.revision
-                            || (new.outcome == old.outcome && new.released == old.released))
-                        && new.revision >= old.revision,
-                    "VM operation changed or regressed"
-                );
-            }
-            s.vm = view.vm;
-            s.generation = view.generation;
-            for old in s.assignments.values() {
-                let new = view
-                    .assignments
-                    .iter()
-                    .find(|a| a.id == old.id)
-                    .context("controller lost an accepted assignment")?;
-                ensure!(
-                    new.execution == old.execution
-                        && new.worker == old.worker
-                        && new.workload == old.workload
-                        && new.attempt == old.attempt
-                        && new.revision >= old.revision,
-                    "accepted assignment changed or regressed"
+                    view.registration == s.registration,
+                    "enrollment differs from local worker configuration"
                 );
                 ensure!(
-                    new.revision != old.revision
-                        || (new.desired == old.desired
-                            && new.suspend_checkpoint == old.suspend_checkpoint),
-                    "same revision changed intent"
+                    view.acknowledged >= s.acknowledged && view.acknowledged <= s.sequence,
+                    "controller/worker journal rollback detected"
                 );
-            }
-            for a in view.assignments {
-                ensure!(a.worker == s.registration.id, "wrong assigned worker");
-                a.validate(&s.registration)?;
-                s.assignments.insert(a.id.clone(), a);
-            }
-            ensure!(!view.recovery_required, "worker recovery has not committed");
-            for (id, cp) in view.resume_checkpoints {
-                cp.content.validate()?;
                 ensure!(
-                    s.checkpoints.get(&id).is_none_or(|old| old == &cp),
-                    "resume checkpoint changed"
+                    view.generation >= s.generation,
+                    "controller generation regressed"
                 );
-                s.checkpoints.insert(id, cp);
-            }
-            s.known_checkpoints = view.checkpoints;
-            s.held = view.held;
-            s.starts_allowed = view.starts_allowed;
-            s.recovery_inventory = None;
-            s.acknowledged = view.acknowledged;
-            s.outbox.retain(|seq, _| *seq > s.acknowledged);
-            Ok(())
-        })
+                ensure!(
+                    view.generation <= super::version::MAX,
+                    "worker does not support controller generation"
+                );
+                for (id, old) in &s.vm.operations {
+                    let new = view
+                        .vm
+                        .operations
+                        .get(id)
+                        .context("controller lost an accepted VM operation")?;
+                    ensure!(
+                        new.spec == old.spec
+                            && new.ordinal == old.ordinal
+                            && new.instance == old.instance
+                            && new.execution == old.execution
+                            && new.instance_revision == old.instance_revision
+                            && new.worker == old.worker
+                            && new.incarnation == old.incarnation
+                            && new.retention_seconds == old.retention_seconds
+                            && (!old.released || new.released)
+                            && (!old.reclaimed || new.reclaimed)
+                            && (!old.outcome.phase.terminal() || new.outcome == old.outcome)
+                            && (new.revision != old.revision
+                                || (new.outcome == old.outcome && new.released == old.released))
+                            && new.revision >= old.revision,
+                        "VM operation changed or regressed"
+                    );
+                }
+                s.vm = view.vm;
+                s.generation = view.generation;
+                for old in s.assignments.values() {
+                    let new = view
+                        .assignments
+                        .iter()
+                        .find(|a| a.id == old.id)
+                        .context("controller lost an accepted assignment")?;
+                    ensure!(
+                        new.execution == old.execution
+                            && new.worker == old.worker
+                            && new.workload == old.workload
+                            && new.attempt == old.attempt
+                            && new.revision >= old.revision,
+                        "accepted assignment changed or regressed"
+                    );
+                    ensure!(
+                        new.revision != old.revision
+                            || (new.desired == old.desired
+                                && new.suspend_checkpoint == old.suspend_checkpoint),
+                        "same revision changed intent"
+                    );
+                }
+                for a in view.assignments {
+                    ensure!(a.worker == s.registration.id, "wrong assigned worker");
+                    a.validate(&s.registration)?;
+                    s.assignments.insert(a.id.clone(), a);
+                }
+                ensure!(!view.recovery_required, "worker recovery has not committed");
+                for (id, cp) in view.resume_checkpoints {
+                    cp.content.validate()?;
+                    ensure!(
+                        s.checkpoints.get(&id).is_none_or(|old| old == &cp),
+                        "resume checkpoint changed"
+                    );
+                    s.checkpoints.insert(id, cp);
+                }
+                s.known_checkpoints = view.checkpoints;
+                s.held = view.held;
+                s.starts_allowed = view.starts_allowed;
+                s.recovery_inventory = None;
+                s.acknowledged = view.acknowledged;
+                s.outbox.retain(|seq, _| *seq > s.acknowledged);
+                Ok(())
+            },
+            sync.map(Some),
+        )
     }
-    fn observe(&self, a: &Assignment, observation: Observation) -> Result<()> {
+    fn observe(&self, a: &Assignment, mut observation: Observation) -> Result<()> {
+        ensure!(
+            a.workload.accepts_phase(observation.phase),
+            "backend observation lifecycle does not match assignment"
+        );
+        observation.normalize();
         let old = self.read()?;
         if old.observations.get(&a.id) == Some(&(a.revision, observation.clone())) {
             return Ok(());
@@ -507,6 +559,7 @@ pub async fn data_call(
 }
 
 pub struct Worker {
+    sync: super::worker_sync::Receiver,
     reclamation: blobs::Reclamation,
     pub config: WorkerConfig,
     pub home: PathBuf,
@@ -633,32 +686,35 @@ impl Worker {
                     && vm::supported(old.format),
                 "worker journal/config identity mismatch"
             );
-            journal.change(|s| {
-                s.cluster = manifest.plan.config.cluster.clone();
-                s.starts_allowed = false;
-                s.vm = Default::default();
-                s.generation = 0;
-                s.recovery_binding = Some(manifest.clone());
-                let mut assignments = s.assignments.clone();
-                for (id, a) in &mut assignments {
-                    if let Some(observation) = s.observations.get(id) {
-                        a.observed = Some(observation.clone());
+            journal.change_with_sync(
+                |s| {
+                    s.cluster = manifest.plan.config.cluster.clone();
+                    s.starts_allowed = false;
+                    s.vm = Default::default();
+                    s.generation = 0;
+                    s.recovery_binding = Some(manifest.clone());
+                    let mut assignments = s.assignments.clone();
+                    for (id, a) in &mut assignments {
+                        if let Some(observation) = s.observations.get(id) {
+                            a.observed = Some(observation.clone());
+                        }
                     }
-                }
-                s.recovery_inventory = Some(super::recovery::Inventory {
-                    checkpoints: s
-                        .checkpoints
-                        .iter()
-                        .filter(|(_, c)| c.worker == s.registration.id)
-                        .map(|(id, c)| (id.clone(), c.clone()))
-                        .collect(),
-                    held: s.held.clone(),
-                    registration: s.registration.clone(),
-                    sequence: s.sequence,
-                    assignments,
-                });
-                Ok(())
-            })?;
+                    s.recovery_inventory = Some(super::recovery::Inventory {
+                        checkpoints: s
+                            .checkpoints
+                            .iter()
+                            .filter(|(_, c)| c.worker == s.registration.id)
+                            .map(|(id, c)| (id.clone(), c.clone()))
+                            .collect(),
+                        held: s.held.clone(),
+                        registration: s.registration.clone(),
+                        sequence: s.sequence,
+                        assignments,
+                    });
+                    Ok(())
+                },
+                Some(None),
+            )?;
         }
         // Preserve original identities and backend ownership; only controller authority changes.
         config.cluster = manifest.plan.config.cluster.clone();
@@ -789,7 +845,12 @@ impl Worker {
             &home.join("worker.json"),
             &config.cluster,
         ))?;
+        let mut sync = super::worker_sync::Receiver::new(journal.read_sync()?)?;
+        if journal.sync_pending()? {
+            sync.require_refresh();
+        }
         Ok(Self {
+            sync,
             config,
             reclamation,
             home: home.into(),
@@ -808,18 +869,10 @@ impl Worker {
     /// Network failure does not prevent local supervision. Accepted intents remain authoritative.
     pub async fn tick(&mut self) -> Result<()> {
         let r = self.config.registration.clone();
-        let poll = self
-            .client
-            .call(
-                Message::WorkerRead {
-                    worker: r.id.clone(),
-                    incarnation: r.incarnation.clone(),
-                },
-                Duration::from_secs(2),
-            )
-            .await;
+        let poll = self.synchronize().await;
         let online = match poll {
-            Ok(Answer::WorkerRead(Ok(view))) => {
+            Ok(Some(saved)) => {
+                let view = saved.image.view()?;
                 if view.recovery_required || self.journal.read()?.recovery_inventory.is_some() {
                     self.journal.change(|s| {
                         if s.recovery_inventory.is_none() {
@@ -871,13 +924,18 @@ impl Worker {
                         return Ok(());
                     }
                 }
-                self.journal.accept(view.clone())?;
+                self.journal.accept(view.clone(), Some(&saved))?;
+                self.sync.commit(saved);
                 self.storage_view = Some(view);
                 true
             }
-            Ok(other) => bail!("unexpected worker poll: {other:?}"),
+            // Do not initiate effects using a partially received/confirmed replacement image.
+            Ok(None) => return Ok(()),
             Err(e) => {
                 tracing::debug!(error=%e, "worker could not refresh committed intent");
+                if self.sync.pending() {
+                    return Ok(());
+                }
                 false
             }
         };
@@ -900,6 +958,8 @@ impl Worker {
                     detail: Some(format!("{e:#}").chars().take(1000).collect()),
                 },
             };
+            // reconcile() already short-circuits terminal execution. Sealed checkpoint import
+            // must still retry: a transient failure can coincide with the terminal observation.
             if let Err(e) = self.persist_checkpoints(a).await {
                 tracing::warn!(attempt=%a.id,error=%e,"checkpoint remains unavailable");
             }
@@ -953,17 +1013,36 @@ impl Worker {
                 })?;
             }
             for report in self.journal.read()?.outbox.values().take(64) {
-                let reply = self
+                let mut reply = self
                     .client
                     .write(
                         Request {
                             origin: self.config.cluster.clone(),
-                            id: format!("observation-{}-{}", report.incarnation, report.sequence),
+                            id: report.request_id(),
                             mutation: Mutation::WorkerReport(report.clone()),
                         },
                         Duration::from_secs(2),
                     )
                     .await?;
+                // A timeout is not a rejection. Retry the original immutable envelope until
+                // its outcome is known. Only this precise, pre-effect validation rejection
+                // permits a new request ID carrying a byte-bounded diagnostic at the SAME
+                // sequence. Re-derivation is deterministic across worker restarts/lost replies.
+                if matches!(&reply, Reply::Rejected { reason } if reason == DETAIL_TOO_LARGE)
+                    && let Some((corrected, id)) = report.corrected_detail()
+                {
+                    reply = self
+                        .client
+                        .write(
+                            Request {
+                                origin: self.config.cluster.clone(),
+                                id,
+                                mutation: Mutation::WorkerReport(corrected),
+                            },
+                            Duration::from_secs(2),
+                        )
+                        .await?;
+                }
                 ensure!(
                     reply == Reply::Recorded,
                     "worker observation rejected: {reply:?}"
@@ -971,6 +1050,45 @@ impl Worker {
             }
         }
         Ok(())
+    }
+
+    async fn synchronize(&mut self) -> Result<Option<super::worker_sync::Saved>> {
+        // Bound work per tick. Partial pages survive ticks, but never authorize local effects.
+        for _ in 0..8 {
+            let answer = self
+                .client
+                .call(
+                    Message::WorkerSync {
+                        worker: self.config.registration.id.clone(),
+                        incarnation: self.config.registration.incarnation.clone(),
+                        request: self.sync.request(),
+                    },
+                    Duration::from_secs(2),
+                )
+                .await?;
+            let Answer::WorkerSync(Ok(reply)) = answer else {
+                bail!("unexpected worker synchronization: {answer:?}");
+            };
+            if matches!(
+                reply,
+                super::worker_sync::Reply::Page { .. } | super::worker_sync::Reply::Reset
+            ) && let Err(error) = self.journal.begin_sync()
+            {
+                self.sync.require_refresh();
+                return Err(error);
+            }
+            let received = match self.sync.receive(reply) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.sync.require_refresh();
+                    return Err(error);
+                }
+            };
+            if let Some(saved) = received {
+                return Ok(Some(saved));
+            }
+        }
+        Ok(None)
     }
 
     async fn persist_checkpoints(&self, a: &Assignment) -> Result<()> {
