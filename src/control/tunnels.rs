@@ -187,6 +187,12 @@ pub(super) fn validate_relay(url: &iroh::RelayUrl) -> Result<()> {
 }
 impl State {
     pub(crate) fn replace_tunnels(&mut self, revision: u64, topology: &Topology) -> Reply {
+        if self.version.active >= super::vm::GENERATION {
+            return self.vm_host_topology(revision, topology);
+        }
+        self.replace_tunnels_raw(revision, topology)
+    }
+    pub(crate) fn replace_tunnels_raw(&mut self, revision: u64, topology: &Topology) -> Reply {
         if revision != self.tunnels.revision {
             return Reply::rejected("tunnel revision conflict");
         }

@@ -184,9 +184,13 @@ pub fn run(root: &Path, baseline: &Path, candidate: &Path, unsupported: &Path) -
     let initial_revision = l.state()?["version"]["revision"].as_u64().unwrap();
     l.binary = current;
     caught(&l, &[1, 2, 3])?;
-    let denied=l.envelope(json!({"op":"replace_tunnels","request_id":"inactive-tunnels","expected_revision":0,"topology":{"adapters":{},"services":{},"routes":[]}}))?;
+    let denied = l.envelope(
+        json!({"op":"vm_manage","request_id":"inactive-vm","action":{"kind":"sweep","as_of":0}}),
+    )?;
     ensure!(
-        denied["ok"] == false && denied.to_string().contains("request was not accepted"),
+        denied["ok"] == false
+            && denied["outcome_unknown"] == false
+            && denied.to_string().contains("activate generation 4"),
         "future variant reached an older leader: {denied}"
     );
     for n in 1..=3 {
@@ -366,11 +370,7 @@ pub fn run(root: &Path, baseline: &Path, candidate: &Path, unsupported: &Path) -
         l.state()?["version"]["active"] == NEXT,
         "generation not activated"
     );
-    ensure!(l.request(json!({"op":"replace_tunnels","request_id":"activated-tunnels","expected_revision":0,"topology":{"adapters":{},"services":{},"routes":[]}}))?["reply"]=="Recorded","activated tunnel mutation failed");
-    ensure!(
-        l.request(json!({"op":"tunnels"}))?["revision"] == 1,
-        "tunnel state not committed"
-    );
+    ensure!(l.request(json!({"op":"vm_manage","request_id":"activated-vm","action":{"kind":"sweep","as_of":0}}))?["reply"]=="Recorded","activated VM mutation failed");
     ensure!(
         api_result(
             baseline,
@@ -574,15 +574,21 @@ pub fn build(output_dir: &Path) -> Result<()> {
         let file = future.join("src/control/version.rs");
         let source = fs::read_to_string(&file)?;
         ensure!(
-            source.contains("pub const MIN: u32 = 2;")
-                && source.contains("pub const MAX: u32 = 3;"),
+            source.contains(&format!("pub const MIN: u32 = {BASE};"))
+                && source.contains(&format!("pub const MAX: u32 = {NEXT};")),
             "update unsupported build fixture for new baseline"
         );
         fs::write(
             file,
             source
-                .replace("pub const MIN: u32 = 2;", "pub const MIN: u32 = 4;")
-                .replace("pub const MAX: u32 = 3;", "pub const MAX: u32 = 5;"),
+                .replace(
+                    &format!("pub const MIN: u32 = {BASE};"),
+                    &format!("pub const MIN: u32 = {};", NEXT + 1),
+                )
+                .replace(
+                    &format!("pub const MAX: u32 = {NEXT};"),
+                    &format!("pub const MAX: u32 = {};", NEXT + 2),
+                ),
         )?;
         build_one(&future, "fleet-unsupported", false)?;
         build_one(&root, "fleet-candidate", true)?;

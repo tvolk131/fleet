@@ -33,7 +33,7 @@ Raft receipt handling. Invalid references, unauthorized routes, duplicate ports,
 non-loopback sockets and oversized topologies are rejected before state changes.
 
 Adapters fetch a quorum-confirmed, filtered view, fsync it to `policy.json`, and
-apply it locally. Any policy revision closes existing tunnels and rebinds the
+apply it locally. A change to an adapter’s filtered policy closes its existing tunnels and rebinds the
 configured listeners. Applications reconnect using their normal TCP recovery
 logic. A bind conflict fails the adapter's policy closed and retries; Fleet does
 not pick a different port silently. The catalog describes desired state, not a
@@ -215,3 +215,6 @@ Garage process restart. It installs no service and makes no power-loss or
 multi-machine durability claim. Stock Garage v2.4.1 builds on Apple Silicon with
 `cargo build --locked -p garage --no-default-features --features bundled-libs,sqlite`.
 The fixture uses disposable test credentials, never production S3 credentials.
+
+Generation 4 also provides [worker-managed persistent VM connections](MANAGED_VMS.md).
+Unrelated global revisions preserve streams when the adapter's filtered policy is unchanged.

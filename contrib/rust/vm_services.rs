@@ -169,13 +169,7 @@ pub fn run(a: tart::Options) -> Result<()> {
         |v| v["version"]["active"] == fleet::control::version::MIN,
         30,
     )?;
-    l.request(json!({"op":"prepare_version","request_id":"prepare","expected_revision":0,"target":fleet::control::tunnels::GENERATION}))?;
-    wait(
-        || l.request(json!({"op":"versions"})),
-        |v| v["version"]["pending"]["ready"] == json!([1]),
-        30,
-    )?;
-    l.request(json!({"op":"activate_version","request_id":"activate","expected_revision":1}))?;
+    super::rolling::activate_to(&l, fleet::control::tunnels::GENERATION)?;
     let mut settings = tart::settings(&l, &a)?;
     settings["memory_budget_mb"] = if a.fake { 4096 } else { 8192 }.into();
     // Fake VMs allocate no RAM. Separate small logical workers let CI exercise

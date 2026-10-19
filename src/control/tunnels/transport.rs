@@ -412,7 +412,7 @@ pub async fn run_attached(
 ) {
     loop {
         let view = policies.borrow_and_update().clone();
-        let revision = view.revision;
+        let mut revision = view.revision;
         status.send_replace(TransportStatus::Applying { revision });
         let binding = tokio::select! {
             result = Session::bind(endpoint.clone(), view, &attachment) => result,
@@ -421,11 +421,30 @@ pub async fn run_attached(
         let error = match binding {
             Ok(mut session) => {
                 status.send_replace(TransportStatus::Applied { revision });
-                let result = tokio::select! {
-                    result = session.serve() => Some(result),
-                    changed = policies.changed() => { if changed.is_err() {session.shutdown().await; break;} None }
+                let result = loop {
+                    tokio::select! {
+                        result = session.serve() => break Some(result),
+                        changed = policies.changed() => {
+                            if changed.is_err() { break None; }
+                            let next = policies.borrow().clone();
+                            let mut same = next.clone();
+                            same.revision = session.view.revision;
+                            if same == *session.view {
+                                // A global revision can change without changing this adapter's
+                                // permissions or sockets. Keep its established streams alive.
+                                policies.borrow_and_update();
+                                revision = next.revision;
+                                status.send_replace(TransportStatus::Applied { revision });
+                                continue;
+                            }
+                            break None;
+                        }
+                    }
                 };
                 session.shutdown().await;
+                if policies.has_changed().is_err() {
+                    break;
+                }
                 match result {
                     None => continue,
                     Some(Ok(())) => "transport stopped".into(),

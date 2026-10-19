@@ -121,7 +121,9 @@ pub async fn run(path: &Path) -> Result<()> {
         && let Some(raw) = super::version::preflight(&home.join("worker.redb"), "worker_journal")?
     {
         ensure!(
-            raw["state"]["format"] == super::FORMAT,
+            raw["state"]["format"]
+                .as_u64()
+                .is_some_and(super::runtime::supported_format),
             "worker metadata needs explicit baseline migration"
         );
     }

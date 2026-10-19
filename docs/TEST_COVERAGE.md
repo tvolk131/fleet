@@ -30,3 +30,12 @@ checks, Clippy, the JSON CLI/service suite, isolated checkpoint backup/restore, 
 scenarios on Linux and macOS. None needs an installed Fleet service or existing training data.
 Historical installations can remain archived on disk; removing their source/entrypoints does not delete
 their state or adopt their workloads. Physical deployment upgrades require separate idle checks and backups.
+
+Generation-4 managed VM coverage adds `src/control/vm/tests.rs` (capability/revision gates, identity
+binding, explicit grants, request replay, retention and recovery), worker journal reopen/rollback tests,
+and the managed GUI panel. `fleet-qualify managed-vm` drives public CLI/JSON operations through isolated
+workers: immutable uploads, verified downloads, worker/controller restart, no command replay, recovery
+of a pending backend launch (fault injected through the private worker's launcher setting), automatic
+network attachments, revocation/deletion and retained-result reclamation. CI runs the fake backend on
+both operating systems, including refusal by the actual previous worker executable without DB writes.
+`tests/control/tunnels.rs` also verifies that an established stream survives unrelated catalog changes.

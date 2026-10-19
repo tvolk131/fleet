@@ -21,6 +21,40 @@ const WAIT: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ApiRequest {
+    Vm {
+        #[serde(default)]
+        instance: Option<String>,
+    },
+    VmManage {
+        request_id: String,
+        action: super::vm::Action,
+    },
+    VmUpload {
+        request_id: String,
+        id: String,
+        instance: String,
+        expected_revision: u64,
+        source: PathBuf,
+        path: String,
+        #[serde(default)]
+        executable: bool,
+        #[serde(default = "super::vm::retention")]
+        retention_seconds: u64,
+    },
+    VmStage {
+        id: String,
+    },
+    VmFetch {
+        id: String,
+        destination: PathBuf,
+    },
+    VmLogs {
+        id: String,
+        #[serde(default)]
+        stderr: bool,
+        #[serde(default)]
+        from: u64,
+    },
     Tunnels,
     WaitTunnels {
         revision: u64,
@@ -258,7 +292,9 @@ fn log_size() -> u32 {
 impl ApiRequest {
     pub fn request_id(&self) -> Option<&str> {
         match self {
-            Self::ReplaceTunnels { request_id, .. } => Some(request_id),
+            Self::VmManage { request_id, .. }
+            | Self::VmUpload { request_id, .. }
+            | Self::ReplaceTunnels { request_id, .. } => Some(request_id),
             Self::PrepareVersion { request_id, .. }
             | Self::ActivateVersion { request_id, .. }
             | Self::AbortVersion { request_id, .. }
@@ -354,7 +390,11 @@ impl AppClient {
         prepared.reply = Some(reply.clone());
         instances::write(&path, &prepared)
             .context("outcome unknown to the local request journal; retry the saved request")?;
-        Ok(json!({"request_id":prepared.request.id,"reply":reply}))
+        let mut value = json!({"request_id":prepared.request.id,"reply":reply});
+        if let Mutation::Vm(super::vm::Action::Start { id, .. }) = &prepared.request.mutation {
+            value["operation"] = json!(id);
+        }
+        Ok(value)
     }
     pub async fn read(&mut self) -> Result<State> {
         self.transport.read(WAIT).await
@@ -455,6 +495,37 @@ impl AppClient {
             return self.send(prepared).await;
         }
         let mutation = match api {
+            ApiRequest::VmManage { action, .. } => {
+                ensure!(
+                    self.read().await?.version.active >= super::vm::GENERATION,
+                    "activate generation 4 before managing VM services or operations"
+                );
+                Mutation::Vm(action.clone())
+            }
+            ApiRequest::VmUpload {
+                id,
+                instance,
+                expected_revision,
+                source,
+                path,
+                executable,
+                retention_seconds,
+                ..
+            } => {
+                ensure!(
+                    self.read().await?.version.active >= super::vm::GENERATION,
+                    "activate generation 4 before managing VM operations"
+                );
+                let spec = super::vm::client::prepare_upload(&self.home, source, path, *executable)
+                    .await?;
+                Mutation::Vm(super::vm::Action::Start {
+                    id: id.clone(),
+                    instance: instance.clone(),
+                    expected_revision: *expected_revision,
+                    spec,
+                    retention_seconds: *retention_seconds,
+                })
+            }
             ApiRequest::ReplaceTunnels {
                 expected_revision,
                 topology,
@@ -857,7 +928,14 @@ impl AppClient {
     pub async fn execute(&mut self, api: ApiRequest) -> Result<Value> {
         match &api {
             ApiRequest::ReplaceTunnels { .. } => self.prepare_mutation(&api).await,
-            ApiRequest::Tunnels => Ok(json!(self.tunnel_status().await?)),
+            ApiRequest::Tunnels => {
+                let state = self.read().await?;
+                let mut status = json!(self.tunnel_status().await?);
+                status["host_topology"] =
+                    json!(state.vm.hosts.as_ref().unwrap_or(&state.tunnels.topology));
+                status["host_revision"] = json!(state.tunnels.revision);
+                Ok(status)
+            }
             ApiRequest::WaitTunnels {
                 revision,
                 timeout_seconds,
@@ -947,6 +1025,40 @@ impl AppClient {
                     };
                 }
                 Ok(answer)
+            }
+            ApiRequest::VmManage { .. } => self.prepare_mutation(&api).await,
+            ApiRequest::VmUpload { id, .. } => {
+                let mut result = self.prepare_mutation(&api).await?;
+                if result["reply"] == "Recorded" {
+                    result["staging"] = match self.stage_vm(id).await {
+                        Ok(v) => v,
+                        Err(e) => json!({"staged":false,"error":format!("{e:#}")}),
+                    };
+                }
+                Ok(result)
+            }
+            ApiRequest::VmStage { id } => self.stage_vm(id).await,
+            ApiRequest::VmFetch { id, destination } => self.fetch_vm(id, destination).await,
+            ApiRequest::VmLogs { id, stderr, from } => self.vm_logs(id, *stderr, *from).await,
+            ApiRequest::Vm { instance } => {
+                let state = self.read().await?;
+                let mut catalog = state.vm.clone();
+                if let Some(id) = instance {
+                    ensure!(
+                        state
+                            .assignments
+                            .get(id)
+                            .is_some_and(|a| matches!(a.workload, Workload::Instance { .. })),
+                        "unknown persistent VM"
+                    );
+                    catalog.networks.retain(|k, _| k == id);
+                    catalog.bindings.retain(|k, _| k == id);
+                    catalog.operations.retain(|_, o| &o.instance == id);
+                }
+                catalog.hosts = None;
+                Ok(
+                    json!({"generation":state.version.active,"catalog":catalog,"enforcement":self.tunnel_status().await?}),
+                )
             }
             ApiRequest::PrepareVersion { .. }
             | ApiRequest::ActivateVersion { .. }

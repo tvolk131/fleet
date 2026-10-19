@@ -23,6 +23,8 @@ pub struct Command {
 /// Deterministic application commands. External effects are reconciled by workers after commit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Mutation {
+    Vm(super::vm::Action),
+    VmReport(super::vm::Report),
     TunnelReport {
         report: super::tunnels::status::Report,
         recorded_at_ms: u64,
@@ -170,6 +172,7 @@ impl Mutation {
     /// replication, so an older voter never needs to deserialize a newer command variant.
     pub(crate) fn minimum_generation(&self) -> u32 {
         match self {
+            Self::Vm(..) | Self::VmReport(..) => super::vm::GENERATION,
             Self::ReplaceTunnels { .. } | Self::TunnelReport { .. } => super::tunnels::GENERATION,
             Self::PrepareVersion { .. }
             | Self::ReplicaPrepared { .. }
@@ -242,6 +245,8 @@ pub struct Receipt {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct State {
     #[serde(default)]
+    pub vm: super::vm::Catalog,
+    #[serde(default)]
     pub tunnels: super::tunnels::Catalog,
     #[serde(default)]
     pub version: super::version::ClusterVersion,
@@ -273,6 +278,7 @@ pub fn key(principal: &str, id: &str) -> String {
 impl State {
     pub fn new(cluster: String) -> Self {
         Self {
+            vm: Default::default(),
             tunnels: Default::default(),
             // New clusters start at the binary's floor. Deserializing old metadata still
             // defaults to generation one, never silently to the running executable's version.
@@ -325,6 +331,8 @@ impl State {
         // observations converge without retaining an unbounded receipt per chunk or sample.
         // User mutations (including history policy and pins) retain normal request receipts.
         let diagnostic = match &request.mutation {
+            Mutation::Vm(super::vm::Action::Sweep { .. }) => principal == "vm-maintenance",
+            Mutation::VmReport(r) => self.vm_reporter(&principal, r),
             Mutation::TunnelReport { .. } => true,
             Mutation::HistoryReport(r) => self.history_reporter(&principal, r),
             Mutation::ArtifactReady(r) => {
@@ -382,6 +390,8 @@ impl State {
             return Reply::rejected("operation requires an inactive cluster generation");
         }
         match mutation {
+            Mutation::Vm(a) => self.vm_action(a),
+            Mutation::VmReport(r) => self.vm_report(principal, r),
             Mutation::TunnelReport {
                 report,
                 recorded_at_ms,

@@ -37,7 +37,10 @@ pub fn run(home: PathBuf) -> iced::Result {
     .window_size((1220.0, 820.0))
     .run()
 }
+mod vm;
+
 struct App {
+    vm: vm::Panel,
     dark: bool,
     acting: bool,
     home: PathBuf,
@@ -77,6 +80,7 @@ struct App {
 }
 #[derive(Debug, Clone)]
 enum Message {
+    Vm(vm::Event),
     ManageStorage(String),
     StorageReplacement(String),
     StorageAction(StorageAction),
@@ -117,6 +121,7 @@ enum StorageAction {
 }
 #[derive(Debug, Clone)]
 struct Refresh {
+    vm: Value,
     tunnels: Value,
     tunnels_checked: std::time::Instant,
     history_epoch: u64,
@@ -139,6 +144,7 @@ fn id() -> String {
 impl App {
     fn new(home: PathBuf) -> Self {
         Self {
+            vm: Default::default(),
             dark: false,
             acting: false,
             home,
@@ -271,6 +277,7 @@ impl App {
                                 .as_array()
                                 .cloned()
                                 .unwrap_or_default();
+                            let vm = c.execute(ApiRequest::Vm { instance: None }).await?;
                             let storage = c.execute(ApiRequest::Storage).await?;
                             let tunnels = c.execute(ApiRequest::Tunnels).await?;
                             let tunnels_checked = std::time::Instant::now();
@@ -371,6 +378,7 @@ impl App {
                                 }
                             }
                             Ok::<_, anyhow::Error>(Box::new(Refresh {
+                                vm,
                                 tunnels,
                                 tunnels_checked,
                                 history_epoch,
@@ -431,6 +439,7 @@ impl App {
                         self.jobs = r.jobs;
                         self.workers = r.workers;
                         self.instances = r.instances;
+                        self.vm.snapshot = r.vm;
                         self.storage = r.storage;
                         self.tunnels = r.tunnels;
                         self.tunnels_checked = r.tunnels_checked;
@@ -660,6 +669,7 @@ impl App {
                     expected_revision: revision,
                 });
             }
+            Message::Vm(e) => return self.vm_update(e),
             Message::Instance(instance, revision, desired) => {
                 return self.act(ApiRequest::InstanceSet {
                     request_id: id(),
@@ -698,6 +708,21 @@ impl App {
         Task::none()
     }
     fn view(&self) -> Element<'_, Message> {
+        if self.vm.selected.is_some() {
+            return iced_m3::focus::scope(
+                container(scrollable(
+                    column![
+                        button("Back to Fleet")
+                            .variant(ButtonVariant::Text)
+                            .on_press(Message::Vm(vm::Event::Close)),
+                        self.vm_panel(),
+                    ]
+                    .spacing(16),
+                ))
+                .padding(24)
+                .height(Length::Fill),
+            );
+        }
         let mut page = column![
             row![
                 typography("Fleet", TypeScale::HeadlineLarge),
@@ -1383,6 +1408,10 @@ impl App {
                             TypeScale::BodyMedium
                         )
                         .width(Length::Fill),
+                        button("Manage")
+                            .variant(ButtonVariant::Tonal)
+                            .size(ButtonSize::Small)
+                            .on_press(Message::Vm(vm::Event::Select(id.into()))),
                         action("Start", InstanceDesired::Running),
                         action("Stop", InstanceDesired::Stopped),
                         action("Delete", InstanceDesired::Deleted).variant(ButtonVariant::Outlined),
@@ -1475,6 +1504,15 @@ fn action_notice(value: &Value) -> String {
                 .as_str()
                 .map(str::to_owned)
                 .unwrap_or_else(|| reason.to_string())
+        );
+    }
+    if let Some(op) = value["operation"].as_str() {
+        return format!(
+            "Operation {op}: {}",
+            value.get("staging").map_or_else(
+                || "inspect its status and result below".into(),
+                |v| v.to_string()
+            )
         );
     }
     if let Some(job) = value.pointer("/reply/Accepted/job").and_then(Value::as_str) {
@@ -1876,6 +1914,7 @@ mod tests {
         let mut jobs = app.jobs.clone();
         jobs[0]["assignment"]["execution"] = json!("exec-training-a2");
         let _ = app.update(Message::Refreshed(Ok(Box::new(Refresh {
+            vm: Value::Null,
             tunnels: Value::Null,
             tunnels_checked: std::time::Instant::now(),
             history_epoch: 0,
@@ -2022,6 +2061,7 @@ mod tests {
             }
         }
         let _ = app.update(Message::Refreshed(Ok(Box::new(Refresh {
+            vm: Value::Null,
             tunnels: Value::Null,
             tunnels_checked: std::time::Instant::now(),
             history_epoch: 1,
@@ -2088,6 +2128,7 @@ mod tests {
         let mut app = sample();
         app.selected = Some("new-job".into());
         let _ = app.update(Message::Refreshed(Ok(Box::new(Refresh {
+            vm: Value::Null,
             tunnels: Value::Null,
             tunnels_checked: std::time::Instant::now(),
             history_epoch: 0,

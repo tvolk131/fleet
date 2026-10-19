@@ -26,10 +26,15 @@ use std::{
 mod artifacts;
 mod history;
 mod reclaim;
+mod vm;
 
 pub const DATA_ALPN: &[u8] = b"fleet/worker-data/1";
 const JOURNAL: TableDefinition<&str, &[u8]> = TableDefinition::new("worker_journal");
 const MAX_FRAME: usize = 8 << 20;
+
+pub(crate) fn supported_format(format: u64) -> bool {
+    u32::try_from(format).is_ok_and(vm::supported)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerConfig {
@@ -42,6 +47,12 @@ pub struct WorkerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JournalState {
+    #[serde(default)]
+    vm: super::vm::Catalog,
+    #[serde(default)]
+    generation: u32,
+    #[serde(default)]
+    vm_attempted: BTreeSet<String>,
     #[serde(default)]
     artifacts: BTreeMap<String, super::artifact::Manifest>,
     #[serde(default)]
@@ -78,7 +89,9 @@ impl Journal {
         }
         if let Some(raw) = super::version::preflight(&path, "worker_journal")? {
             ensure!(
-                raw["state"]["format"] == super::FORMAT,
+                raw["state"]["format"]
+                    .as_u64()
+                    .is_some_and(|f| vm::supported(f as u32)),
                 "worker metadata format mismatch; explicit baseline migration required"
             );
         }
@@ -93,7 +106,7 @@ impl Journal {
                 .transpose()?;
             if let Some(old) = old {
                 ensure!(
-                    old.format == super::FORMAT
+                    vm::supported(old.format)
                         && old.cluster == config.cluster
                         && old.registration == config.registration,
                     "worker journal identity/configuration mismatch"
@@ -104,6 +117,9 @@ impl Journal {
                     "worker journal has no durable identity; explicit recovery required"
                 );
                 let state = JournalState {
+                    vm: Default::default(),
+                    generation: 0,
+                    vm_attempted: BTreeSet::new(),
                     artifacts: BTreeMap::new(),
                     deleted_artifacts: BTreeSet::new(),
                     starts_allowed: true,
@@ -158,6 +174,43 @@ impl Journal {
                 view.acknowledged >= s.acknowledged && view.acknowledged <= s.sequence,
                 "controller/worker journal rollback detected"
             );
+            ensure!(
+                view.generation >= s.generation,
+                "controller generation regressed"
+            );
+            ensure!(
+                view.generation <= super::version::MAX,
+                "worker does not support controller generation"
+            );
+            for (id, old) in &s.vm.operations {
+                let new = view
+                    .vm
+                    .operations
+                    .get(id)
+                    .context("controller lost an accepted VM operation")?;
+                ensure!(
+                    new.spec == old.spec
+                        && new.ordinal == old.ordinal
+                        && new.instance == old.instance
+                        && new.execution == old.execution
+                        && new.instance_revision == old.instance_revision
+                        && new.worker == old.worker
+                        && new.incarnation == old.incarnation
+                        && new.retention_seconds == old.retention_seconds
+                        && (!old.released || new.released)
+                        && (!old.reclaimed || new.reclaimed)
+                        && (!old.outcome.phase.terminal() || new.outcome == old.outcome)
+                        && (new.revision != old.revision
+                            || (new.outcome == old.outcome && new.released == old.released))
+                        && new.revision >= old.revision,
+                    "VM operation changed or regressed"
+                );
+            }
+            s.vm = view.vm;
+            s.generation = view.generation;
+            if s.generation >= super::vm::GENERATION {
+                s.format = vm::FORMAT;
+            }
             for old in s.assignments.values() {
                 let new = view
                     .assignments
@@ -230,6 +283,14 @@ impl Journal {
 /// Direct data plane has no execute or lifecycle commands. Those must pass through consensus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DataRequest {
+    VmInput {
+        id: String,
+    },
+    VmLogs {
+        id: String,
+        stderr: bool,
+        from: u64,
+    },
     History {
         execution: String,
         stream: crate::history::Stream,
@@ -268,6 +329,7 @@ struct DataFrame {
 
 #[derive(Clone, Debug)]
 struct DataHandler {
+    vm_access: Arc<std::sync::RwLock<super::vm::Catalog>>,
     home: PathBuf,
     cluster: String,
     allow: Arc<HashSet<EndpointId>>,
@@ -289,6 +351,21 @@ impl ProtocolHandler for DataHandler {
                         serde_json::from_slice(&recv.read_to_end(MAX_FRAME).await?)?;
                     ensure!(frame.cluster == self.cluster, "cluster mismatch");
                     let special = match &frame.request {
+                        DataRequest::VmInput{id}=> {
+                            let _gate=self.agent.blob_guard().await;
+                            let op=self.vm_access.read().expect("VM access").operations.get(id).cloned().context("operation has not reached worker")?;
+                            ensure!(!op.released,"operation input was released");
+                            let instances::guest::Spec::Upload{hash,size,..}=op.spec else {bail!("not an upload");};
+                            self.store.tags().set(vm::input_tag(id),iroh_blobs::HashAndFormat::raw(hash)).await?;
+                            let complete=matches!(self.store.blobs().status(hash).await?,iroh_blobs::api::blobs::BlobStatus::Complete{size:stored} if size==stored);
+                            self.store.sync_db().await?;
+                            Some(proto::Response::Missing(if complete {vec![]} else {vec![hash]}))
+                        }
+                        DataRequest::VmLogs{id,stderr,from}=>{
+                            let op=self.vm_access.read().expect("VM access").operations.get(id).cloned().context("unknown operation")?;
+                            ensure!(!op.released,"operation output was released");
+                            Some(proto::Response::InstanceGuest(instances::guest::Response::Logs(instances::guest::logs(&self.home.join("backend"),&op.execution,&op.backend_id(),*stderr,*from)?)))
+                        }
                         DataRequest::History {
                             execution,
                             stream,
@@ -316,7 +393,7 @@ impl ProtocolHandler for DataHandler {
                         response
                     } else {
                         let request = match frame.request {
-                            DataRequest::Storage
+                            DataRequest::VmInput{..} | DataRequest::VmLogs{..} | DataRequest::Storage
                             | DataRequest::ReserveInputs { .. }
                             | DataRequest::History { .. } => {
                                 unreachable!()
@@ -352,16 +429,26 @@ impl ProtocolHandler for DataHandler {
                         // A staging acknowledgement must survive worker process restart.
                         self.store.sync_db().await?;
                     }
-                    let bytes = serde_json::to_vec(&response)?;
-                    ensure!(bytes.len() <= MAX_FRAME, "worker data response too large");
+                    Ok::<_, anyhow::Error>(response)
+                })
+                .await;
+                let response = match result {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(e)) => {
+                        proto::Response::Error(format!("{e:#}").chars().take(1024).collect())
+                    }
+                    Err(_) => proto::Response::Error("worker data request timed out".into()),
+                };
+                let bytes = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
+                if bytes.len() > MAX_FRAME {
+                    continue;
+                }
+                let _ = tokio::time::timeout(Duration::from_secs(5), async {
                     send.write_all(&bytes).await?;
                     send.finish()?;
                     Ok::<_, anyhow::Error>(())
                 })
                 .await;
-                if let Ok(Err(e)) = result {
-                    tracing::debug!(error=%e, "worker data stream ended");
-                }
             }
         }
         Ok(())
@@ -406,6 +493,8 @@ pub struct Worker {
     agent: Agent,
     artifact_access: Arc<std::sync::RwLock<super::artifact_io::Access>>,
     storage_view: Option<WorkerView>,
+    vm_adapters: BTreeMap<String, super::tunnels::agent::Agent>,
+    vm_access: Arc<std::sync::RwLock<super::vm::Catalog>>,
 }
 
 impl Worker {
@@ -419,7 +508,7 @@ impl Worker {
         let journal = Journal { db };
         let state = journal.read()?;
         ensure!(
-            state.format == super::FORMAT && state.cluster == config.cluster,
+            vm::supported(state.format) && state.cluster == config.cluster,
             "upgrade worker metadata first"
         );
         let mut identity = state.registration.clone();
@@ -499,8 +588,12 @@ impl Worker {
         let raw: serde_json::Value =
             serde_json::from_slice(table.get("state")?.context("missing worker state")?.value())?;
         let source_format = raw["format"].as_u64().context("worker format missing")? as u32;
-        let already = raw["format"] == super::FORMAT;
-        let converted = super::upgrade::journal(raw)?;
+        let already = vm::supported(source_format);
+        let converted = if already {
+            raw
+        } else {
+            super::upgrade::journal(raw)?
+        };
         let state: JournalState = serde_json::from_value(converted)?;
         ensure!(
             state.cluster == expected.cluster
@@ -552,12 +645,14 @@ impl Worker {
             ensure!(
                 old.cluster == config.cluster
                     && old.registration == config.registration
-                    && old.format == super::FORMAT,
+                    && vm::supported(old.format),
                 "worker journal/config identity mismatch"
             );
             journal.change(|s| {
                 s.cluster = manifest.plan.config.cluster.clone();
                 s.starts_allowed = false;
+                s.vm = Default::default();
+                s.generation = 0;
                 s.recovery_binding = Some(manifest.clone());
                 let mut assignments = s.assignments.clone();
                 for (id, a) in &mut assignments {
@@ -671,6 +766,7 @@ impl Worker {
         )?;
         let artifact_access =
             Arc::new(std::sync::RwLock::new(super::artifact_io::Access::default()));
+        let vm_access = Arc::new(std::sync::RwLock::new(inventory.vm.clone()));
         let router = Router::builder(endpoint.clone())
             .accept(
                 super::artifact_io::ALPN,
@@ -689,6 +785,7 @@ impl Worker {
             .accept(
                 DATA_ALPN,
                 DataHandler {
+                    vm_access: vm_access.clone(),
                     home: home.into(),
                     cluster: config.cluster.clone(),
                     allow: allow.clone(),
@@ -715,6 +812,8 @@ impl Worker {
             agent,
             artifact_access,
             storage_view: None,
+            vm_adapters: BTreeMap::new(),
+            vm_access,
         })
     }
 
@@ -795,6 +894,7 @@ impl Worker {
             }
         };
         let journal = self.journal.read()?;
+        *self.vm_access.write().expect("VM access") = journal.vm.clone();
         // A rebound worker cannot execute stale intent while its recovery inventory is pending.
         if journal.recovery_inventory.is_some() {
             return Ok(());
@@ -816,6 +916,12 @@ impl Worker {
                 tracing::warn!(attempt=%a.id,error=%e,"checkpoint remains unavailable");
             }
             self.journal.observe(a, observation)?;
+        }
+        if let Err(e) = self.reconcile_vm(online).await {
+            tracing::warn!(error=%e,"VM management will retry");
+            instances::write(&self.home.join("managed-vm/error.json"), &format!("{e:#}"))?;
+        } else {
+            let _ = std::fs::remove_file(self.home.join("managed-vm/error.json"));
         }
         if online {
             if let Err(e) = self.reconcile_history().await {
@@ -1186,7 +1292,10 @@ impl Worker {
         })
     }
 
-    pub async fn shutdown(self) -> Result<()> {
+    pub async fn shutdown(mut self) -> Result<()> {
+        for (_, agent) in std::mem::take(&mut self.vm_adapters) {
+            agent.shutdown().await;
+        }
         // Supervisors are deliberately detached; stopping a worker never cancels its assignments.
         self.router.shutdown().await?;
         Ok(())

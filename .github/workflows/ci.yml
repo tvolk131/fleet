@@ -64,6 +64,11 @@ jobs:
           target/debug/fleet-qualify rolling-upgrade --baseline /tmp/fleet-upgrade-binaries/fleet-baseline \
             --candidate /tmp/fleet-upgrade-binaries/fleet-candidate --unsupported /tmp/fleet-upgrade-binaries/fleet-unsupported \
             --home /tmp/fleet-control-rolling-ci 2>&1 | tee rolling-upgrade.log
+      - name: Managed VM connections, durable operations, restart and retention
+        run: |
+          target/debug/fleet-qualify managed-vm --fake --binary "$PWD/target/debug/fleet" \
+            --baseline-binary /tmp/fleet-upgrade-binaries/fleet-baseline \
+            --home /tmp/fleet-control-managed-vm-ci 2>&1 | tee managed-vm.log
       - name: Rolling checkpoint retention, backup and restore JSON CLI lifecycle with isolated Tart backend
         run: |
           target/debug/fleet-qualify checkpoint --fake --rolling --backup-restore --binary "$PWD/target/debug/fleet" \
@@ -108,6 +113,9 @@ jobs:
           fi
           if [ -f /tmp/fleet-control-vm-services-ci/qualification.json ]; then
             cp /tmp/fleet-control-vm-services-ci/qualification.json ci-evidence/vm-services.json
+          fi
+          if [ -f /tmp/fleet-control-managed-vm-ci/qualification.json ]; then
+            cp /tmp/fleet-control-managed-vm-ci/qualification.json ci-evidence/managed-vm.json
           fi
           # Never upload fixture homes: they contain private identity keys and databases.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -32,7 +32,10 @@ impl Job {
             .spawn()
             .unwrap();
         let job = Self { dir, child };
-        job.until(|| job.dir.join("work/ready").exists());
+        // The child can publish readiness before its parent publishes Started.
+        job.until(|| {
+            job.dir.join("work/ready").exists() && job.dir.join("supervisor.json").exists()
+        });
         job
     }
     fn until(&self, predicate: impl Fn() -> bool) {
