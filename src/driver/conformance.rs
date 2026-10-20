@@ -76,6 +76,7 @@ macro_rules! driver_conformance {
             guest_power_off_is_stopped_not_lost,
             runner_death_is_lost_and_recoverable,
             delete_is_complete_and_idempotent,
+            restarts_do_not_need_the_image,
             save_and_restore_preserve_guest_state,
             unsupported_save_is_reported
         );
@@ -420,6 +421,33 @@ pub fn delete_is_complete_and_idempotent(h: &impl Harness) {
     // Deleting forgets the generation, so the id can be reused from the start.
     driver.start(&spec).unwrap();
     driver.delete(&spec.id, 1).unwrap();
+}
+
+/// After the first prepare an instance owns copies of everything it needs, so its image can be
+/// moved or deleted without stopping it from starting again.
+pub fn restarts_do_not_need_the_image(h: &impl Harness) {
+    let image = h.scratch().join("moving-image");
+    std::fs::create_dir_all(&image).unwrap();
+    for entry in std::fs::read_dir(h.image(TestImage::Standard)).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), image.join(entry.file_name())).unwrap();
+    }
+    let driver = h.driver();
+    let first = InstanceSpec {
+        image: image.clone(),
+        ..spec(h, "imageless", 1, TestImage::Standard)
+    };
+    driver.start(&first).unwrap();
+    assert_eq!(ask(&driver, &first.id, "before"), "echo#1: before");
+    driver.stop(&first.id, 1, StopMode::Force).unwrap();
+    std::fs::remove_dir_all(&image).unwrap();
+    let second = InstanceSpec {
+        generation: 2,
+        ..first
+    };
+    driver.start(&second).unwrap();
+    assert_eq!(ask(&driver, &second.id, "after"), "echo#1: after");
+    driver.delete(&second.id, 2).unwrap();
 }
 
 pub fn save_and_restore_preserve_guest_state(h: &impl Harness) {

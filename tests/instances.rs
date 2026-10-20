@@ -550,6 +550,11 @@ fn lifecycle_survives_controller_loss_preserves_disk_and_rejects_stale_commands(
     assert_eq!(fs::read_to_string(&disk).unwrap(), "checkpoint");
     f.set("one", Desired::Running);
     f.wait("one", State::Running);
+    assert_eq!(
+        fs::read_to_string(&disk).unwrap(),
+        "checkpoint",
+        "a restart must keep the disk"
+    );
     assert!(
         instances::set_desired(
             &f.home,

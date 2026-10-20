@@ -8,7 +8,11 @@ use std::{
         unix::net::UnixStream,
     },
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock, mpsc},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
 
@@ -36,6 +40,7 @@ pub fn run(args: runner::Args) -> Result<()> {
     let vm = VzVm {
         dir: args.dir.clone(),
         machine: OnceLock::new(),
+        asking_agent: AtomicBool::new(false),
     };
     runner::run(args, Arc::new(vm))
 }
@@ -93,6 +98,8 @@ impl Machine {
 pub struct VzVm {
     dir: PathBuf,
     machine: OnceLock<Machine>,
+    /// A thread is asking the guest agent to shut down; repeated stop requests share it.
+    asking_agent: AtomicBool,
 }
 
 impl VzVm {
@@ -148,19 +155,26 @@ impl Vm for Arc<VzVm> {
             }
         });
         // A guest still booting has no agent yet: keep asking until one answers or the VM ends.
+        if self.asking_agent.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
         let vm = self.clone();
         std::thread::spawn(move || {
             let Ok(machine) = vm.machine() else { return };
-            while machine.state() != VZVirtualMachineState::Stopped {
+            while !matches!(
+                machine.state(),
+                VZVirtualMachineState::Stopped | VZVirtualMachineState::Error
+            ) {
                 let asked = vm.connect_guest(AGENT_PORT).and_then(|fd| {
                     UnixStream::from(fd).write_all(crate::driver::SHUTDOWN_REQUEST)?;
                     Ok(())
                 });
                 if asked.is_ok() {
-                    return;
+                    break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
+            vm.asking_agent.store(false, Ordering::SeqCst);
         });
         Ok(())
     }

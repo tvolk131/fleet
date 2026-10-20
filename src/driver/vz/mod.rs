@@ -4,8 +4,8 @@
 //! (`contrib/vz.entitlements`, applied by [`sign_runner`]).
 //!
 //! An image bundle is a directory with an `image.json` ([`Manifest`]) naming files beside it.
-//! [`VzBackend::prepare`] copies the bundle into the instance directory as APFS clones, so a
-//! running instance never depends on its image again and the copies cost no space until written.
+//! [`VzBackend::prepare`] copies the bundle into the instance directory as APFS clones, so an
+//! instance never depends on its image again and the copies cost no space until written.
 
 mod vm;
 
@@ -25,7 +25,8 @@ use super::{Backend, Capabilities, Error, GuestOs, InstanceSpec, Result};
 pub use vm::run;
 
 pub const MANIFEST: &str = "image.json";
-/// Recorded at the first prepare; an instance's disk always comes from one image.
+/// The image an instance was first prepared from, recorded once its copies are complete. An
+/// instance's disk always comes from that one image.
 const SOURCE: &str = "source.json";
 pub const DISK: &str = "disk.img";
 
@@ -122,55 +123,40 @@ impl Backend for VzBackend {
     }
 
     fn prepare(&self, spec: &InstanceSpec, dir: &Path) -> Result<()> {
-        let image = fs::canonicalize(&spec.image)
-            .with_context(|| format!("image {}", spec.image.display()))?;
-        let manifest = Manifest::read(&image)?;
-        if manifest.guest() != spec.guest {
-            return Err(Error::Invalid(format!(
-                "image {} is a {:?} guest, the spec asks for {:?}",
-                image.display(),
-                manifest.guest(),
-                spec.guest
-            )));
-        }
-        let source = dir.join(SOURCE);
-        match fs::read(&source) {
-            Ok(recorded) => {
-                let recorded: PathBuf = serde_json::from_slice(&recorded)?;
-                if recorded != image {
-                    return Err(Error::Invalid(format!(
-                        "instance {} was created from {}; delete it to change its image",
-                        spec.id,
-                        recorded.display()
-                    )));
-                }
+        // Once the instance has its own copies, its image is never read again: the bundle
+        // may since have moved, changed or been deleted.
+        let manifest = if dir.join(SOURCE).exists() {
+            Manifest::read(dir)?
+        } else {
+            let image = fs::canonicalize(&spec.image)
+                .with_context(|| format!("image {}", spec.image.display()))?;
+            let manifest = Manifest::read(&image)?;
+            check_guest(&manifest, spec)?;
+            // Disk first and the record last, so an interrupted prepare starts over.
+            for name in manifest.files() {
+                let to = dir.join(if Some(name) == manifest.disk() {
+                    DISK
+                } else {
+                    name
+                });
+                let _ = fs::remove_file(&to);
+                clone(&image.join(name), &to)?;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Disk first and the record last, so an interrupted prepare starts over.
-                for name in manifest.files() {
-                    let to = dir.join(if Some(name) == manifest.disk() {
-                        DISK
-                    } else {
-                        name
-                    });
-                    let _ = fs::remove_file(&to);
-                    clone(&image.join(name), &to)?;
-                }
-                if manifest.disk().is_none() {
-                    let _ = fs::remove_file(dir.join(DISK));
-                    fs::File::create(dir.join(DISK))?;
-                }
-                // The instance's own manifest names its own disk.
-                let mut copy = manifest.clone();
-                match &mut copy {
-                    Manifest::Linux { disk, .. } => *disk = Some(DISK.into()),
-                    Manifest::Macos { disk, .. } => *disk = DISK.into(),
-                }
-                super::write_json(&dir.join(MANIFEST), &copy)?;
-                super::write_json(&source, &image)?;
+            if manifest.disk().is_none() {
+                let _ = fs::remove_file(dir.join(DISK));
+                fs::File::create(dir.join(DISK))?;
             }
-            Err(e) => return Err(e.into()),
-        }
+            // The instance's own manifest names its own disk.
+            let mut copy = manifest;
+            match &mut copy {
+                Manifest::Linux { disk, .. } => *disk = Some(DISK.into()),
+                Manifest::Macos { disk, .. } => *disk = DISK.into(),
+            }
+            super::write_json(&dir.join(MANIFEST), &copy)?;
+            super::write_json(&dir.join(SOURCE), &image)?;
+            copy
+        };
+        check_guest(&manifest, spec)?;
         grow(&dir.join(DISK), spec.disk_gb)?;
         Ok(())
     }
@@ -180,6 +166,18 @@ impl Backend for VzBackend {
         command.arg(dir);
         command
     }
+}
+
+fn check_guest(manifest: &Manifest, spec: &InstanceSpec) -> Result<()> {
+    if manifest.guest() != spec.guest {
+        return Err(Error::Invalid(format!(
+            "instance {} has a {:?} image, the spec asks for {:?}",
+            spec.id,
+            manifest.guest(),
+            spec.guest
+        )));
+    }
+    Ok(())
 }
 
 /// A copy-on-write clone: instant and free until either side is written.
@@ -214,8 +212,6 @@ fn grow(disk: &Path, gb: u32) -> Result<()> {
     Ok(())
 }
 
-/// Ad-hoc signs `runner` with the virtualization entitlement, which the framework requires.
-/// Signing needs no identity or network access; it is repeated only when the binary changed.
 /// Whether `runner` carries the virtualization entitlement.
 pub fn runner_signed(runner: &Path) -> anyhow::Result<bool> {
     let output = Command::new("/usr/bin/codesign")
@@ -226,6 +222,8 @@ pub fn runner_signed(runner: &Path) -> anyhow::Result<bool> {
         && String::from_utf8_lossy(&output.stdout).contains("com.apple.security.virtualization"))
 }
 
+/// Ad-hoc signs `runner` with the virtualization entitlement, which the framework requires.
+/// Signing needs no identity or network access; it is repeated only when the binary changed.
 pub fn sign_runner(runner: &Path) -> anyhow::Result<()> {
     let entitlements = std::env::temp_dir().join(format!(
         "fleet-vz-entitlements-{}.plist",

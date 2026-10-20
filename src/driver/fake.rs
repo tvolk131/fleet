@@ -36,6 +36,9 @@ pub struct FakeImage {
     pub ignore_graceful_stop: bool,
     #[serde(default)]
     pub boot_ms: u64,
+    /// The guest the image holds; any guest if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest: Option<GuestOs>,
     /// A directory of switches that tests flip while instances run, relative to the bundle
     /// if it is relative, so a bundle's digest need not depend on where it is. The fake appends what its
     /// guests do to `history` there and obeys these files:
@@ -84,10 +87,20 @@ impl Backend for FakeBackend {
     }
 
     fn prepare(&self, spec: &InstanceSpec, dir: &Path) -> super::Result<()> {
-        let image = FakeImage::read(&spec.image)?;
-        // Stands in for a disk cloned from the image.
-        std::fs::write(dir.join("disk.img"), [])?;
-        if let Some(faults) = image.faults {
+        // Like vz, an instance keeps its own copy of the image and never reads the bundle again.
+        let copied = dir.join("fake.json").exists();
+        let image = FakeImage::read(if copied { dir } else { &spec.image })?;
+        if image.guest.is_some_and(|guest| guest != spec.guest) {
+            return Err(super::Error::Invalid(format!(
+                "instance {} has a {:?} image, the spec asks for {:?}",
+                spec.id, image.guest, spec.guest
+            )));
+        }
+        // Stands in for a disk cloned from the image, which later starts keep.
+        if !dir.join("disk.img").exists() {
+            std::fs::write(dir.join("disk.img"), [])?;
+        }
+        if let Some(faults) = &image.faults {
             let mut history = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -98,6 +111,9 @@ impl Backend for FakeBackend {
                     "the image cannot be configured".into(),
                 ));
             }
+        }
+        if !copied {
+            image.write(dir)?;
         }
         Ok(())
     }
@@ -195,7 +211,7 @@ impl FakeVm {
 
 impl Vm for Arc<FakeVm> {
     fn start(&self, spec: &InstanceSpec, card: OwnedFd, restore: Option<&Path>) -> Result<()> {
-        let image = FakeImage::read(&spec.image)?;
+        let image = FakeImage::read(&self.dir)?;
         std::thread::sleep(Duration::from_millis(image.boot_ms));
         let served = match restore {
             Some(path) => serde_json::from_slice::<Saved>(&std::fs::read(path)?)?.served,
