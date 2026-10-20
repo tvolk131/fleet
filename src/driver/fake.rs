@@ -5,8 +5,9 @@
 //! An image bundle for the fake is a directory containing `fake.json` ([`FakeImage`]).
 //!
 //! Its guest agent is Fleet's real one, running commands on the host. They see a private
-//! `/tmp`: every `/tmp/` in their arguments becomes the instance's `guest/tmp/`, which a fresh
-//! boot empties. A `{"kind":"prepare","platform":..}` request names the host's own platform, so
+//! `/tmp`: every `/tmp/` path in their arguments becomes the instance's `guest/tmp/`, which a
+//! fresh boot empties. Paths into the host directory that holds the instance (on Linux, test
+//! homes are under `/tmp` too) are host paths and stay as they are. A `{"kind":"prepare","platform":..}` request names the host's own platform, so
 //! the guest helper accepts it on any host. `FLEET_TEST_VM_LIFETIME` names a file holding the
 //! runner's pid and the boot's identity while the guest runs, so test workloads can end with
 //! their VM.
@@ -187,14 +188,15 @@ impl FakeVm {
     /// A guest command, confined as the module documentation describes.
     fn command(&self, argv: &[String]) -> Command {
         let tmp = format!("{}/", self.guest_tmp().display());
+        let host = host_tmp_root(&self.dir);
         let argv: Vec<String> = argv
             .iter()
             .map(|arg| match serde_json::from_str::<serde_json::Value>(arg) {
                 Ok(mut value) if value.is_object() => {
                     host_platform(&mut value);
-                    private_tmp(&value.to_string(), &tmp)
+                    private_tmp(&value.to_string(), &tmp, host.as_deref())
                 }
-                _ => private_tmp(arg, &tmp),
+                _ => private_tmp(arg, &tmp, host.as_deref()),
             })
             .collect();
         self.log(&format!("spawn {}", argv.join(" ")));
@@ -382,9 +384,18 @@ pub fn run(args: super::runner::Args) -> Result<()> {
     super::runner::run(args, Arc::new(vm))
 }
 
+/// The top directory under `/tmp` that holds `dir`, if `dir` is under `/tmp` at all.
+fn host_tmp_root(dir: &Path) -> Option<String> {
+    let dir = dir.to_str()?;
+    let rest = dir
+        .strip_prefix("/tmp/")
+        .or_else(|| dir.strip_prefix("/private/tmp/"))?;
+    Some(rest.split('/').next()?.to_owned()).filter(|s| !s.is_empty())
+}
+
 /// Replaces each `/tmp/` that begins a path, leaving ones inside other paths such as
-/// `/private/tmp/`.
-fn private_tmp(arg: &str, tmp: &str) -> String {
+/// `/private/tmp/`, and paths into `/tmp/<host>`.
+fn private_tmp(arg: &str, tmp: &str, host: Option<&str>) -> String {
     let mut out = String::with_capacity(arg.len());
     let mut rest = arg;
     while let Some(at) = rest.find("/tmp/") {
@@ -393,8 +404,20 @@ fn private_tmp(arg: &str, tmp: &str) -> String {
             .chain(rest[..at].chars())
             .last()
             .is_none_or(|c| !(c.is_alphanumeric() || "._-~".contains(c)));
+        let after = &rest[at + "/tmp/".len()..];
+        let on_host = host.is_some_and(|host| {
+            after.strip_prefix(host).is_some_and(|tail| {
+                tail.chars()
+                    .next()
+                    .is_none_or(|c| !(c.is_alphanumeric() || "._-~".contains(c)))
+            })
+        });
         out.push_str(&rest[..at]);
-        out.push_str(if starts_path { tmp } else { "/tmp/" });
+        out.push_str(if starts_path && !on_host {
+            tmp
+        } else {
+            "/tmp/"
+        });
         rest = &rest[at + "/tmp/".len()..];
     }
     out.push_str(rest);
@@ -424,5 +447,30 @@ fn host_platform(value: &mut serde_json::Value) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guest_tmp_paths_are_private_but_host_paths_are_not() {
+        let host = host_tmp_root(Path::new("/tmp/fleet-vm-1/instances/a/driver/vm"));
+        assert_eq!(host.as_deref(), Some("fleet-vm-1"));
+        let rewrite = |arg| private_tmp(arg, "/G/", host.as_deref());
+        assert_eq!(rewrite("/tmp/fleet-guest-ab"), "/G/fleet-guest-ab");
+        assert_eq!(
+            rewrite(r#"{"cwd":"/tmp/x/work"}"#),
+            r#"{"cwd":"/G/x/work"}"#
+        );
+        assert_eq!(rewrite("/tmp/fleet-vm-1/work"), "/tmp/fleet-vm-1/work");
+        assert_eq!(rewrite("/tmp/fleet-vm-10/work"), "/G/fleet-vm-10/work");
+        assert_eq!(rewrite("/private/tmp/y"), "/private/tmp/y");
+        assert_eq!(
+            host_tmp_root(Path::new("/private/tmp/h/vm")).as_deref(),
+            Some("h")
+        );
+        assert_eq!(host_tmp_root(Path::new("/var/folders/x/vm")), None);
     }
 }
