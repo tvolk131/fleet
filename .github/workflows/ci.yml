@@ -64,7 +64,7 @@ jobs:
       - name: Package headless qualification binaries
         run: |
           cargo build --bin fleet --no-default-features --features control-plane,qualification --locked
-          tar -czf fleet-binaries.tar.gz -C target/debug fleet fleet-guest fleet-fake-tart fleet-test-workload fleet-qualify fleet-import-baseline
+          tar -czf fleet-binaries.tar.gz -C target/debug fleet fleet-guest fleet-runner-vz fleet-test-workload fleet-qualify fleet-import-baseline
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-${{ matrix.os }}

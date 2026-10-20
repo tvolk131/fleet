@@ -73,7 +73,7 @@ change policy, or read the administrator-only control-plane state.
 
 The first backend is a private filesystem, not an object-storage provider. Artifact transfers expose
 only manifest-listed files; there is no arbitrary path API. Guests receive no storage credentials and
-retain the same offline/public-internet-only networking restrictions.
+keep their VM's networking restrictions (only `offline` is available today).
 
 ## Verification, quotas, and repair
 
@@ -110,7 +110,7 @@ the source worker. A worker does not have to be online for backup export. Destin
 failed transfers remove their partial download. Exports validate every file before returning success.
 The GUI shows checkpoint backup status, and its existing output download uses the same fallback path.
 
-[Portable Tart jobs](PORTABLE_JOBS.md) can resume on a different compatible worker after confirmed
+[Portable VM jobs](PORTABLE_JOBS.md) can resume on a different compatible worker after confirmed
 suspension and VM cleanup. The original executable/inputs and selected checkpoint must have verified
 storage copies. The destination imports verified bytes before launching; the original worker and client
 can be unavailable. Jobs without an explicit portable runtime retain original-worker resume semantics.
@@ -285,7 +285,7 @@ target/debug/fleet-qualify checkpoint --fake --backup-restore \
   --binary "$PWD/target/debug/fleet" --home /tmp/fleet-control-storage-ci
 ```
 
-Omit `--fake` and supply `--instances` and `--image-cache` to qualify with real offline Tart VMs. The
+Omit `--fake` and supply a `vz` `--instances` catalog to qualify with real offline VMs. The
 backup fixture uses the built-in input-free canary. It checks installed work is idle and verifies its
 records are unchanged. Separate homes/processes on one M4 qualify the recovery protocol, **not survival
 of physical M4 loss**. That final failure domain still requires a second machine.
@@ -301,4 +301,4 @@ target/debug/fleet-qualify portable --fake --storage-lifecycle \
 ```
 
 All homes, keys, services, workloads and fault injection are isolated. This scenario is part of CI on
-Linux and macOS; it uses the fake Tart adapter because the behavior under test is storage orchestration.
+Linux and macOS; it uses the fake VM driver because the behavior under test is storage orchestration.

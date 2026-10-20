@@ -22,7 +22,7 @@ all processes able to reach the host's loopback are inside this trust boundary.
 Do not expose a host adapter's ports to mutually untrusted VM guests. Use a
 [VM attachment](VM_SERVICE_NETWORKING.md) instead: a separate host-owned identity
 bound to one persistent VM, with its local sockets inside that guest. Guest
-traffic crosses Tart's private guest channel; the host checks its permitted route
+traffic crosses Fleet's private guest channel; the host checks its permitted route
 and the destination checks the authenticated adapter identity.
 
 ## Committed policy and outages

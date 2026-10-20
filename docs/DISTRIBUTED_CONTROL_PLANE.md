@@ -3,7 +3,7 @@
 Fleet has one logical control plane, represented by either one replica or a three-voter Raft quorum.
 Trusted physical machines run independently configured controller, worker, storage and tunnel roles.
 Roles can share one process, but colocation does not bypass authentication, consensus or worker
-reconciliation. Untrusted application code runs inside Tart guests; native jobs remain trusted host
+reconciliation. Untrusted application code runs inside VM guests; native jobs remain trusted host
 processes. The [baseline contract](BASELINE.md) defines current formats and upgrade boundaries.
 
 ## Control plane
@@ -40,7 +40,7 @@ authorization and execution fencing. `worker_data` describes replies for the aut
 clients can read observations or stage authorized inputs without receiving a direct launch channel.
 `inputs::prepare` builds immutable input specifications independently of networking.
 
-Jobs have stable logical IDs and immutable attempts. A portable Tart job can cooperatively suspend
+Jobs have stable logical IDs and immutable attempts. A portable VM job can cooperatively suspend
 at an application checkpoint and resume with a new attempt on a compatible worker. A persistent VM
 has independent lifecycle intent and durable guest operations. See [workers](CONTROL_PLANE_WORKERS.md),
 [portable jobs](PORTABLE_JOBS.md) and [managed VMs](MANAGED_VMS.md).
@@ -54,8 +54,9 @@ See [artifact storage](ARTIFACT_STORAGE.md), [history](DURABLE_HISTORY.md) and [
 
 Authenticated iroh service tunnels carry explicitly permitted TCP services, including host-native
 Garage and optional VM service attachments. Cached routes enforce the latest locally accepted policy
-and expose their freshness; revocation is confirmed through observations. VM networking remains
-offline or restricted public-internet access with separately declared private services. See
+and expose their freshness; revocation is confirmed through observations. VM networking is
+offline, with separately declared private services; restricted public-internet access awaits Fleet's
+host network agent. See
 [service tunnels](SERVICE_TUNNELS.md) and [VM networking](VM_SERVICE_NETWORKING.md).
 
 ## Clients, membership and recovery
@@ -74,5 +75,5 @@ fences while reconciling the surviving inventory. See [membership](CONTROL_PLANE
 
 The root package contains the product and backend library; `crates/fleet-guest` contains the guest
 helper. `crates/fleet-tools` is an unpublished package for release qualification and the one-time
-importer. Fake Tart and workload fixture executables require the explicit `qualification` feature.
+importer. The workload fixture executable requires the explicit `qualification` feature.
 Failure-injection CLI options are excluded from normal builds. See [qualification](QUALIFICATION.md).

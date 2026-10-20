@@ -1,6 +1,6 @@
 # Internal guest operations
 
-Tart's guest channel supplies the execution and file-transfer backend for [VM jobs](VM_JOBS.md).
+Fleet's guest agent (`fleet-guest --agent` on vsock port 1024, reached with `fleet guest-exec`) supplies the execution and file-transfer backend for [VM jobs](VM_JOBS.md).
 It works for offline guests without granting host shares or application-network access. Persistent instances expose durable commands and regular-file uploads/downloads through the replicated
 [managed VM API](MANAGED_VMS.md). Interactive shells are not provided.
 

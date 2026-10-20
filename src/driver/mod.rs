@@ -6,6 +6,7 @@
 //! restarts never touch guests. [`RunnerDriver`] supervises runners for any [`Backend`]; the
 //! backend only says what it can run, how to lay out an instance and how to launch its runner.
 
+pub mod bundle;
 pub mod conformance;
 pub mod fake;
 pub mod protocol;
@@ -271,6 +272,39 @@ const READY_TIMEOUT: Duration = Duration::from_secs(60);
 struct Start {
     generation: u64,
     pid: u32,
+    /// The host's boot session when the runner launched. A runner missing since the host
+    /// restarted was stopped by the restart, not lost.
+    #[serde(default)]
+    host_boot: Option<String>,
+}
+
+/// Identifies the host's current boot.
+fn host_boot() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = [0u8; 64];
+        let mut len = buf.len();
+        let ok = unsafe {
+            libc::sysctlbyname(
+                c"kern.bootsessionuuid".as_ptr(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0;
+        ok.then(|| {
+            String::from_utf8_lossy(&buf[..len])
+                .trim_end_matches('\0')
+                .to_owned()
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|id| id.trim().to_owned())
+    }
 }
 
 /// Supervises one runner process per instance under `root/<id>/`.
@@ -354,6 +388,9 @@ impl<B: Backend> RunnerDriver<B> {
                 Phase::Failed
             }
             (_, Some(_)) | (None, None) => Phase::Stopped,
+            (Some(start), None) if start.host_boot.is_some() && start.host_boot != host_boot() => {
+                Phase::Stopped
+            }
             (Some(_), None) => Phase::Lost,
         };
         Ok(observed)
@@ -430,6 +467,7 @@ impl<B: Backend> RunnerDriver<B> {
             &Start {
                 generation: spec.generation,
                 pid,
+                host_boot: host_boot(),
             },
         )?;
         // Reap the runner if it exits while this process lives; otherwise launchd/init does.

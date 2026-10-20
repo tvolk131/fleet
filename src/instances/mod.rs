@@ -1,10 +1,10 @@
 //! Persistent VM instances, independent of job lifetimes.
 
+mod controller;
 pub mod guest;
 pub mod network;
 pub mod runtime;
 pub mod storage;
-mod tart;
 
 use crate::{jobs, worker_data::Hello};
 use anyhow::{Context, Result, bail};
@@ -134,10 +134,8 @@ impl Info {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub tart: PathBuf,
-    pub softnet: PathBuf,
-    /// Only immutable OCI references (name@sha256:...) are accepted.
-    pub images: BTreeMap<String, String>,
+    /// Image bundles by alias, each pinned by its content digest (`fleet image digest`).
+    pub images: BTreeMap<String, Image>,
     /// Explicit guest platform/capabilities for each approved image. Absent entries cannot run portable jobs.
     #[serde(default)]
     pub platforms: BTreeMap<String, runtime::Platform>,
@@ -145,7 +143,45 @@ pub struct Config {
     pub disk_budget_gb: u32,
     pub min_free_disk_gb: u32,
     #[serde(default)]
-    pub block_cidrs: Vec<String>,
+    pub driver: DriverKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Image {
+    /// An absolute path to the bundle directory.
+    pub bundle: PathBuf,
+    /// `blake3:` and the bundle's collection hash; provisioning checks it.
+    pub digest: String,
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DriverKind {
+    /// Virtualization.framework.
+    #[default]
+    Vz,
+    /// No hypervisor: guests are simulated on the host. For tests only.
+    Fake,
+}
+
+impl Image {
+    /// Writes a fake driver image (`crate::driver::fake::FakeImage`) at `dir/fake-image`,
+    /// whose guests obey the switches in `dir/vm-faults`, and returns its catalog entry. Its
+    /// digest is the same wherever `dir` is. For tests.
+    pub fn fake(dir: &Path) -> Result<Self> {
+        let bundle = dir.join("fake-image");
+        fs::create_dir_all(dir.join("vm-faults"))?;
+        crate::driver::fake::FakeImage {
+            faults: Some("../vm-faults".into()),
+            ..Default::default()
+        }
+        .write(&bundle)?;
+        Ok(Self {
+            digest: crate::driver::bundle::digest(&bundle)?,
+            bundle,
+        })
+    }
 }
 
 impl Config {
@@ -158,10 +194,9 @@ impl Config {
                     .images
                     .get(alias)
                     .context("platform references unknown image")?;
-                let (_, digest) = image.rsplit_once('@').context("image must be pinned")?;
                 let runtime = runtime::Runtime {
                     platform: platform.clone(),
-                    image_digest: digest.into(),
+                    image_digest: image.digest.clone(),
                 };
                 runtime.validate()?;
                 Ok((alias.clone(), runtime))
@@ -181,35 +216,26 @@ impl Config {
     }
 
     pub fn load(home: &Path) -> Result<Self> {
-        let config: Self = jobs::read_json(&home.join("instances.json"))?
+        let value: serde_json::Value = jobs::read_json(&home.join("instances.json"))?
             .context("VM backend disabled: configure the worker's instances.json first")?;
-        if !config.tart.is_absolute()
-            || !config.softnet.is_absolute()
-            || config.softnet.file_name().is_none_or(|n| n != "softnet")
-        {
-            bail!("Tart and Softnet paths must be absolute; Softnet's filename must be softnet");
+        if value.get("tart").is_some() || value.get("softnet").is_some() {
+            bail!(
+                "instances.json is from a Tart-based Fleet, which is no longer supported: delete this worker and prepare a new one with image bundles (see docs/VM_INSTANCES.md)"
+            );
         }
+        let config: Self = serde_json::from_value(value).context("invalid instances.json")?;
         if config.memory_budget_mb == 0 || config.disk_budget_gb == 0 || config.min_free_disk_gb < 5
         {
             bail!("VM budgets must be positive and the free disk guard at least 5 GiB");
         }
-        for source in config.images.values() {
-            let (name, hash) = source
-                .rsplit_once("@sha256:")
-                .context("images must be pinned OCI digests")?;
-            if name.starts_with('-')
-                || !name.contains('/')
-                || name.contains(char::is_whitespace)
-                || hash.len() != 64
-                || !hash.bytes().all(|b| b.is_ascii_hexdigit())
-            {
-                bail!("invalid pinned OCI image reference");
+        for (alias, image) in &config.images {
+            if !image.bundle.is_absolute() {
+                bail!("image {alias}'s bundle path must be absolute");
             }
+            crate::driver::bundle::validate(&image.digest)
+                .with_context(|| format!("image {alias}"))?;
         }
         config.runtimes()?;
-        for subnet in &config.block_cidrs {
-            network::cidr(subnet)?;
-        }
         Ok(config)
     }
 }
@@ -312,6 +338,11 @@ fn create_inner(
     config.check_runtime(&spec)?;
     if !config.images.contains_key(&spec.image) {
         bail!("image is not in this worker's trusted catalog");
+    }
+    if spec.network == Network::PublicInternet {
+        bail!(
+            "public_internet VMs need Fleet's host network agent, which is not built yet; use offline"
+        );
     }
     if spec.cpus == 0
         || spec.cpus > hello.cpu_slots
@@ -587,8 +618,9 @@ pub fn ensure_controller(home: &Path, id: &str, executable: &Path) -> Result<()>
 }
 
 pub fn run_controller(home: &Path, id: &str) -> Result<()> {
-    tart::run_controller(home, id)
+    controller::run(home, id)
 }
+pub use controller::guest_exec;
 
 /// Bounded worker capabilities for placement; the worker rechecks admission.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

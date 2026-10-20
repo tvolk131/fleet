@@ -216,6 +216,16 @@ fn grow(disk: &Path, gb: u32) -> Result<()> {
 
 /// Ad-hoc signs `runner` with the virtualization entitlement, which the framework requires.
 /// Signing needs no identity or network access; it is repeated only when the binary changed.
+/// Whether `runner` carries the virtualization entitlement.
+pub fn runner_signed(runner: &Path) -> anyhow::Result<bool> {
+    let output = Command::new("/usr/bin/codesign")
+        .args(["-d", "--entitlements", "-", "--xml"])
+        .arg(runner)
+        .output()?;
+    Ok(output.status.success()
+        && String::from_utf8_lossy(&output.stdout).contains("com.apple.security.virtualization"))
+}
+
 pub fn sign_runner(runner: &Path) -> anyhow::Result<()> {
     let entitlements = std::env::temp_dir().join(format!(
         "fleet-vz-entitlements-{}.plist",

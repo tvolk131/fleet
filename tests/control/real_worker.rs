@@ -6,7 +6,6 @@ use fleet::{
     },
     instances, jobs, worker_data,
 };
-use std::os::unix::fs::PermissionsExt;
 
 fn hello() -> worker_data::Hello {
     worker_data::Hello {
@@ -116,13 +115,6 @@ async fn prepare_named(
     if tart {
         let backend = home.join("backend");
         std::fs::create_dir_all(&backend).unwrap();
-        let fake = backend.join("tart");
-        let softnet = backend.join("softnet");
-        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_fleet-fake-tart"), &fake).unwrap();
-        std::fs::write(&softnet, "#!/bin/sh\necho 'softnet 0.24.0-test'\n").unwrap();
-        for p in [&fake, &softnet] {
-            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
         instances::write(
             &backend.join("instances.json"),
             &instances::Config {
@@ -131,16 +123,14 @@ async fn prepare_named(
                 } else {
                     BTreeMap::new()
                 },
-                tart: fake,
-                softnet,
                 images: BTreeMap::from([(
                     "macos".into(),
-                    format!("registry.test/macos@sha256:{}", "a".repeat(64)),
+                    instances::Image::fake(&backend).unwrap(),
                 )]),
                 memory_budget_mb: 8192,
                 disk_budget_gb: 200,
                 min_free_disk_gb: 5,
-                block_cidrs: vec![],
+                driver: instances::DriverKind::Fake,
             },
         )
         .unwrap();
@@ -601,7 +591,7 @@ async fn enrolled_worker_cannot_submit_jobs_or_impersonate_another_journal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tart_job_and_persistent_instances_use_replicated_intent_and_shared_budgets() {
+async fn vm_job_and_persistent_instances_use_replicated_intent_and_shared_budgets() {
     let mut c = Cluster::new(3).await;
     let (home, config) = prepare(&mut c, true).await;
     let mut w = Worker::start(&home, config.clone(), hello()).await.unwrap();
@@ -657,10 +647,10 @@ async fn tart_job_and_persistent_instances_use_replicated_intent_and_shared_budg
             .all(|i| i.observed.state == instances::State::Running)
     );
     assert_eq!(
-        std::fs::read_to_string(home.join("backend/instance-tart/history"))
+        std::fs::read_to_string(home.join("backend/vm-faults/history"))
             .unwrap()
             .lines()
-            .filter(|l| l.starts_with("run "))
+            .filter(|l| l.ends_with(" boot"))
             .count(),
         2,
         "worker restart must reuse both existing VMs"

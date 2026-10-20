@@ -61,9 +61,16 @@ fn run() -> Result<()> {
             path.with_file_name(format!("guest-{}.ready", std::process::id())),
             b"ready",
         )?;
+        // The fake VM driver writes its runner's pid first; a forced stop kills only that.
+        let runner = String::from_utf8_lossy(&generation)
+            .split(' ')
+            .next()
+            .and_then(|pid| pid.parse::<i32>().ok());
         std::thread::spawn(move || {
             loop {
-                if fs::read(&path).ok().as_ref() != Some(&generation) {
+                if fs::read(&path).ok().as_ref() != Some(&generation)
+                    || runner.is_some_and(|pid| unsafe { libc::kill(pid, 0) } != 0)
+                {
                     std::process::exit(0);
                 }
                 sleep(20);

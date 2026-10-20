@@ -568,9 +568,10 @@ pub fn build(output_dir: &Path) -> Result<()> {
         )?;
         hashes.insert(name.into(), json!(digest(&output_dir.join(name))?));
     }
-    for name in ["fleet-fake-tart", "fleet-test-workload"] {
-        fs::copy(tool(name), output_dir.join(name))?;
-    }
+    fs::copy(
+        tool("fleet-test-workload"),
+        output_dir.join("fleet-test-workload"),
+    )?;
     let report = json!({"family":fleet::control::FAMILY,"synthetic_future_releases":true,"snapshot_after_entries":100,"ranges":{"baseline":[BASE,BASE],"candidate":[BASE,NEXT],"unsupported":[NEXT+1,NEXT+2]},"sha256":hashes});
     save(&output_dir.join("builds.json"), &report)?;
     fs::remove_dir_all(&scratch)?;

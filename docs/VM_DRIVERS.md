@@ -1,9 +1,10 @@
 # VM drivers
 
-Status: the trait, the `fake` driver and the production `vz` driver are implemented and pass the
-conformance suite; `krun` is still a spike. Tart is still what the worker runs (see "Removing Tart").
+Status: the trait, the `fake` driver and the production `vz` driver are implemented, pass the
+conformance suite and are what the worker runs (`vz` by default, `fake` for tests and qualification);
+`krun` is still a spike. The host network agent is not built yet, so only `offline` VMs run.
 
-Fleet replaces Tart and Softnet with its own VM drivers. A driver turns a Fleet-owned instance
+Fleet runs VMs through its own drivers, which replaced Tart and Softnet. A driver turns a Fleet-owned instance
 record into a running guest on one host and reports what it observes. Fleet stays the only
 authority for what should exist; a driver never invents, renames or garbage-collects instances on
 its own.
@@ -33,7 +34,7 @@ Native processes stay a separate executor (`backend.rs`); they are not a driver.
 is only worth adding if NVIDIA GPU boxes are. Apple's Containerization library is the fallback if
 `vz` proves too costly to own, but needs a patch to hand Fleet the network card.
 
-Tart is removed outright, not kept behind a flag: its licence (FSL), its root-owned Softnet helper
+Tart was removed outright, not kept behind a flag: its licence (FSL), its root-owned Softnet helper
 and its own VM registry each break a binding constraint.
 
 ## Process model
@@ -69,12 +70,13 @@ never granted to the rest of Fleet. Both take `--lock-fd` and `--restore` and sp
 - Disks are raw images. Instance disks are `clonefile(2)` copies of a base image, so they are
   instant and copy-on-write on APFS. On Linux hosts, `FICLONE` where the filesystem supports it,
   otherwise a full copy.
-- Images stop being OCI references pulled by Tart. A Fleet image is a bundle directory: an
-  `image.json` manifest naming files beside it, either a Linux kernel, optional initrd, command line
-  and optional disk, or a macOS hardware model, auxiliary storage (NVRAM) and disk.
-  `vz::import_tart` turns a Tart VM directory into a bundle with clones, so existing images carry
-  over without a download. Still to do: storing and transferring bundles content-addressed with the
-  iroh-blobs store, and pinning bundle hashes in the trusted catalog instead of OCI digests.
+- A Fleet image is a flat bundle directory: an `image.json` manifest naming files beside it, either
+  a Linux kernel, optional initrd, command line and optional disk, or a macOS hardware model,
+  auxiliary storage (NVRAM) and disk. Its identity is `blake3:<hex>`, the iroh-blobs collection
+  hash over every regular non-dot file (`driver/bundle.rs`, printed by `fleet image digest`), which
+  the trusted catalog pins. `fleet image import-tart` (`vz::import_tart`) turns a Tart VM directory
+  into a bundle with clones, so existing images carry over without a download. Still to do:
+  transferring bundles between workers with iroh-blobs; today each worker needs its own copy.
 - `prepare` clones every file of the bundle into the instance directory and records which bundle it
   came from. A running instance never reads its image again, an instance cannot silently switch
   images, and disks only grow.
@@ -92,15 +94,16 @@ address carried over iroh.
 
 ## Guest channel
 
-`fleet-guest` will listen on `driver::AGENT_PORT` (vsock 1024) inside the guest, replacing
-`tart exec`. The driver exposes `connect_guest(port) -> stream`; the runner bridges it from
+`fleet-guest --agent` listens on `driver::AGENT_PORT` (vsock 1024) inside the guest; `fleet
+guest-exec` and the worker's guest operations use it. The driver exposes `connect_guest(port) -> stream`; the runner bridges it from
 `runner.sock` to the hypervisor's vsock device.
 
 A graceful stop presses the virtual power button and also sends `{"kind":"shutdown"}` to the agent
 port, retrying while the guest boots. Neither guest tested honours the power button: the Kata test
 kernel has no GPIO power-key driver, and macOS ignored it for the whole 90-second deadline. So in
-practice graceful stop depends on the agent, and macOS guests are forced until Fleet's agent is in
-the image.
+practice graceful stop depends on the agent, and macOS guests without it are forced. For macOS
+images, `sudo contrib/install-guest-agent.sh <bundle> <fleet-guest>` installs the agent as a
+LaunchAgent.
 
 ## Driver trait
 
@@ -123,8 +126,8 @@ An instance directory holds `spec.json` (the recorded spec and generation), `sta
 | held | socket answers | `Running` or `Stopping` |
 | held | socket not answering yet | `Starting` |
 | free | `exit.json` says failed | `Failed` |
-| free | any other `exit.json`, or never started | `Stopped` |
-| free | `start.json` without `exit.json` | `Lost` |
+| free | any other `exit.json`, never started, or launched before the host last booted | `Stopped` |
+| free | `start.json` without `exit.json`, same host boot | `Lost` |
 
 Every call is fenced by generation: an older generation than `spec.json` gets `Error::Stale`.
 Repeating a generation with a different spec is rejected; `delete` forgets the generation.

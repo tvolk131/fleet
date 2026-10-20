@@ -2,7 +2,7 @@ use super::support::*;
 use anyhow::{Context, Result, ensure};
 use clap::Args;
 use serde_json::{Value, json};
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+use std::{fs, path::PathBuf};
 
 #[derive(Args)]
 pub struct Options {
@@ -14,8 +14,6 @@ pub struct Options {
     pub fake: bool,
     #[arg(long)]
     pub instances: Option<PathBuf>,
-    #[arg(long)]
-    pub image_cache: Option<PathBuf>,
     #[arg(long)]
     pub job: Option<PathBuf>,
     #[arg(long)]
@@ -46,10 +44,7 @@ pub(super) fn real_guard(a: &Options) -> Result<()> {
     if a.fake {
         return Ok(());
     }
-    ensure!(
-        a.instances.is_some() && a.image_cache.is_some(),
-        "real Tart needs --instances and --image-cache"
-    );
+    ensure!(a.instances.is_some(), "real VMs need --instances");
     let home = PathBuf::from(std::env::var("HOME")?);
     for config in [
         home.join("fleet/replicated/service.json"),
@@ -94,12 +89,15 @@ pub(super) fn real_guard(a: &Options) -> Result<()> {
 }
 pub(super) fn settings(l: &Lab, a: &Options) -> Result<Value> {
     let mut s = if a.fake {
+        // A fake driver image (`fleet::driver::fake::FakeImage`), shared by every worker.
+        fs::create_dir_all(l.root.join("vm-faults"))?;
+        fs::create_dir_all(l.root.join("fake-image"))?;
         fs::write(
-            l.root.join("softnet"),
-            "#!/bin/sh\necho 'softnet 0.24.0-test'\n",
+            l.root.join("fake-image/fake.json"),
+            r#"{"faults":"../vm-faults"}"#,
         )?;
-        fs::set_permissions(l.root.join("softnet"), fs::Permissions::from_mode(0o700))?;
-        json!({"tart":l.s("fleet-fake-tart"),"softnet":l.s("softnet"),"images":{"macos":format!("registry.test/macos@sha256:{}","a".repeat(64))},"block_cidrs":[]})
+        let image = l.cli(&["image", "digest", &l.s("fake-image")])?;
+        json!({"driver":"fake","images":{"macos":image}})
     } else {
         read(a.instances.as_ref().context("instances required")?)?
     };
@@ -126,21 +124,6 @@ pub(super) fn worker(l: &Lab, a: &Options, id: &str, settings: &Value) -> Result
         "--instances",
         &l.s(&format!("{id}-instances.json")),
     ])?;
-    if !a.fake {
-        let cache = l.root.join(format!("{id}/backend/instance-tart/cache"));
-        fs::create_dir_all(cache.parent().unwrap())?;
-        let out = output(
-            "/bin/cp".as_ref(),
-            &[
-                "-cR".into(),
-                a.image_cache.as_ref().unwrap().display().to_string(),
-                cache.display().to_string(),
-            ],
-            None,
-            180,
-        )?;
-        ensure!(out.status.success(), "private image cache copy failed");
-    }
     l.cli(&[
         "service",
         "configure",
@@ -289,7 +272,7 @@ pub fn checkpoint(a: Options) -> Result<()> {
     l.init(1)?;
     let mut s = settings(&l, &a)?;
     let platform = json!({"os":"macos","arch":"aarch64","capabilities":[]});
-    let runtime = json!({"platform":platform,"image_digest":s["images"]["macos"].as_str().unwrap().split('@').nth(1).unwrap()});
+    let runtime = json!({"platform":platform,"image_digest":s["images"]["macos"]["digest"]});
     if a.backup_restore {
         s["platforms"] = json!({"macos":platform});
     }
@@ -534,7 +517,7 @@ pub fn checkpoint(a: Options) -> Result<()> {
     }
     let vm_count = deleted_vms(&l, &["worker"])?;
     l.phase("suspend_delete_restart_backup_restore_and_fresh_vm_resume");
-    l.report(json!({"success":true,"real_tart":!a.fake,"fixture_vms_created":vm_count,"all_fixture_vms_deleted":true,"unique_attempts":2,"off_worker_restore_verified":a.backup_restore,"rolling_reclamation_verified":a.rolling,"executable_input_bytes":input_bytes,"physical_failure_domain":"one machine; no physical host-loss claim"}))
+    l.report(json!({"success":true,"real_vm":!a.fake,"fixture_vms_created":vm_count,"all_fixture_vms_deleted":true,"unique_attempts":2,"off_worker_restore_verified":a.backup_restore,"rolling_reclamation_verified":a.rolling,"executable_input_bytes":input_bytes,"physical_failure_domain":"one machine; no physical host-loss claim"}))
 }
 
 fn backed(l: &Lab, number: usize) -> Result<Value> {
@@ -592,7 +575,7 @@ pub fn portable(mut a: Options) -> Result<()> {
     real_guard(&a)?;
     ensure!(
         a.baseline_binary.is_none() || a.fake,
-        "mixed-version fixture must use simulated Tart"
+        "mixed-version fixture must use the fake driver"
     );
     a.history |= a.storage_lifecycle;
     let mut l = Lab::new(&a.home, &a.binary)?;
@@ -605,7 +588,7 @@ pub fn portable(mut a: Options) -> Result<()> {
     let mut s = settings(&l, &a)?;
     let platform = json!({"os":"macos","arch":"aarch64","capabilities":[]});
     s["platforms"] = json!({"macos":platform});
-    let runtime = json!({"platform":platform,"image_digest":s["images"]["macos"].as_str().unwrap().split('@').nth(1).unwrap()});
+    let runtime = json!({"platform":platform,"image_digest":s["images"]["macos"]["digest"]});
     worker(&l, &a, "source", &s)?;
     let mut initial = s.clone();
     initial["platforms"] = json!({});
@@ -1090,7 +1073,7 @@ pub fn portable(mut a: Options) -> Result<()> {
     delete_all(&l)?;
     let count = deleted_vms(&l, &["source", "destination"])?;
     l.phase("dependent_artifact_retention_and_cleanup");
-    l.report(json!({"success":true,"real_tart":!a.fake,"fixture_vms_created":count,"all_fixture_vms_deleted":true,"rolling_vm_agent_upgrade":a.baseline_binary.is_some(),"cross_worker_resume":true,"durable_executable_and_inputs":true,"storage_replacement":a.storage_lifecycle,"lost_agent_recovery":a.storage_lifecycle,"durable_history":a.history,"physical_failure_domain":"one machine; no physical host-loss claim"}))
+    l.report(json!({"success":true,"real_vm":!a.fake,"fixture_vms_created":count,"all_fixture_vms_deleted":true,"rolling_vm_agent_upgrade":a.baseline_binary.is_some(),"cross_worker_resume":true,"durable_executable_and_inputs":true,"storage_replacement":a.storage_lifecycle,"lost_agent_recovery":a.storage_lifecycle,"durable_history":a.history,"physical_failure_domain":"one machine; no physical host-loss claim"}))
 }
 
 pub fn normal(a: Options) -> Result<()> {
@@ -1225,7 +1208,7 @@ pub fn normal(a: Options) -> Result<()> {
     }
     let count = deleted_vms(&l, &["worker"])?;
     l.phase("persistent_instance_create_stop_delete");
-    l.report(json!({"success":true,"real_tart":!a.fake,"fixture_vms_created":count,"all_fixture_vms_deleted":true,"native_coexistence":true,"guest_started_once":true}))
+    l.report(json!({"success":true,"real_vm":!a.fake,"fixture_vms_created":count,"all_fixture_vms_deleted":true,"native_coexistence":true,"guest_started_once":true}))
 }
 
 #[cfg(test)]

@@ -36,12 +36,12 @@ no ML training, host firewall change, or adoption of existing jobs.
 ## GitHub CI
 
 The workflow runs on Linux and macOS using the pinned Rust toolchain and locked
-dependencies. It runs the Rust suite (including simulated Tart backend contracts
+dependencies. It runs the Rust suite (including fake VM driver contracts
 and headless Material 3 GUI tests), Clippy, JSON CLI contracts and fixture safeguards,
 then the three-process local scenarios above. Actions are pinned to immutable
 commits and receive read-only repository permissions. Artifacts contain only test
 logs and the qualification summary, never private keys or complete fixture homes.
 
-Real Tart/Metal, Softnet, physical networking/power failure and system-service boot
+Real `vz` VMs/Metal, physical networking/power failure and system-service boot
 qualification remain hardware checks. GitHub-hosted tests do not claim to cover
 those. No self-hosted runner is installed on a training machine.

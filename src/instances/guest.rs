@@ -1,6 +1,6 @@
-//! Durable guest operations. Only the fixed Tart executable runs on the host;
-//! guest argv, paths and environment are data passed to a fixed guest helper.
-use super::{Config, Desired, State, directory, info, try_lock, valid_id, write};
+//! Durable guest operations. Only `fleet guest-exec` runs on the host; guest argv, paths and
+//! environment are data passed to a fixed guest helper.
+use super::{Desired, State, directory, info, try_lock, valid_id, write};
 use crate::{blobs, jobs};
 use anyhow::{Context, Result, bail};
 use iroh_blobs::Hash;
@@ -26,8 +26,9 @@ use std::{
 pub const MAX_FILE: u64 = 1 << 30;
 pub const MAX_LOG: u64 = 8 << 20;
 pub const LOG_CHUNK: usize = 64 << 10;
-/// Release packages place this small native executable beside Fleet. No guest interpreter is needed.
-pub fn helper_binary() -> Result<PathBuf> {
+/// An executable that release packages place beside Fleet: `fleet-guest`, `fleet-runner-vz`,
+/// or `fleet` itself for processes that are not Fleet (tests).
+pub fn companion(name: &str) -> Result<PathBuf> {
     let executable = std::env::current_exe()?.canonicalize()?;
     let parent = executable.parent().context("executable has no parent")?;
     let parent = if parent.file_name().is_some_and(|n| n == "deps") {
@@ -37,13 +38,17 @@ pub fn helper_binary() -> Result<PathBuf> {
     } else {
         parent
     };
-    let path = parent.join("fleet-guest");
+    let path = parent.join(name);
     anyhow::ensure!(
         path.is_file(),
-        "missing companion executable {}; install fleet-guest beside Fleet",
+        "missing companion executable {}; install {name} beside Fleet",
         path.display()
     );
     Ok(path)
+}
+/// This small native executable runs in the guest. No guest interpreter is needed.
+pub fn helper_binary() -> Result<PathBuf> {
+    companion("fleet-guest")
 }
 pub fn helper_guest_path() -> Result<String> {
     Ok(format!("/tmp/fleet-guest-{}", sha256(&helper_binary()?)?))
@@ -418,13 +423,8 @@ fn launch(home: &Path, id: &str, operation: &str, executable: &Path) -> Result<(
 }
 
 fn channel(home: &Path, id: &str) -> Result<Command> {
-    let config: Config = jobs::read_json(&directory(home, id)?.join("runtime.json"))?
-        .context("missing VM runtime")?;
-    let mut cmd = Command::new(config.tart);
-    cmd.env("TART_HOME", home.join("instance-tart"))
-        .env("TART_NO_AUTO_PRUNE", "1")
-        .args(["exec", "-i", &format!("fleet-{id}")])
-        .stdin(Stdio::null())
+    let mut cmd = super::guest_exec(home, id)?;
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
@@ -483,7 +483,7 @@ fn collect(
     stopped: Arc<AtomicBool>,
 ) -> Result<()> {
     // A descendant holding a pipe open must not hang the host supervisor after
-    // Tart exits. Drain buffered bytes, then stop without waiting for EOF.
+    // the guest channel exits. Drain buffered bytes, then stop without waiting for EOF.
     let fd = source.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
@@ -536,8 +536,8 @@ fn execute(
     let mut child = cmd.spawn()?;
     let exceeded = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
-    let stdout = child.stdout.take().context("missing Tart stdout")?;
-    let stderr = child.stderr.take().context("missing Tart stderr")?;
+    let stdout = child.stdout.take().context("missing guest stdout")?;
+    let stderr = child.stderr.take().context("missing guest stderr")?;
     let out_path = dir.join("stdout");
     let err_path = dir.join("stderr");
     let flag = exceeded.clone();
@@ -660,7 +660,7 @@ pub fn supervise(home: &Path, id: &str, operation: &str) -> Result<()> {
             };
             if code != 0 {
                 op.error = Some(format!(
-                    "Tart/guest exited with code {code}; inspect operation stderr"
+                    "guest exited with code {code}; inspect operation stderr"
                 ));
             }
         }

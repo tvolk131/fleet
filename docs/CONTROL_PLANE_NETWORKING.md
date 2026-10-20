@@ -24,8 +24,8 @@ and did not change installed legacy services.
 - `inspect` is authenticated local diagnostics and may be stale. Only normal quorum-confirmed reads
   and committed mutations authorize scheduling or membership decisions.
 
-The new transport does not change Tart guest networking. Offline and public-internet-only VM policies
-remain enforced by the worker's existing Tart/Softnet backend.
+The new transport does not change VM guest networking. Only `offline` VMs run until Fleet's host
+network agent exists.
 
 ## Prepare and distribute initial replicas
 
@@ -105,7 +105,7 @@ fleet cluster prepare-worker --home /absolute/private/worker \
 Copy its public `enroll.json` to the administrator and submit it using `request`. Start the worker using
 `worker --home /absolute/private/worker`. The optional combined `serve --worker-home ...` mode also
 works with separate replica/worker homes and identities. See [real workers](CONTROL_PLANE_WORKERS.md)
-for workload, input/output, resource and Tart configuration. Do not enroll overlapping capacity in the
+for workload, input/output, resource and VM configuration. Do not enroll overlapping capacity in the
 old coordinator and the new cluster. Qualification workloads are tiny, explicitly placed native canaries.
 
 For replica rotation, run this on the new replica's host:
@@ -171,5 +171,5 @@ partition between the experiment's replicas; it does not qualify a physical swit
 
 The qualification record (local hardware qualification record; excluded from the public source package) describes the completed run,
 binary/source hashes, regression checks and preservation evidence. Physical power loss, disk corruption,
-WAN failure, mixed-version upgrades, additional Tart hypervisor behavior and production service cutover
+WAN failure, mixed-version upgrades, additional hypervisor behavior and production service cutover
 remain outside this qualification. The prior metadata-size and snapshot limits still apply.

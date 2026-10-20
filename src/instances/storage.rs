@@ -49,10 +49,13 @@ pub fn guard(home: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn usage(path: &Path, deadline: Instant, entries: &mut u64) -> Result<Usage> {
+fn usage(path: &Path, skip: Option<&Path>, deadline: Instant, entries: &mut u64) -> Result<Usage> {
     let mut total = Usage::default();
     let mut pending = vec![path.to_owned()];
     while let Some(path) = pending.pop() {
+        if Some(path.as_path()) == skip {
+            continue;
+        }
         *entries += 1;
         if *entries > 200_000 || Instant::now() > deadline {
             bail!("storage inventory exceeded its scan budget");
@@ -89,6 +92,8 @@ pub fn report(home: &Path) -> Result<Report> {
         if i.observed.state != State::Deleted {
             reserved += u64::from(i.record.spec.disk_gb);
         }
+        let dir = super::directory(home, &i.record.id)?;
+        let vm = dir.join("driver");
         rows.push(Instance {
             id: i.record.id.clone(),
             capacity_gb: if i.observed.state == State::Deleted {
@@ -96,23 +101,20 @@ pub fn report(home: &Path) -> Result<Report> {
             } else {
                 i.record.spec.disk_gb
             },
-            disk: usage(
-                &home
-                    .join("instance-tart/vms")
-                    .join(format!("fleet-{}", i.record.id)),
-                deadline,
-                &mut entries,
-            )?,
-            management: usage(
-                &super::directory(home, &i.record.id)?,
-                deadline,
-                &mut entries,
-            )?,
+            disk: usage(&vm, None, deadline, &mut entries)?,
+            management: usage(&dir, Some(&vm), deadline, &mut entries)?,
         });
+    }
+    let mut images = Usage::default();
+    for image in config.images.values() {
+        let u = usage(&image.bundle, None, deadline, &mut entries)?;
+        images.logical_bytes = images.logical_bytes.saturating_add(u.logical_bytes);
+        images.allocated_bytes = images.allocated_bytes.saturating_add(u.allocated_bytes);
+        images.files += u.files;
     }
     Ok(Report{checked_at:crate::jobs::now(),free_bytes:free_bytes(home)?,disk_budget_gb:config.disk_budget_gb,
         reserved_capacity_gb:reserved,min_free_disk_gb:config.min_free_disk_gb,instances:rows,
-        image_cache:usage(&home.join("instance-tart/cache"),deadline,&mut entries)?,
-        blob_store:usage(&home.join("blobs"),deadline,&mut entries)?,
+        image_cache:images,
+        blob_store:usage(&home.join("blobs"),None,deadline,&mut entries)?,
         note:"Logical sizes include sparse capacity. Allocated bytes are filesystem-reported per-file blocks; APFS clones can share those blocks, so sums are neither unique physical use nor reclaimable space. No cleanup is performed.".into()})
 }

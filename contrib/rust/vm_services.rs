@@ -1,6 +1,6 @@
-//! End-to-end CLI qualification, using either real offline Tart VMs or the
+//! End-to-end CLI qualification, using either real offline VMs or the
 //! process-level test double. The latter does not prove a hypervisor boundary.
-use super::{support::*, tart};
+use super::{support::*, vm};
 use anyhow::{Context, Result, ensure};
 use fleet::instances::{self, guest};
 use serde_json::{Value, json};
@@ -80,7 +80,7 @@ fn executable(l: &Lab, id: &str) -> String {
     l.s(&format!("guest-{id}/workload"))
 }
 fn upload(l: &Lab, vm: &Vm, name: &str) -> Result<()> {
-    // Tart reports a running hypervisor before the guest agent has booted.
+    // A VM reports running before its guest agent has booted.
     // Only this side-effect-free readiness probe is retried, never the upload.
     wait(
         || {
@@ -150,8 +150,8 @@ fn apply(l: &Lab, topology: &Value, previous: u64) -> Result<()> {
     l.request(json!({"op":"replace_tunnels","request_id":format!("services-{previous}"),"expected_revision":previous,"topology":topology}))?;
     confirmed(l, previous + 1)
 }
-pub fn run(a: tart::Options) -> Result<()> {
-    tart::real_guard(&a)?;
+pub fn run(a: vm::Options) -> Result<()> {
+    vm::real_guard(&a)?;
     let mut l = Lab::new(&a.home, &a.binary)?;
     l.init(1)?;
     l.cli(&[
@@ -173,7 +173,7 @@ pub fn run(a: tart::Options) -> Result<()> {
         &l,
         fleet::control::tunnels::GENERATION.max(fleet::control::version::MIN),
     )?;
-    let mut settings = tart::settings(&l, &a)?;
+    let mut settings = vm::settings(&l, &a)?;
     settings["memory_budget_mb"] = if a.fake { 4096 } else { 8192 }.into();
     // Fake VMs allocate no RAM. Separate small logical workers let CI exercise
     // their network identities without relaxing real host admission checks.
@@ -189,8 +189,8 @@ pub fn run(a: tart::Options) -> Result<()> {
     ];
     let [vm_a, vm_b] = &vms;
     for worker in vms.iter().map(|vm| vm.worker).collect::<BTreeSet<_>>() {
-        tart::worker(&l, &a, worker, &settings)?;
-        tart::enroll(&l, worker, false)?;
+        vm::worker(&l, &a, worker, &settings)?;
+        vm::enroll(&l, worker, false)?;
         l.start(worker, None)?;
     }
     save(
@@ -375,7 +375,7 @@ pub fn run(a: tart::Options) -> Result<()> {
         l.stop("adapter-a", false)?;
         // Cached policy survives both controller loss and an adapter restart.
         l.start("adapter-a", None)?;
-        // Tart may keep the old guest command's stdin open after the host dies.
+        // The guest may keep the old command's stdin open after the host dies.
         // Allow its heartbeat expiry and the replacement adapter's bind retry.
         std::thread::sleep(fleet_guest::tunnel::DEADLINE + Duration::from_secs(5));
         probe(&l, vm_a, "cached-policy-restart", &a_to_b)?;
@@ -509,5 +509,5 @@ pub fn run(a: tart::Options) -> Result<()> {
     state(&mut l, "a", "Stopped")?;
     apply(&l, &json!({"adapters":{},"services":{},"routes":[]}), 4)?;
     l.phase("retired_stopped_vm_acknowledges_empty_policy");
-    l.report(json!({"success":true,"real_tart":!a.fake,"isolated_guest_namespaces":!a.fake,"service_protocol":"fleet-service-channel-1","physical_failure_domain":"one machine","all_fixture_vms_deleted":true}))
+    l.report(json!({"success":true,"real_vm":!a.fake,"isolated_guest_namespaces":!a.fake,"service_protocol":"fleet-service-channel-1","physical_failure_domain":"one machine","all_fixture_vms_deleted":true}))
 }

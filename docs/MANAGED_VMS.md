@@ -1,7 +1,7 @@
 # Managed persistent VMs
 
 Generation 4 adds worker-managed private service attachments and durable one-off guest operations to
-persistent Tart VMs. The CLI, JSON API and Material 3 GUI use the same replicated control plane.
+persistent VMs. The CLI, JSON API and Material 3 GUI use the same replicated control plane.
 Disposable job VMs retain their existing job/checkpoint lifecycle.
 
 ## Ownership and network identity
@@ -52,7 +52,7 @@ Host-originated connections to automatically managed VM exports are not exposed 
 
 All guest processes share that VM's grants. TCP only; no DNS, arbitrary subnet routing, LAN bridging,
 public ingress, port forwarding or cross-worker VM migration. Offline VMs can use explicitly granted
-service channels without enabling their NIC. Existing public-internet restrictions remain intact.
+service channels without enabling their NIC. `public_internet` VMs are unavailable until Fleet's host network agent exists.
 
 Configuration acceptance is not enforcement. `instance inspect` includes the adapter binding and
 existing enforcement reports; `tunnels status` and `tunnels wait --revision N` expose fresh application
@@ -152,6 +152,6 @@ fleet-qualify managed-vm --fake --binary /absolute/fleet --home /tmp/fleet-contr
 The qualifier uses public APIs, separate control-plane/worker homes and explicit fixture VMs. It covers
 input replay, retained download capture, controller outage and worker restart, command deduplication,
 and recovery of a pending launch using a no-op launcher in a private fixture worker configuration,
-private connection setup, revocation, deletion and reclamation. The same workflow accepts real Tart
-`--instances` and `--image-cache` settings and checks that no guest listener appears on the host.
+private connection setup, revocation, deletion and reclamation. The same workflow accepts a real `vz`
+`--instances` catalog and checks that no guest listener appears on the host.
 Real runs require idle installed workloads and never upgrade or stop the normal Fleet service.

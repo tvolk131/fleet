@@ -1,4 +1,4 @@
-# Portable Tart jobs
+# Portable VM jobs
 
 Portable jobs keep one logical job identity and immutable attempt history while resuming a suspended
 macOS ARM workload on another eligible worker. Executables and declared inputs are job-owned artifacts,
@@ -12,13 +12,15 @@ Workers opt approved image aliases into portable execution in their instance con
 
 ```json
 {
-  "images": {"macos": "registry.example/macos@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "images": {"macos": {"bundle": "/absolute/images/macos", "digest": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
   "platforms": {"macos": {"os": "macos", "arch": "aarch64", "capabilities": ["metal"]}}
 }
 ```
 
-This fragment accompanies the existing Tart paths and resource budgets. Use the real pinned digest of
-your approved image. `prepare-worker` advertises these runtimes; the worker checks its local catalog
+This fragment accompanies the resource budgets described in [VM instances](VM_INSTANCES.md). Use the
+real digest of your approved bundle from `fleet image digest`; a job's `runtime.image_digest` is this
+`blake3:` digest. Bundles are not yet transferred between workers, so place the same bundle on each.
+`prepare-worker` advertises these runtimes; the worker checks its local catalog
 again at launch. Worker identity, budgets and image aliases remain immutable. Runtime declarations and
 capabilities can be added to an existing idle worker using the procedure below. A job requires its image alias on the destination, with the same digest and platform;
 required capabilities must be a subset of those declared for that image. Capability names are trusted
@@ -78,7 +80,7 @@ Add an explicit runtime to an ordinary VM job file:
     "network": "offline", "gpu": "exclusive",
     "runtime": {
       "platform": {"os": "macos", "arch": "aarch64", "capabilities": ["metal"]},
-      "image_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      "image_digest": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
   },
   "checkpoint": {
@@ -134,7 +136,7 @@ application-level: Fleet restarts the declared program with saved files, not a s
 Input bundles are protected while the job is unfinished or any of its checkpoints is retained. They
 are never swept by rolling checkpoint retention. After those dependencies end, explicit deletion or
 expiry can reclaim storage and restored worker payloads. Tombstones remain durable and cleanup waits
-for unavailable agents to return. Client spools, logs, job metadata and VM image caches retain their
+for unavailable agents to return. Client spools, logs, job metadata and VM image bundles retain their
 separate lifecycle; deleting an artifact does not erase every historical copy.
 
 Cooperative resume requires a confirmed suspended attempt and deleted VM. A lost or unreachable worker
@@ -157,9 +159,9 @@ target/debug/fleet-qualify portable --fake --binary "$PWD/target/debug/fleet" \
   --home /tmp/fleet-control-portable-ci
 ```
 
-For real Tart, omit `--fake` and supply `--instances /absolute/instances.json` and
-`--image-cache /absolute/tart/cache`. The fixture uses separate controller, storage and two worker homes,
-clones the approved image cache, and refuses active installed jobs. It suspends and deletes the source
+For real VMs, omit `--fake` and supply `--instances /absolute/instances.json` with a `vz` catalog. The
+fixture uses separate controller, storage and two worker homes, clones the approved image bundle into
+each VM, and refuses active installed jobs. It suspends and deletes the source
 VM, makes the original worker and client unavailable, restarts controller/storage, resumes on a fresh
 VM on the second worker, verifies results and idempotency, then checks dependency retention and cleanup.
 It never upgrades the installed service. Two workers on one Mac test role separation and transfers;

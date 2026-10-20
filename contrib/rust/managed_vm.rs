@@ -1,5 +1,5 @@
 //! Public client qualification for worker-owned VM networking and durable operations.
-use super::{support::*, tart};
+use super::{support::*, vm};
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -152,8 +152,8 @@ fn recover_pending_launch(l: &mut Lab, worker: &str) -> Result<()> {
     l.phase("pending_backend_launch_recovers_after_worker_restart_without_replay");
     Ok(())
 }
-pub fn run(a: tart::Options) -> Result<()> {
-    tart::real_guard(&a)?;
+pub fn run(a: vm::Options) -> Result<()> {
+    vm::real_guard(&a)?;
     let mut l = Lab::new(&a.home, &a.binary)?;
     l.init(1)?;
     l.cli(&[
@@ -172,7 +172,7 @@ pub fn run(a: tart::Options) -> Result<()> {
         30,
     )?;
     super::rolling::activate_to(&l, fleet::control::version::MAX)?;
-    let mut settings = tart::settings(&l, &a)?;
+    let mut settings = vm::settings(&l, &a)?;
     settings["memory_budget_mb"] = json!(if a.fake { 4096 } else { 8192 });
     let workers = if a.fake {
         ["worker-a", "worker-b"]
@@ -180,8 +180,8 @@ pub fn run(a: tart::Options) -> Result<()> {
         ["worker", "worker"]
     };
     for worker in workers.iter().copied().collect::<BTreeSet<_>>() {
-        tart::worker(&l, &a, worker, &settings)?;
-        tart::enroll(&l, worker, false)?;
+        vm::worker(&l, &a, worker, &settings)?;
+        vm::enroll(&l, worker, false)?;
         l.start(worker, None)?;
     }
     wait(
@@ -431,7 +431,7 @@ pub fn run(a: tart::Options) -> Result<()> {
         "released result still available"
     );
     l.phase("explicit_retention_release_waits_for_worker_reclamation");
-    l.report(json!({"success":true,"real_tart":!a.fake,"physical_failure_domain":"one host; independent workers simulated when fake","public_client_interfaces":true,"fault_injection":"private worker launcher exits before guest execution","binary_sha256":digest(&l.binary)?}))?;
+    l.report(json!({"success":true,"real_vm":!a.fake,"physical_failure_domain":"one host; independent workers simulated when fake","public_client_interfaces":true,"fault_injection":"private worker launcher exits before guest execution","binary_sha256":digest(&l.binary)?}))?;
     for name in workers.iter().copied().collect::<BTreeSet<_>>() {
         l.stop(name, false)?;
     }

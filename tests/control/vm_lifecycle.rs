@@ -91,7 +91,7 @@ async fn progress(
 }
 
 fn downloads(home: &Path) -> usize {
-    std::fs::read_to_string(home.join("backend/instance-tart/history"))
+    std::fs::read_to_string(home.join("backend/vm-faults/history"))
         .unwrap()
         .lines()
         .filter(|l| l.contains("\"kind\":\"download\""))
@@ -188,8 +188,9 @@ async fn vm_observations_replay_and_same_size_outputs_survive_restart_and_cancel
     progress(&c, &config, &a.execution, 0, 2.0).await;
     let instance = fleet::vm_job::instance_id(&a.execution);
     let guest = home
-        .join("backend/instance-tart/vms")
-        .join(format!("fleet-{instance}/guest-work"));
+        .join("backend/instances")
+        .join(&instance)
+        .join(format!("driver/vm/guest/tmp/fleet-{instance}/work"));
     std::fs::write(guest.join("advance"), "go").unwrap();
     until(&mut c, &mut w, "same-size output replacement", |_| {
         std::fs::read(dir.join("work/out/result")).is_ok_and(|b| b == b"v2")
@@ -369,34 +370,33 @@ async fn vm_failures_release_capacity_only_after_cleanup() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cancellation_during_vm_clone_never_executes_the_guest() {
+async fn cancellation_during_vm_start_never_executes_the_guest() {
     let mut c = Cluster::new(1).await;
     let (home, config) = prepare(&mut c, true).await;
-    let root = home.join("backend/instance-tart");
-    std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(root.join("slow-clone"), "").unwrap();
+    let faults = home.join("backend/vm-faults");
+    std::fs::write(faults.join("slow-boot"), "").unwrap();
     let mut w = Worker::start(&home, config, hello()).await.unwrap();
     let mut spec = job("echo must-not-run");
     spec.vm = Some(vm_spec());
     spec.shutdown_grace_seconds = None;
-    enqueue(&mut c, "cloning", spec).await;
-    until(&mut c, &mut w, "clone to begin", |_| {
-        std::fs::read_to_string(root.join("history"))
+    enqueue(&mut c, "booting", spec).await;
+    until(&mut c, &mut w, "boot to begin", |_| {
+        std::fs::read_to_string(faults.join("history"))
             .unwrap_or_default()
             .lines()
-            .any(|l| l.starts_with("clone "))
+            .any(|l| l.ends_with(" boot"))
     })
     .await;
-    let revision = c.client.read(WAIT).await.unwrap().jobs["cloning"].revision;
+    let revision = c.client.read(WAIT).await.unwrap().jobs["booting"].revision;
     let start = tokio::time::Instant::now();
     let reply = c
         .client
         .write(
             Request {
                 origin: c.config.cluster.clone(),
-                id: "cancel-clone".into(),
+                id: "cancel-boot".into(),
                 mutation: Mutation::CancelQueued {
-                    id: "cloning".into(),
+                    id: "booting".into(),
                     expected_revision: revision,
                 },
             },
@@ -408,16 +408,16 @@ async fn cancellation_during_vm_clone_never_executes_the_guest() {
     wait(
         &mut c,
         &mut w,
-        "cloning",
+        "booting",
         WorkPhase::Job(AttemptPhase::Cancelled),
     )
     .await;
     assert!(start.elapsed() < Duration::from_secs(15));
     assert!(
-        !std::fs::read_to_string(root.join("history"))
+        !std::fs::read_to_string(faults.join("history"))
             .unwrap()
             .lines()
-            .any(|l| l.starts_with("run "))
+            .any(|l| l.contains("must-not-run"))
     );
     w.shutdown().await.unwrap();
     c.close().await;

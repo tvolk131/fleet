@@ -9,7 +9,7 @@ Archived SQLite coordinator state is not adopted. Assign physical capacity to on
 
 - A controller home contains its private identity, configuration, and redb database.
 - A worker home contains its own identity, immutable enrollment, durable journal, blobs, backend records,
-  and optional Tart disks/cache. It receives committed intentions through worker-initiated polling.
+  and optional VM instance disks. It receives committed intentions through worker-initiated polling.
 - A client home contains its administrator identity, cluster configuration, discovered membership,
   prepared requests, and immutable input copies. The default is `~/.fleet-client`.
 - An optional client-staging service retries delivery of saved inputs to eligible workers. It has no
@@ -50,7 +50,7 @@ fleet --home /absolute/client-home enroll /absolute/copied-worker-enroll.json
 ```
 
 Worker preparation writes `enroll.json`; transfer that public file to the administrator. Pass
-`--instances /absolute/trusted-instances.json` to prepare a Tart worker. The pinned image catalog and
+`--instances /absolute/trusted-instances.json` to prepare a VM worker ([format](VM_INSTANCES.md)). The pinned image catalog and
 memory budget must match enrollment. The worker reports platform/architecture/Metal capability tags.
 Use explicit worker selection or required tags for OS-specific binaries. A capability tag is an
 eligibility declaration, not hardware isolation.
@@ -121,7 +121,7 @@ Metadata can be accepted while inputs await delivery. Submission attempts stagin
 `fleet stage [JOB]` retries it and `fleet stage --watch` keeps retrying. A configured client-staging service
 provides the same behavior after the submitting CLI exits. If that source machine is offline before any
 eligible worker has the bytes, the job waits. Controllers do not replicate file bytes. Configure separate [storage agents](ARTIFACT_STORAGE.md)
-for verified artifact backups. [Portable Tart jobs](PORTABLE_JOBS.md) require durable executable/input
+for verified artifact backups. [Portable VM jobs](PORTABLE_JOBS.md) require durable executable/input
 bundles on storage before execution and can resume on compatible workers after confirmed suspension.
 Other jobs stage inputs directly to workers. Retain the client spool until staging is complete.
 
@@ -213,7 +213,7 @@ produce `RecoveryUnknown`, not automatic reexecution. Imported worker jobs appea
 
 Before handing a machine over, verify the old queue and worker have no running, paused, pending or uncertain
 work, and preserve its old binary, service definitions and data. Stop its old worker from accepting future
-work before starting the new worker's capacity. Do not remove historical job files or Tart disks. A completed
+work before starting the new worker's capacity. Do not remove historical job files or VM disks. A completed
 old job remains historical; importing it is not required for new scheduling.
 
 Qualify fresh homes first, then stage each idle machine. Recheck immediately before stopping services because
@@ -223,7 +223,7 @@ an old worker remains busy. Reverting to the old installation also requires drai
 Portable checkpoint resume and durable persistent-guest operations are supported. Per-user ACLs and
 background output fetching to remembered destinations remain future work. Request identities remain
 reserved indefinitely; response release never permits replay. Payload retention is separately configured.
-Tart CPU/GPU reservations do not enforce exclusivity against unrelated host processes.
+VM CPU/GPU reservations do not enforce exclusivity against unrelated host processes.
 
 The desktop GUI uses `iced-m3` Material 3 components, follows system light/dark appearance, and uses the same durable request journal and replicated API as the CLI and JSON interface. Closing the window never cancels a job.
 

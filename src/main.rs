@@ -17,6 +17,13 @@ struct Args {
     command: Command,
 }
 #[derive(Subcommand)]
+enum ImageCommand {
+    /// Prints a bundle's content digest, which a worker's instances.json pins.
+    Digest { bundle: PathBuf },
+    /// Makes a bundle from a macOS VM directory created by Tart and prints its digest.
+    ImportTart { tart_vm: PathBuf, bundle: PathBuf },
+}
+#[derive(Subcommand)]
 enum VersionCommand {
     Prepare {
         target: u32,
@@ -70,6 +77,11 @@ enum Command {
     Storage {
         #[command(subcommand)]
         action: StorageCommand,
+    },
+    /// VM image bundles. See docs/VM_INSTANCES.md.
+    Image {
+        #[command(subcommand)]
+        action: ImageCommand,
     },
     Artifacts {
         #[arg(long)]
@@ -566,6 +578,25 @@ async fn run(args: Args) -> Result<()> {
             None => return Ok(()),
         },
         Command::Cluster { action } => return fleet::control::admin::run(action).await,
+        Command::Image { action } => {
+            let bundle = match action {
+                ImageCommand::Digest { bundle } => bundle,
+                ImageCommand::ImportTart { tart_vm, bundle } => {
+                    #[cfg(target_os = "macos")]
+                    fleet::driver::vz::import_tart(&tart_vm, &bundle)?;
+                    #[cfg(not(target_os = "macos"))]
+                    anyhow::bail!("importing {} needs macOS", tart_vm.display());
+                    #[cfg(target_os = "macos")]
+                    bundle
+                }
+            };
+            let digest = fleet::driver::bundle::digest(&bundle)?;
+            println!(
+                "{}",
+                serde_json::json!({"bundle": bundle.canonicalize()?, "digest": digest})
+            );
+            return Ok(());
+        }
         Command::Client {
             action: ClientCommand::Import { config, key },
         } => {

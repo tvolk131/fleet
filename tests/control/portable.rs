@@ -13,8 +13,22 @@ pub(super) fn runtime() -> Runtime {
             arch: "aarch64".into(),
             capabilities: BTreeSet::new(),
         },
-        image_digest: format!("sha256:{}", "a".repeat(64)),
+        image_digest: fake_digest(),
     }
+}
+
+/// The digest of the fake image every test worker's catalog holds.
+pub(super) fn fake_digest() -> String {
+    static DIGEST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DIGEST
+        .get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("fleet-fake-image-{:016x}", rand::random::<u64>()));
+            let digest = fleet::instances::Image::fake(&dir).unwrap().digest;
+            let _ = std::fs::remove_dir_all(dir);
+            digest
+        })
+        .clone()
 }
 
 async fn write(c: &mut Cluster, id: &str, mutation: Mutation) -> Reply {
@@ -165,7 +179,7 @@ async fn portable_inputs_and_checkpoint_resume_on_another_worker_without_source_
         match field {
             "image" => {
                 available.runtimes.get_mut("macos").unwrap().image_digest =
-                    format!("sha256:{}", "b".repeat(64))
+                    format!("blake3:{}", "b".repeat(64))
             }
             "platform" => {
                 available.runtimes.get_mut("macos").unwrap().platform.arch = "x86_64".into()

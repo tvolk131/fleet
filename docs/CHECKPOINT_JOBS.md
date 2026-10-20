@@ -1,6 +1,6 @@
 # Checkpoint-resumable VM jobs
 
-Fleet can suspend a Tart job at a verified application checkpoint, delete its VM, and later run a new
+Fleet can suspend a VM job at a verified application checkpoint, delete its VM, and later run a new
 attempt in a fresh VM under the same logical job ID. This is explicit application resume, not a VM memory
 snapshot. Work performed after the selected checkpoint is discarded and will run again.
 
@@ -124,7 +124,7 @@ and checkpoint export are available through the CLI/JSON interface.
 ## Durability and scope
 
 Checkpoints survive VM deletion and worker process restart. Configured [storage agents](ARTIFACT_STORAGE.md)
-retain off-worker copies. [Portable Tart jobs](PORTABLE_JOBS.md) also back up executable/input bundles
+retain off-worker copies. [Portable VM jobs](PORTABLE_JOBS.md) also back up executable/input bundles
 and can cooperatively resume on another compatible worker; other jobs resume on the original worker.
 A replicated control-plane catalog alone is not a checkpoint backup. Physical host-loss protection
 requires a copy on another machine; original input dependencies and worker identity/history are separate.
@@ -136,7 +136,7 @@ checkpoint hook, exactly-once external side-effect guarantee, or automatic resum
 milestone. Cancellation is terminal. Explicit suspension frees VM compute and disk reservations only
 after confirmed deletion; host checkpoint storage is retained separately and is bounded per attempt,
 with explicit artifact retention/pinning and safe cleanup available through the storage catalog.
-Tart networking and VM isolation are unchanged.
+VM networking and isolation are unchanged.
 
 ## Baseline and existing state
 
@@ -157,7 +157,7 @@ target/debug/fleet-qualify checkpoint --fake --backup-restore --binary "$PWD/tar
   --home /tmp/fleet-control-checkpoint-ci
 ```
 
-Omit `--fake` and provide `--instances /absolute/instances.json --image-cache /absolute/tart/cache` for
+Omit `--fake` and provide `--instances /absolute/instances.json` (a `vz` catalog) for
 a real offline macOS VM qualification. Use a fresh `/tmp/fleet-control-*` home. Real mode checks that
 installed work is idle and verifies its records remain unchanged. The script tests export, suspension,
 VM deletion, combined-service restart, fresh-VM resume, request retries, and both attempts' logs.

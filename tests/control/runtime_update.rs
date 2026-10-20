@@ -42,7 +42,7 @@ async fn runtime_update_requires_drain_idle_matching_identity_and_monotonic_cata
     let original = state.workers.clone();
     let mut changed = update(&config);
     if let Mutation::AddWorkerRuntimes { runtimes, .. } = &mut changed {
-        runtimes.get_mut("macos").unwrap().image_digest = format!("sha256:{}", "b".repeat(64));
+        runtimes.get_mut("macos").unwrap().image_digest = format!("blake3:{}", "b".repeat(64));
     }
     assert!(matches!(apply(&mut state, changed), Reply::Rejected { .. }));
     let mut removed = update(&config);

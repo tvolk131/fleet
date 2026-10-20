@@ -1,15 +1,32 @@
-# Tart VM instances
+# VM instances
 
 A persistent instance is an immutable VM specification and a desired state committed by the replicated
-control plane. Its assigned worker owns the VM disk and reconciles Tart through a detached instance
-controller. Disposable [VM jobs](VM_JOBS.md) use the same backend and resource accounting.
+control plane. Its assigned worker owns the VM disk and reconciles its [VM driver](VM_DRIVERS.md) through a
+detached instance controller. Disposable [VM jobs](VM_JOBS.md) use the same backend and resource accounting.
 
 ## Setup and lifecycle
 
 Prepare a worker with `fleet cluster prepare-worker --instances /absolute/instances.json` and enroll it
-as described in [normal setup](NORMAL_FLEET.md). The trusted settings select absolute Tart/Softnet paths,
-a catalog of digest-pinned images, VM memory/disk budgets, a free-space reserve, and optional additional
-blocked networks. The worker rechecks host resources and its configured budgets before boot.
+as described in [normal setup](NORMAL_FLEET.md). The trusted settings select a catalog of digest-pinned
+image bundles, VM memory/disk budgets, a free-space reserve, optional [portable](PORTABLE_JOBS.md) `platforms`, and optionally the driver
+(`vz`, the default, or `fake` for tests):
+
+```json
+{
+  "images": {"macos": {"bundle": "/absolute/images/macos", "digest": "blake3:<64 hex>"}},
+  "memory_budget_mb": 16384, "disk_budget_gb": 200, "min_free_disk_gb": 20
+}
+```
+
+An image bundle is a flat directory (for `vz`: `image.json`, hardware model, auxiliary storage and
+`disk.img`). `fleet image digest BUNDLE` prints its catalog entry; `fleet image import-tart TART_VM_DIR
+BUNDLE` converts an existing Tart VM directory with APFS clones. Install the guest agent into macOS
+images with `sudo contrib/install-guest-agent.sh BUNDLE FLEET_GUEST`. Bundles are not yet distributed
+between workers: place each one on every worker that uses it. The worker verifies the bundle against
+its digest before provisioning each instance, caching the result in `image-digests.json` by file
+stamps so it re-hashes only changed bundles (about 27 s for a 50 GB image in a release build). It rechecks host resources
+and its configured budgets before boot. An `instances.json` from a Tart-based Fleet (with `tart` or
+`softnet` settings) is rejected: delete that worker and prepare a new one.
 
 For example, save this as `vm.json`:
 
@@ -41,7 +58,7 @@ capacity, and stopping/unknown workloads retain reservations until cleanup is co
 RAM size, configured disk capacity, and VM slots must fit worker enrollment and backend admission.
 Apple's macOS virtualization limit is represented by the worker's VM-slot budget.
 
-Tart sets guest RAM and virtual disk sizes. vCPUs are scheduled by the host; they are not pinned physical
+The driver sets guest RAM and grows the instance's raw disk to `disk_gb`. vCPUs are scheduled by the host; they are not pinned physical
 cores. Disk growth/admission and host free-space guards are distinct from guest filesystem use.
 `gpu: "exclusive"` reserves Fleet GPU admission for one workload; `gpu: "shared"` permits best-effort
 coexistence. Every macOS guest can access its virtual GPU. Fleet does not partition GPU compute or VRAM,
@@ -50,26 +67,29 @@ GPU use. Keep the Mac dedicated to Fleet for predictable admission accounting.
 
 ## Network and isolation
 
-Only `offline` and `public_internet` are accepted. Softnet applies restrictions outside the guest before
-boot. Offline mode denies application IP traffic. Public-internet mode blocks the host, LAN, private,
-link-local, reserved and peer destinations, plus configured extra deny CIDRs. Neither mode publishes
-ports, bridges the home LAN, or grants VM-to-VM access. There are no host-directory shares, clipboard,
-audio or USB devices. Fleet management uses Tart's local guest channel independently of application IP.
+Only `offline` works today. The guest's only network card is a socket held by Fleet, and an offline
+VM's card forwards nothing, so it has no application IP traffic. `public_internet` is refused at
+creation until Fleet's host network agent exists. No mode publishes ports, bridges the home LAN, or
+grants VM-to-VM access. There are no host-directory shares, clipboard, audio or USB devices. Fleet
+management uses the guest agent over vsock independently of application IP.
 
-The backend requires the verified Softnet helper and fails closed when policy enforcement is unavailable.
-Loss of network policy or the free-disk guard stops the virtual hardware. For an ordinary stop, the
-controller first requests guest shutdown, then uses Tart's forced stop if the guest does not cooperate.
-Forced termination can lose unflushed guest writes; capacity remains reserved until termination is verified.
+Reaching the free-disk guard stops the VM. For an ordinary stop, the controller first requests guest
+shutdown through the agent, then forces the VM off if the guest does not cooperate. Forced termination
+can lose unflushed guest writes; capacity remains reserved until termination is verified. A VM whose
+runner vanished because the host rebooted counts as stopped, and is started again if desired running.
 
 ## Recovery and qualification
 
-The detached controller uses an OS lock and durable desired/observed records. Worker/service restarts
-reconcile the existing VM; lost replies do not create another identity. Control-plane recovery still
+The detached controller uses an OS lock and durable desired/observed records. Each instance's driver
+state (disk, `runner.log`) lives in `instances/<id>/driver/vm/` under the worker's backend home.
+Worker/service restarts reconcile the existing VM; lost replies do not create another identity. Control-plane recovery still
 requires explicit worker authority rebinding and inventory reconciliation. Deletion tombstones prevent
 late requests from recreating an instance.
 
-`tests/instances.rs` and `tests/instances/guest.rs` test the actual backend against isolated fake Tart
-processes, including network arguments, CPU/RAM/GPU budgets, stubborn shutdown, failed launchers,
-controller restart, disk ownership and guest-file safety. Current control-plane and CLI qualifications
-exercise the same backend through enrolled workers. Real macOS qualification additionally requires Tart,
-Softnet and a pinned image; process tests do not establish physical host-loss independence.
+`tests/instances.rs` and `tests/instances/guest.rs` test the actual backend on the `fake` driver,
+whose guests obey fault switches in a `vm-faults/` directory beside the fake image (`fail-prepare`,
+`fail-start`, `fail-after-start`, `gate-failure`/`release-failure`, `refuse-stop`, `slow-boot`). They
+cover CPU/RAM/GPU budgets, stubborn shutdown, failed starts, controller restart, disk ownership and
+guest-file safety. Current control-plane and CLI qualifications exercise the same backend through
+enrolled workers. Real macOS qualification additionally requires a `vz` catalog with a pinned bundle;
+process tests do not establish physical host-loss independence.

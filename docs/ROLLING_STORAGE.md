@@ -61,7 +61,7 @@ Catalog bytes, logical file lengths and physical allocated bytes are distinct; r
 the entire machine is under a hard disk quota.
 
 Scope: Fleet-owned host checkpoint copies, final-output artifacts, backup objects and their eligible
-cache entries. Logs, metadata, original input spools, Tart images and the application's files inside
+cache entries. Logs, metadata, original input spools, VM image bundles and the application's files inside
 the guest have separate lifetimes. The trainer must prune its own guest checkpoint directories; the
 guest manifest scan remains bounded to 256 matching files and 100,000 visited entries. A backup on
 another directory of the M4 qualifies the protocol but does not protect against loss of that machine.

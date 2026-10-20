@@ -1,5 +1,5 @@
-//! The guest agent: a daemon inside the VM, listening on vsock port [`PORT`], that replaces
-//! `tart exec`. Each connection carries one request line:
+//! The guest agent: a daemon inside the VM, listening on vsock port [`PORT`], through which
+//! the host runs guest commands. Each connection carries one request line:
 //!
 //! - `{"kind":"shutdown"}` shuts the guest down;
 //! - `{"kind":"spawn","argv":[...]}` runs a process, then carries its stdio as frames.
@@ -8,10 +8,10 @@
 //! [`STDIN`] frames, an empty one closing the process's stdin. The agent sends [`STDOUT`] and
 //! [`STDERR`] frames and finally one [`EXIT`] frame holding the exit code as a big-endian `i32`
 //! (128 + the signal for a killed process). If the host disconnects first, the agent kills the
-//! process's whole group, as a host killing `tart exec` did.
+//! process's whole group.
 //!
 //! The agent adds no authority: the host already controls the VM, and the agent runs as the
-//! guest user `tart exec` ran as.
+//! guest's automatically logged-in user.
 
 use std::{
     io::{Read, Write},
@@ -23,7 +23,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 /// Must match `fleet::driver::AGENT_PORT`.
@@ -109,10 +109,33 @@ pub fn serve(listener: OwnedFd) -> Result<()> {
     }
 }
 
-fn connection(mut stream: std::fs::File) -> Result<()> {
+fn connection(stream: std::fs::File) -> Result<()> {
+    handle(
+        stream,
+        |argv| {
+            let mut command = Command::new(&argv[0]);
+            command.args(&argv[1..]);
+            command
+        },
+        shutdown,
+    )
+}
+
+/// Serves one connection, building each process with `command` (given a non-empty argv) and
+/// shutting down with `shutdown`. A test double that runs its "guest" on the host uses this to
+/// confine the processes it starts.
+pub fn handle(
+    mut stream: std::fs::File,
+    command: impl FnOnce(&[String]) -> Command,
+    shutdown: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     match read_request(&mut stream)? {
         AgentRequest::Shutdown => shutdown(),
-        AgentRequest::Spawn { argv } => spawn(stream, argv),
+        AgentRequest::Spawn { argv } => {
+            ensure!(!argv.is_empty(), "empty argv");
+            let program = argv[0].clone();
+            spawn(stream, &program, command(&argv))
+        }
     }
 }
 
@@ -129,11 +152,9 @@ fn shutdown() -> Result<()> {
     Ok(())
 }
 
-fn spawn(stream: std::fs::File, argv: Vec<String>) -> Result<()> {
+fn spawn(stream: std::fs::File, program: &str, mut command: Command) -> Result<()> {
     let out = Arc::new(Mutex::new(stream.try_clone()?));
-    let (program, args) = argv.split_first().context("empty argv")?;
-    let mut child = match Command::new(program)
-        .args(args)
+    let mut child = match command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

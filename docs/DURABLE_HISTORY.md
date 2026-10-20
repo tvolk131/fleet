@@ -1,6 +1,6 @@
 # Durable job logs, metrics, and attempt history
 
-Fleet archives native and Tart job stdout, stderr, and metric observations through the existing
+Fleet archives native and VM job stdout, stderr, and metric observations through the existing
 storage agents. Each logical job retains its immutable attempts: worker, execution identity,
 checkpoint lineage, outcome, and separate stream offsets. A resumed job starts new streams at offset
 zero; its earlier attempt remains readable.
@@ -23,7 +23,7 @@ fleet storage policy --revision 0 --input backup --checkpoint backup --output ba
   --history backup --request-id storage-policy-1
 ```
 
-An example job file (add the usual `vm` and input/runtime declarations for a Tart job):
+An example job file (add the usual `vm` and input/runtime declarations for a VM job):
 
 ```json
 {
@@ -58,7 +58,7 @@ Rapid rotation before Fleet observes a file can lose records. No stdout protocol
 Limits are four exact relative paths, 16 KiB per JSON record, and 64 KiB/256 lines per source per poll.
 Incomplete lines wait for a newline. Oversized, invalid, or incomplete final records produce gap
 records. Missing final files and read errors appear in stream status. Native capture drains final
-batches over subsequent worker polls. Tart finalization drains at most 16 batches per file before VM
+batches over subsequent worker polls. VM finalization drains at most 16 batches per file before VM
 cleanup; a remaining tail is explicitly reported as incomplete. Cooperative suspension allows up to
 30 seconds to start final drain batches, with a 35-second worker stop deadline. Cancellation still
 stops the VM immediately; unavailable final tails are reported as incomplete. Applications should flush records
@@ -168,8 +168,8 @@ target/debug/fleet-qualify portable --fake --history --binary "$PWD/target/debug
   --home /tmp/fleet-control-history-ci
 ```
 
-Without `--fake`, supply a pinned `--instances` configuration and `--image-cache`. This creates two
-separate scratch worker identities and sequential real Tart VMs. It refuses active installed jobs,
+Without `--fake`, supply a pinned `--instances` `vz` catalog. This creates two
+separate scratch worker identities and sequential real VMs. It refuses active installed jobs,
 checks installed/legacy records before and after, and never imports production credentials into the
-scratch cluster. CI runs the fake backend on macOS/Linux; real Tart needs a qualified Apple Silicon
+scratch cluster. CI runs the fake backend on macOS/Linux; real VMs need a qualified Apple Silicon
 host. Same-host tests demonstrate process/role failures and portability, not physical host-loss survival.

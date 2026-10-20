@@ -2,7 +2,7 @@
 
 [![Fleet CI](https://github.com/tvolk131/fleet/actions/workflows/ci.yml/badge.svg)](https://github.com/tvolk131/fleet/actions/workflows/ci.yml)
 
-Fleet manages a durable job queue and native or Tart VM workloads across trusted physical workers.
+Fleet manages a durable job queue and native or VM workloads across trusted physical workers.
 Its control plane uses Raft over authenticated iroh connections and a redb database on each replica.
 One voter or a three-voter majority represents the same logical cluster. Worker supervision continues
 when controllers are unavailable; new assignments require quorum.
@@ -12,7 +12,7 @@ Fleet's consolidated baseline uses one current metadata layout and format family
 idle cutover. Normal runtime code does not retain historical migrations. See [setup and operations](docs/NORMAL_FLEET.md).
 
 ```sh
-cargo build --release --features gui --bin fleet --bin fleet-guest  # omit gui on headless hosts
+cargo build --release --features gui --bin fleet --bin fleet-guest --bin fleet-runner-vz  # omit gui on headless hosts
 fleet --home /absolute/client-home status
 fleet --home /absolute/client-home submit job.json --gpu --requires os:macos --requires gpu:metal
 fleet --home /absolute/client-home queue
@@ -49,9 +49,9 @@ an unknown outcome; create a fresh request only when you intend new work.
 
 Jobs support worker selection, required capability tags, priority, successful-job dependencies, CPU/RAM
 admission, native exclusive GPU reservations, VM GPU policies, logs, progress probes, and verified
-intermediate/final outputs. Native jobs are trusted host processes. Tart jobs run inside disposable
-macOS VMs and can explicitly suspend at an application checkpoint and resume in a new VM under the same job ID; persistent VMs expose lifecycle, private service connections, durable guest commands and regular-file transfers. Tart's CPU/GPU sharing limitations and offline
-or public-internet-only networking policies remain unchanged.
+intermediate/final outputs. Native jobs are trusted host processes. VM jobs run inside disposable
+macOS VMs on Fleet's own [Virtualization.framework driver](docs/VM_DRIVERS.md) and can explicitly suspend at an application checkpoint and resume in a new VM under the same job ID; persistent VMs expose lifecycle, private service connections, durable guest commands and regular-file transfers. vCPUs and the GPU are shared, not
+partitioned. Only `offline` VM networking is available until Fleet's host network agent exists.
 
 - [Artifact backups, restore, retention, and storage roles](docs/ARTIFACT_STORAGE.md)
 - [Rolling control-plane upgrades](docs/ROLLING_UPGRADES.md)
@@ -63,10 +63,11 @@ or public-internet-only networking policies remain unchanged.
 - [Membership design and qualification](docs/CONTROL_PLANE_MEMBERSHIP.md)
 - [Emergency recovery and authority transitions](docs/CONTROL_PLANE_RECOVERY.md)
 - [Direct LAN deployment qualification](docs/CONTROL_PLANE_NETWORKING.md)
-- [Worker execution and Tart guarantees](docs/CONTROL_PLANE_WORKERS.md)
+- [Worker execution and VM guarantees](docs/CONTROL_PLANE_WORKERS.md)
 - [Authenticated service tunnels and Garage](docs/SERVICE_TUNNELS.md)
+- [VM instances, image bundles and worker VM configuration](docs/VM_INSTANCES.md)
 - [Managed VM networking, commands and file transfers](docs/MANAGED_VMS.md)
-- [Private named services for Tart VMs](docs/VM_SERVICE_NETWORKING.md)
+- [Private named services for VMs](docs/VM_SERVICE_NETWORKING.md)
 - [Current regression coverage](docs/TEST_COVERAGE.md)
 
 Build the explicit test tools with `cargo build --workspace --all-features --bins --locked`, then run
@@ -78,7 +79,7 @@ Normal clients always use the replicated control plane; the retired coordinator 
 
 Rolling checkpoint retention is opt-in; see [rolling storage](docs/ROLLING_STORAGE.md) for budgets, pins, reclamation and storage reports.
 
-[Portable Tart jobs](docs/PORTABLE_JOBS.md) provide durable executable/input bundles, explicit runtime
+[Portable VM jobs](docs/PORTABLE_JOBS.md) provide durable executable/input bundles, explicit runtime
 compatibility and cooperative resume on another worker after confirmed suspension.
 
 Job logs, metrics, attempt selection and their retention are documented in [Durable job history](docs/DURABLE_HISTORY.md). History uses the existing storage role; configure history destinations explicitly for worker-independent reads.

@@ -322,7 +322,7 @@ impl Lab {
         )?;
         let source = binary.canonicalize()?;
         fs::copy(&source, root.join("fleet"))?;
-        for name in ["fleet-guest", "fleet-fake-tart", "fleet-test-workload"] {
+        for name in ["fleet-guest", "fleet-runner-vz", "fleet-test-workload"] {
             let p = source.parent().unwrap().join(name);
             if p.is_file() {
                 fs::copy(p, root.join(name))?;

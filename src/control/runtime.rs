@@ -787,7 +787,7 @@ impl Worker {
                     && vm.disk_budget_gb == config.registration.budget.disk_gb
                     && vm.images.keys().cloned().collect::<BTreeSet<_>>()
                         == config.registration.images,
-                "Tart configuration and enrollment budgets/catalog differ"
+                "VM configuration and enrollment budgets/catalog differ"
             );
         }
         hello.cpu_slots = config.registration.budget.cpu_slots;

@@ -1,5 +1,6 @@
 use fleet::{
-    instances::{self, Config, Desired, Gpu, Network, Spec, State},
+    driver::{Driver, Exit, InstanceId, Phase, RunnerDriver, StopMode, fake::FakeBackend},
+    instances::{self, Config, Desired, DriverKind, Gpu, Image, Network, Spec, State},
     worker_data::Hello,
 };
 use std::{
@@ -38,26 +39,15 @@ impl Fixture {
     fn new() -> Self {
         let home = std::env::temp_dir().join(format!("fleet-vm-{:016x}", rand::random::<u64>()));
         fs::create_dir_all(&home).unwrap();
-        let tart = home.join("tart");
-        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_fleet-fake-tart"), &tart).unwrap();
-        fs::set_permissions(&tart, fs::Permissions::from_mode(0o700)).unwrap();
-        let softnet = home.join("softnet");
-        fs::write(&softnet, "#!/bin/sh\necho 'softnet 0.24.0-test'\n").unwrap();
-        fs::set_permissions(&softnet, fs::Permissions::from_mode(0o700)).unwrap();
         instances::write(
             &home.join("instances.json"),
             &Config {
                 platforms: Default::default(),
-                tart,
-                softnet,
-                images: BTreeMap::from([(
-                    "macos".into(),
-                    format!("registry.test/macos@sha256:{}", "a".repeat(64)),
-                )]),
+                images: BTreeMap::from([("macos".into(), Image::fake(&home).unwrap())]),
                 memory_budget_mb: 8192,
                 disk_budget_gb: 200,
                 min_free_disk_gb: 5,
-                block_cidrs: vec![],
+                driver: DriverKind::Fake,
             },
         )
         .unwrap();
@@ -87,6 +77,49 @@ impl Fixture {
         let revision = instances::info(&self.home, id).unwrap().record.revision;
         instances::set_desired(&self.home, id, desired, revision, "owner", &hello()).unwrap()
     }
+    /// Switches the fake guests' failure injections (see `fleet::driver::fake::FakeImage`).
+    fn fault(&self, name: &str) {
+        fs::write(self.home.join("vm-faults").join(name), "").unwrap();
+    }
+    /// What the instance's fake guest has done: `boot`, `power-button`, `spawn <argv>`, ...
+    fn history(&self, id: &str) -> Vec<String> {
+        let dir = self.vm_dir(id);
+        let prefixes = [&dir, &dir.canonicalize().unwrap()].map(|d| format!("{} ", d.display()));
+        fs::read_to_string(self.home.join("vm-faults/history"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| prefixes.iter().find_map(|p| l.strip_prefix(p.as_str())))
+            .map(str::to_owned)
+            .collect()
+    }
+    fn count(&self, id: &str, event: &str) -> usize {
+        self.history(id).iter().filter(|e| *e == event).count()
+    }
+    fn vm_dir(&self, id: &str) -> PathBuf {
+        self.home.join("instances").join(id).join("driver/vm")
+    }
+    /// The instance's VM as its driver sees it, without going through the controller.
+    fn driver(&self, id: &str) -> RunnerDriver<FakeBackend> {
+        RunnerDriver::new(
+            self.home.join("instances").join(id).join("driver"),
+            FakeBackend {
+                fleet: env!("CARGO_BIN_EXE_fleet").into(),
+            },
+        )
+        .unwrap()
+    }
+    fn vm(&self, id: &str) -> fleet::driver::Observed {
+        self.driver(id).observe(&vm()).unwrap()
+    }
+    /// Ends the VM behind Fleet's back, as a host restart or another tool would.
+    fn kill_vm(&self, id: &str) {
+        self.try_kill_vm(id).unwrap();
+    }
+    fn try_kill_vm(&self, id: &str) -> fleet::driver::Result<()> {
+        let driver = self.driver(id);
+        let generation = driver.observe(&vm())?.generation;
+        driver.stop(&vm(), generation, StopMode::Force)
+    }
     fn wait(&self, id: &str, state: State) -> instances::Info {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
@@ -97,7 +130,7 @@ impl Fixture {
             assert!(
                 Instant::now() < deadline,
                 "waiting for {state:?}: {i:?}; VM log: {:?}",
-                fs::read_to_string(self.home.join("instances").join(id).join("vm.log"))
+                fs::read_to_string(self.vm_dir(id).join("runner.log"))
             );
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -110,20 +143,22 @@ impl Drop for Fixture {
             let _ = child.kill();
             let _ = child.wait();
         }
-        if let Ok(entries) = fs::read_dir(self.home.join("instance-tart/vms")) {
+        if let Ok(entries) = fs::read_dir(self.home.join("instances")) {
             for entry in entries.flatten() {
-                if let Ok(pid) = fs::read_to_string(entry.path().join("pid"))
-                    && let Ok(pid) = pid.parse::<i32>()
+                if let Some(id) = entry.file_name().to_str()
+                    && self.vm_dir(id).exists()
                 {
-                    unsafe {
-                        libc::kill(pid, libc::SIGTERM);
-                    }
+                    let _ = self.try_kill_vm(id);
                 }
             }
         }
         let _ = fs::remove_dir_all(&self.home);
     }
 }
+fn vm() -> InstanceId {
+    InstanceId::new("vm").unwrap()
+}
+
 fn spec() -> Spec {
     Spec {
         runtime: Default::default(),
@@ -162,27 +197,26 @@ fn stopped(f: &Fixture, id: &str, spec: Spec) {
 #[test]
 fn failed_configuration_can_be_stopped_and_deleted_without_reprovisioning() {
     let mut f = Fixture::new();
-    let tart = f.home.join("instance-tart");
-    fs::create_dir_all(&tart).unwrap();
-    fs::write(tart.join("fail-set"), "").unwrap();
+    f.fault("fail-prepare");
     f.create("broken");
     f.controller("broken");
     f.wait("broken", State::Failed);
-    assert!(tart.join("vms/fleet-broken/disk").is_file());
+    assert!(f.vm_dir("broken").join("disk.img").is_file());
     assert!(!f.home.join("instances/broken/provisioned.json").exists());
+    let history = f.history("broken");
 
     f.set("broken", Desired::Stopped);
     f.wait("broken", State::Stopped);
     f.set("broken", Desired::Deleted);
     f.wait("broken", State::Deleted);
-    assert!(!tart.join("vms/fleet-broken").exists());
-    let history = fs::read_to_string(tart.join("history")).unwrap();
-    assert_eq!(history.lines().filter(|l| l.starts_with("set ")).count(), 1);
-    assert_eq!(
-        history.lines().filter(|l| l.starts_with("clone ")).count(),
-        1
+    assert!(!f.home.join("instances/broken/driver").exists());
+    assert_eq!(history, ["prepare"]);
+    assert!(
+        !fs::read_to_string(f.home.join("vm-faults/history"))
+            .unwrap()
+            .contains(" boot"),
+        "a failed configuration never boots"
     );
-    assert!(!history.lines().any(|l| l.starts_with("run ")));
 }
 
 #[test]
@@ -382,14 +416,7 @@ fn two_shared_vms_run_and_restart_without_double_counting_their_claims() {
     }
     f.controllers.clear();
     for id in ["one", "two"] {
-        assert!(
-            Command::new(f.home.join("tart"))
-                .env("TART_HOME", f.home.join("instance-tart"))
-                .args(["stop", &format!("fleet-{id}")])
-                .status()
-                .unwrap()
-                .success()
-        );
+        f.kill_vm(id);
         let mut observed = instances::info(&f.home, id).unwrap().observed;
         observed.state = State::Unknown;
         instances::write(
@@ -404,32 +431,21 @@ fn two_shared_vms_run_and_restart_without_double_counting_their_claims() {
     for id in ["one", "two"] {
         f.wait(id, State::Running);
     }
-    assert_eq!(
-        fs::read_to_string(f.home.join("instance-tart/history"))
-            .unwrap()
-            .lines()
-            .filter(|s| s.starts_with("run "))
-            .count(),
-        4
-    );
+    for id in ["one", "two"] {
+        assert_eq!(f.count(id, "boot"), 2, "{id}");
+    }
     // Restart admission uses the current budget, including the other VM's claim.
     f.controllers[0].kill().unwrap();
     f.controllers[0].wait().unwrap();
-    assert!(
-        Command::new(f.home.join("tart"))
-            .env("TART_HOME", f.home.join("instance-tart"))
-            .args(["stop", "fleet-one"])
-            .status()
-            .unwrap()
-            .success()
-    );
+    f.kill_vm("one");
     let mut config = Config::load(&f.home).unwrap();
     config.memory_budget_mb = 6144;
     instances::write(&f.home.join("instances.json"), &config).unwrap();
     f.controller("one");
     let failed = f.wait("one", State::Failed);
     assert!(failed.observed.error.unwrap().contains("memory"));
-    assert!(!f.home.join("instance-tart/vms/fleet-one/pid").exists());
+    assert_eq!(f.vm("one").phase, Phase::Stopped);
+    assert_eq!(f.count("one", "boot"), 2);
     for id in ["one", "two"] {
         f.set(id, Desired::Stopped);
         f.wait(id, State::Stopped);
@@ -478,29 +494,16 @@ fn stale_stopped_observations_do_not_release_compute() {
 }
 
 #[test]
-fn lost_network_policy_stops_a_public_vm() {
-    let mut f = Fixture::new();
+fn public_internet_vms_are_refused_until_fleet_has_a_network_agent() {
+    let f = Fixture::new();
     let mut public = spec();
     public.network = Network::PublicInternet;
-    instances::create(&f.home, "public", public, "owner", &hello()).unwrap();
-    f.controller("public");
-    f.wait("public", State::Stopped);
-    f.set("public", Desired::Running);
-    f.wait("public", State::Running);
-    fs::write(f.home.join("instance-tart/refuse-shutdown"), "").unwrap();
-    fs::remove_file(f.home.join("instances/public/network-subnets.json")).unwrap();
-    f.wait("public", State::Failed);
-    assert!(!f.home.join("instance-tart/vms/fleet-public/pid").exists());
+    let error = instances::create(&f.home, "public", public, "owner", &hello()).unwrap_err();
     assert!(
-        !fs::read_to_string(f.home.join("instance-tart/history"))
-            .unwrap()
-            .contains("exec fleet-public"),
-        "network-policy failures must not wait for the guest"
+        error.to_string().contains("host network agent"),
+        "{error:#}"
     );
-    f.set("public", Desired::Stopped);
-    f.wait("public", State::Stopped);
-    f.set("public", Desired::Deleted);
-    f.wait("public", State::Deleted);
+    assert!(instances::info(&f.home, "public").is_err());
 }
 
 #[test]
@@ -511,15 +514,14 @@ fn lifecycle_survives_controller_loss_preserves_disk_and_rejects_stale_commands(
     f.wait("one", State::Stopped);
     f.set("one", Desired::Running);
     f.wait("one", State::Running);
-    let disk = f.home.join("instance-tart/vms/fleet-one/disk");
+    let disk = f.vm_dir("one").join("disk.img");
     fs::write(&disk, "checkpoint").unwrap();
     f.controllers[0].kill().unwrap();
     f.controllers[0].wait().unwrap();
     f.controller("one");
     std::thread::sleep(Duration::from_secs(2));
-    let history = fs::read_to_string(f.home.join("instance-tart/history")).unwrap();
     assert_eq!(
-        history.lines().filter(|s| s.starts_with("run ")).count(),
+        f.count("one", "boot"),
         1,
         "adoption must not launch another VM"
     );
@@ -577,12 +579,11 @@ fn a_late_launcher_failure_is_reported_without_a_restart_loop() {
     f.create("one");
     f.controller("one");
     f.wait("one", State::Stopped);
-    fs::write(f.home.join("instance-tart/fail-after-lock"), "").unwrap();
-    fs::write(f.home.join("instance-tart/gate-launcher-failure"), "").unwrap();
+    f.fault("fail-after-start");
+    f.fault("gate-failure");
     f.set("one", Desired::Running);
     f.wait("one", State::Running);
-    // Force the launcher to exit during inventory, between try_wait and reconciliation.
-    fs::write(f.home.join("instance-tart/fail-launcher-during-list"), "").unwrap();
+    f.fault("release-failure");
     let failed = f.wait("one", State::Failed);
     assert!(failed.reserves_compute());
     assert!(
@@ -593,14 +594,7 @@ fn a_late_launcher_failure_is_reported_without_a_restart_loop() {
             .contains("Late virtual machine capacity error")
     );
     std::thread::sleep(Duration::from_secs(2));
-    assert_eq!(
-        fs::read_to_string(f.home.join("instance-tart/history"))
-            .unwrap()
-            .lines()
-            .filter(|s| s.starts_with("run "))
-            .count(),
-        1
-    );
+    assert_eq!(f.count("one", "boot"), 1);
     f.set("one", Desired::Stopped);
     f.wait("one", State::Stopped);
     f.set("one", Desired::Deleted);
@@ -615,14 +609,13 @@ fn uncooperative_guest_cannot_prevent_stop_or_release_its_claim_early() {
     f.wait("one", State::Stopped);
     f.set("one", Desired::Running);
     f.wait("one", State::Running);
-    fs::write(f.home.join("instance-tart/refuse-shutdown"), "").unwrap();
+    f.fault("refuse-stop");
     f.set("one", Desired::Stopped);
     f.wait("one", State::Stopping);
     assert!(instances::admit_job(&f.home, 1, Some(true), None, &hello()).is_err());
     f.wait("one", State::Stopped);
-    let history = fs::read_to_string(f.home.join("instance-tart/history")).unwrap();
-    assert!(history.contains("exec fleet-one /usr/bin/sudo -n /sbin/shutdown -h now"));
-    assert!(history.contains("stop fleet-one --timeout 30"));
+    assert_eq!(f.count("one", "power-button"), 1);
+    assert_eq!(f.vm("one").last_exit, Some(Exit::Forced));
     assert!(instances::admit_job(&f.home, 1, Some(true), None, &hello()).is_ok());
     f.set("one", Desired::Deleted);
     f.wait("one", State::Deleted);
@@ -634,7 +627,7 @@ fn failed_launcher_keeps_reservation_until_stop_confirms_termination() {
     f.create("one");
     f.controller("one");
     f.wait("one", State::Stopped);
-    fs::write(f.home.join("instance-tart/fail-run"), "").unwrap();
+    f.fault("fail-start");
     f.set("one", Desired::Running);
     let failed = f.wait("one", State::Failed);
     assert!(failed.reserves_compute());

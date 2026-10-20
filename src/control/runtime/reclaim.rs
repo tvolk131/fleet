@@ -121,7 +121,7 @@ impl Worker {
         let report = json!({"observed_at":jobs::now(),"cleanup_allowed":view.cleanup_allowed,
             "blob_filesystem":super::super::storage::usage(&self.home.join("blobs"))?,
             "blob_payload_bytes":cache_bytes,"reclaimable_blob_bytes":reclaimable_bytes,"checkpoints":captures,
-            "scope":"Fleet input-bundle/checkpoint/output payloads and their cache entries; client input spools, logs, metadata, Tart images and guest-owned files are retained separately"});
+            "scope":"Fleet input-bundle/checkpoint/output payloads and their cache entries; client input spools, logs, metadata, VM image bundles and guest-owned files are retained separately"});
         instances::write(&self.home.join("storage-report.json"), &report)?;
         Ok(())
     }

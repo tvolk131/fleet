@@ -1,7 +1,7 @@
 # Replicated control plane: real workers
 
-The replicated worker backend runs native jobs, disposable Tart VM jobs, and persistent
-Tart instances under the replicated control plane. This is the normal Fleet worker architecture;
+The replicated worker backend runs native jobs, disposable VM jobs, and persistent
+VM instances under the replicated control plane. This is the normal Fleet worker architecture;
 [the service guide](NORMAL_FLEET.md) covers installation. The explicit-home examples below are for
 isolated qualification and do not adopt archived coordinator workloads.
 
@@ -88,7 +88,7 @@ execution attempt produce uncertainty; missing journals and unrecognized backend
 supervisor disappears after recording an attempt but before a durable exit, Fleet reports `Uncertain` and
 holds the reservation. This deliberately does not promise exactly-once external effects: an orphan process
 may remain, and an operator must investigate it. There is no automatic PID-based orphan kill or force-release
-API in this milestone. Tart job supervision retains its existing durable guest operations and cleanup rules.
+API in this milestone. VM job supervision retains its existing durable guest operations and cleanup rules.
 
 Raw mutation files require `origin`, the control-plane cluster ID at request creation. Preserve that
 origin and request ID across retries, including after disaster recovery.
@@ -103,11 +103,11 @@ VM deletion, not merely guest-command exit. Stop/cancel/delete remain possible w
 | Resource | Guarantee |
 | --- | --- |
 | CPU | Aggregate declared native threads and VM vCPUs fit the worker's slots; no dedicated-core enforcement |
-| Memory | Aggregate declared native memory and VM RAM fit the enrollment budget; native declarations are admission accounting, while Tart configures guest RAM |
+| Memory | Aggregate declared native memory and VM RAM fit the enrollment budget; native declarations are admission accounting, while the VM driver configures guest RAM |
 | VM disk | Sum of virtual disk capacities fits the budget; stopped disks still count; existing free-space guard remains active |
 | GPU | Native GPU jobs reserve exclusive use; VM policies are exclusive or best-effort shared; every macOS VM has GPU access |
 | VM count | At most two active macOS VM reservations; external hypervisor use can still prevent a launch |
-| Networking | Existing offline or public-internet-only Softnet policies; no LAN access, inbound exposure, host-directory sharing, or new allow-rule API |
+| Networking | `offline` only until Fleet's host network agent exists; no LAN access, inbound exposure, host-directory sharing, or allow-rule API |
 
 Native jobs remain trusted host processes. Their memory, CPU and GPU declarations do not provide VM
 isolation or hard per-process quotas. Host processes outside this worker are outside its admission ledger.
@@ -152,10 +152,11 @@ target/debug/fleet cluster worker --home "$lab_dir/worker"
 
 Preparation refuses a populated home and generates a separate key/incarnation and durable journal. It does not enroll or
 launch anything. The worker verifies its budget against host capacity. Its `backend/` holds supervision
-records, instance state and a separate Tart home. `blobs/` and `worker.redb` are independent of installed Fleet.
+records and instance state, including each instance's driver directory. `blobs/` and `worker.redb` are independent of installed Fleet.
 
-For Tart, supply `--instances /absolute/path/to/trusted-instances.json` to `prepare-worker`; its memory
-budget must match `--memory-mb`. The configuration is copied, while VM storage/cache stays in the new home.
+For VMs, supply `--instances /absolute/path/to/trusted-instances.json` ([format](VM_INSTANCES.md)) to
+`prepare-worker`; its memory budget must match `--memory-mb`. The configuration is copied, and VM disks
+live in the new home; image bundles stay where the catalog names them.
 Preparation records the currently built lab executable as the supervisor; do not remove or replace that
 executable while its worker is in use. Replica processes use `serve`. Combined mode adds
 `serve ... --worker-home /absolute/path/to/prepared-worker`; both roles still use their own state and keys.
@@ -184,7 +185,7 @@ execution IDs must be valid identifiers of at most 64 characters. `job-` instanc
 backend-managed disposable VMs.
 
 For a disposable VM job, add `"vm":{"image":"macos","cpus":2,"memory_mb":4096,"disk_gb":50,
-"network":"offline","gpu":"exclusive"}` to the job file and use a suitably enrolled Tart worker.
+"network":"offline","gpu":"exclusive"}` to the job file and use a suitably enrolled VM worker.
 The VM's declared RAM supersedes the native `--memory-mb` reservation. Use the normal queue and
 [checkpoint contract](CHECKPOINT_JOBS.md) for checkpoint suspension and explicit resume; there is no
 automatic preemption or live VM migration.
@@ -215,14 +216,14 @@ Rust tests, eight Python tests, and the successful real M4/Tart canary. All expe
 were cleaned up; 88 installed queue rows and 76 worker job records remained unchanged.
 
 `cargo test --features control-plane --test control real_worker` exercises actual native supervisors and
-an isolated process-level Tart double. Tests cover authenticated worker roles, replay and receipt loss,
+the `fake` VM driver. Tests cover authenticated worker roles, replay and receipt loss,
 worker SIGKILL, replica replacement and shrink, quorum outage, cancellation before inputs, launch uncertainty,
 CPU/memory/GPU conflicts, report gaps/stale revisions, two shared VMs, and persistent/disposable cleanup.
-The full suite also covers the existing native/Tart backends and Raft persistence/membership contracts.
+The full suite also covers the existing native/VM backends and Raft persistence/membership contracts.
 
-`target/debug/fleet-qualify normal-tart` is a separately invoked real-Tart qualification tool. It requires explicit
-paths, refuses an occupied qualification home or unfinished legacy jobs/VMs, uses an independent APFS image
-cache clone, and compares installed job/instance/database hashes afterward. It runs small native and offline
+`target/debug/fleet-qualify normal-vm` is a separately invoked real-VM qualification tool. It requires an
+explicit `--instances` `vz` catalog, refuses an occupied qualification home or unfinished legacy jobs/VMs,
+clones the image bundle into its own instance disks, and compares installed job/instance/database hashes afterward. It runs small native and offline
 VM jobs, captures live metrics/files, kills a replica leader and worker, cancels the VM job, and creates/stops/
 deletes a persistent instance. It cleans up only its own resources. It does not reserve capacity through a
 second coordinator; run it only with the physical machine idle and no legacy queue waiting to start.

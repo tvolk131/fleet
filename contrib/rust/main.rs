@@ -6,7 +6,7 @@ mod managed_vm;
 mod multihost;
 mod rolling;
 mod support;
-mod tart;
+mod vm;
 mod vm_services;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -22,8 +22,8 @@ struct Cli {
 enum Commands {
     Garage(garage::Options),
     GarageNative(garage_native::Options),
-    VmServices(tart::Options),
-    ManagedVm(tart::Options),
+    VmServices(vm::Options),
+    ManagedVm(vm::Options),
     Host,
     BuildUpgradeFixtures {
         #[arg(long)]
@@ -39,10 +39,10 @@ enum Commands {
         #[arg(long)]
         unsupported: PathBuf,
     },
-    Checkpoint(tart::Options),
-    Portable(tart::Options),
+    Checkpoint(vm::Options),
+    Portable(vm::Options),
     NormalMultihost(multihost::Options),
-    NormalTart(tart::Options),
+    NormalVm(vm::Options),
 }
 fn main() {
     let result = match Cli::parse().command {
@@ -58,10 +58,10 @@ fn main() {
             candidate,
             unsupported,
         } => rolling::run(&home, &baseline, &candidate, &unsupported),
-        Commands::Checkpoint(options) => tart::checkpoint(options),
-        Commands::Portable(options) => tart::portable(options),
+        Commands::Checkpoint(options) => vm::checkpoint(options),
+        Commands::Portable(options) => vm::portable(options),
         Commands::NormalMultihost(options) => multihost::run(options),
-        Commands::NormalTart(options) => tart::normal(options),
+        Commands::NormalVm(options) => vm::normal(options),
     };
     if let Err(e) = result {
         eprintln!("{e:#}");
