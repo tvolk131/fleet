@@ -13,8 +13,7 @@ use super::{
     Config, Desired, DriverKind, Info, Observed, State, directory, info, storage, try_lock, write,
 };
 use crate::driver::{
-    self, Driver, GuestOs, InstanceId, InstanceSpec, Phase, RunnerDriver, StopMode,
-    fake::FakeBackend,
+    self, Driver, InstanceId, InstanceSpec, Phase, RunnerDriver, StopMode, fake::FakeBackend,
 };
 use anyhow::{Context, Result, bail};
 
@@ -114,7 +113,7 @@ fn spec(config: &Config, instance: &Info) -> Result<InstanceSpec> {
     Ok(InstanceSpec {
         id: InstanceId::new(VM)?,
         generation: record.revision,
-        guest: GuestOs::Macos,
+        guest: image.guest,
         image: image.bundle.clone(),
         cpus: record.spec.cpus,
         memory_mb: record.spec.memory_mb,

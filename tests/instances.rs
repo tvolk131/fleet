@@ -1,5 +1,5 @@
 use fleet::{
-    driver::{Driver, Exit, InstanceId, Phase, RunnerDriver, StopMode, fake::FakeBackend},
+    driver::{Driver, Exit, GuestOs, InstanceId, Phase, RunnerDriver, StopMode, fake::FakeBackend},
     instances::{self, Config, Desired, DriverKind, Gpu, Image, Network, Spec, State},
     worker_data::Hello,
 };
@@ -43,7 +43,16 @@ impl Fixture {
             &home.join("instances.json"),
             &Config {
                 platforms: Default::default(),
-                images: BTreeMap::from([("macos".into(), Image::fake(&home).unwrap())]),
+                images: BTreeMap::from([
+                    ("macos".into(), Image::fake(&home).unwrap()),
+                    (
+                        "linux".into(),
+                        Image {
+                            guest: GuestOs::Linux,
+                            ..Image::fake(&home).unwrap()
+                        },
+                    ),
+                ]),
                 memory_budget_mb: 8192,
                 disk_budget_gb: 200,
                 min_free_disk_gb: 5,
@@ -168,6 +177,17 @@ fn spec() -> Spec {
         disk_gb: 50,
         network: Network::Offline,
         gpu: Gpu::Exclusive,
+    }
+}
+
+/// The default GPU mode is exclusive; Linux guests ignore it.
+fn linux_spec() -> Spec {
+    Spec {
+        image: "linux".into(),
+        cpus: 1,
+        memory_mb: 512,
+        disk_gb: 1,
+        ..spec()
     }
 }
 
@@ -393,6 +413,122 @@ fn macos_vm_count_includes_pending_starts_and_unconfirmed_stops() {
     one.observed.revision = one.record.revision;
     instances::write(&f.home.join("instances/one/observed.json"), &one.observed).unwrap();
     f.set("three", Desired::Running);
+}
+
+#[test]
+fn linux_guests_are_small_have_no_gpu_and_skip_the_macos_limit() {
+    let f = Fixture::new();
+    let create = |id: &str, spec: Spec| {
+        instances::create(&f.home, id, spec, "owner", &hello()).map_err(|e| e.to_string())
+    };
+    let small_mac = create(
+        "small-mac",
+        Spec {
+            image: "macos".into(),
+            ..linux_spec()
+        },
+    );
+    assert!(small_mac.unwrap_err().contains("at least 4096 MiB"));
+    let tiny = create(
+        "tiny",
+        Spec {
+            memory_mb: 128,
+            ..linux_spec()
+        },
+    );
+    assert!(tiny.unwrap_err().contains("at least 256 MiB"));
+
+    // An exclusive macOS VM and three Linux VMs (also "exclusive") run together.
+    stopped(&f, "mac", spec());
+    f.set("mac", Desired::Running);
+    for id in ["linux-0", "linux-1", "linux-2"] {
+        stopped(&f, id, linux_spec());
+        f.set(id, Desired::Running);
+    }
+    // A native GPU job conflicts with the macOS VM only.
+    assert!(instances::admit_job(&f.home, 1, Some(true), None, &hello()).is_err());
+    f.set("mac", Desired::Stopped);
+    instances::write(
+        &f.home.join("instances/mac/observed.json"),
+        &instances::Observed {
+            state: State::Stopped,
+            revision: instances::info(&f.home, "mac").unwrap().record.revision,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    instances::admit_job(&f.home, 1, Some(true), None, &hello()).unwrap();
+
+    // CPU and memory still count every guest: 3 + 6 > 8 slots.
+    stopped(
+        &f,
+        "linux-3",
+        Spec {
+            cpus: 6,
+            ..linux_spec()
+        },
+    );
+    let revision = instances::info(&f.home, "linux-3").unwrap().record.revision;
+    let busy = instances::set_desired(
+        &f.home,
+        "linux-3",
+        Desired::Running,
+        revision,
+        "owner",
+        &hello(),
+    );
+    assert!(busy.unwrap_err().to_string().contains("CPU"));
+}
+
+#[test]
+fn a_linux_instance_boots_a_linux_guest_from_a_linux_image() {
+    let mut f = Fixture::new();
+    instances::create(&f.home, "linux", linux_spec(), "owner", &hello()).unwrap();
+    f.controller("linux");
+    f.wait("linux", State::Stopped);
+    f.set("linux", Desired::Running);
+    f.wait("linux", State::Running);
+    let spec: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.vm_dir("linux").join("spec.json")).unwrap()).unwrap();
+    assert_eq!(spec["guest"], "linux");
+    f.set("linux", Desired::Stopped);
+    f.wait("linux", State::Stopped);
+
+    // A catalog entry that calls a macOS image Linux fails at provisioning.
+    let bundle = f.home.join("mac-only");
+    fleet::driver::fake::FakeImage {
+        guest: Some(GuestOs::Macos),
+        ..Default::default()
+    }
+    .write(&bundle)
+    .unwrap();
+    let mut config = Config::load(&f.home).unwrap();
+    config.images.insert(
+        "mislabelled".into(),
+        Image {
+            digest: fleet::driver::bundle::digest(&bundle).unwrap(),
+            bundle,
+            guest: GuestOs::Linux,
+        },
+    );
+    instances::write(&f.home.join("instances.json"), &config).unwrap();
+    instances::create(
+        &f.home,
+        "mislabelled",
+        Spec {
+            image: "mislabelled".into(),
+            ..linux_spec()
+        },
+        "owner",
+        &hello(),
+    )
+    .unwrap();
+    f.controller("mislabelled");
+    let failed = f.wait("mislabelled", State::Failed);
+    assert!(
+        failed.observed.error.as_deref().unwrap().contains("Macos"),
+        "{failed:?}"
+    );
 }
 
 #[test]

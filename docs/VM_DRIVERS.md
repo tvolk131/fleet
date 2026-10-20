@@ -103,7 +103,8 @@ port, retrying while the guest boots. Neither guest tested honours the power but
 kernel has no GPIO power-key driver, and macOS ignored it for the whole 90-second deadline. So in
 practice graceful stop depends on the agent, and macOS guests without it are forced. For macOS
 images, `sudo contrib/install-guest-agent.sh <bundle> <fleet-guest>` installs the agent as a
-LaunchAgent.
+LaunchAgent. The agent shuts macOS down with `shutdown -h now` and Linux with `poweroff`; a Linux
+guest without `poweroff` (its init is the agent) is synced and powered off by the kernel.
 
 ## Driver trait
 

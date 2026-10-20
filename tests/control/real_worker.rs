@@ -102,7 +102,12 @@ async fn prepare_named(
                 vm_slots: if vms { 2 } else { 0 },
             },
             images: if vms {
-                BTreeSet::from(["macos".into()])
+                BTreeSet::from(["macos".into(), "linux".into()])
+            } else {
+                BTreeSet::new()
+            },
+            linux_images: if vms {
+                BTreeSet::from(["linux".into()])
             } else {
                 BTreeSet::new()
             },
@@ -123,10 +128,16 @@ async fn prepare_named(
                 } else {
                     BTreeMap::new()
                 },
-                images: BTreeMap::from([(
-                    "macos".into(),
-                    instances::Image::fake(&backend).unwrap(),
-                )]),
+                images: BTreeMap::from([
+                    ("macos".into(), instances::Image::fake(&backend).unwrap()),
+                    (
+                        "linux".into(),
+                        instances::Image {
+                            guest: fleet::driver::GuestOs::Linux,
+                            ..instances::Image::fake(&backend).unwrap()
+                        },
+                    ),
+                ]),
                 memory_budget_mb: 8192,
                 disk_budget_gb: 200,
                 min_free_disk_gb: 5,

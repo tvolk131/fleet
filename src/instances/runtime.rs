@@ -14,8 +14,8 @@ pub struct Platform {
 impl Platform {
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.os == "macos" && self.arch == "aarch64",
-            "portable jobs require macos/aarch64 guests"
+            matches!(self.os.as_str(), "macos" | "linux") && self.arch == "aarch64",
+            "portable jobs require macos/aarch64 or linux/aarch64 guests"
         );
         ensure!(
             self.capabilities.len() <= 64

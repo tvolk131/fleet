@@ -6,7 +6,7 @@ pub mod network;
 pub mod runtime;
 pub mod storage;
 
-use crate::{jobs, worker_data::Hello};
+use crate::{driver::GuestOs, jobs, worker_data::Hello};
 use anyhow::{Context, Result, bail};
 pub use network::Network;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,14 @@ use std::{
 /// the hypervisor remains authoritative when those launches race Fleet.
 pub const MACOS_VM_LIMIT: usize = 2;
 
+/// The smallest memory (MiB) and disk (GiB) a guest is admitted with.
+pub fn minimums(guest: GuestOs) -> (u32, u32) {
+    match guest {
+        GuestOs::Macos => (4096, 50),
+        GuestOs::Linux => (256, 1),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Spec {
@@ -37,7 +45,8 @@ pub struct Spec {
     pub memory_mb: u32,
     pub disk_gb: u32,
     pub network: Network,
-    /// Scheduling policy, not a hardware partition. Every macOS guest can use Metal.
+    /// Scheduling policy, not a hardware partition. Every macOS guest can use Metal; Linux
+    /// guests have no GPU and ignore it.
     #[serde(default, skip_serializing_if = "Gpu::is_exclusive")]
     pub gpu: Gpu,
 }
@@ -153,6 +162,18 @@ pub struct Image {
     pub bundle: PathBuf,
     /// `blake3:` and the bundle's collection hash; provisioning checks it.
     pub digest: String,
+    /// The guest the bundle boots. Linux guests have no GPU and do not count against
+    /// [`MACOS_VM_LIMIT`].
+    #[serde(default = "macos", skip_serializing_if = "is_macos")]
+    pub guest: GuestOs,
+}
+
+fn macos() -> GuestOs {
+    GuestOs::Macos
+}
+
+fn is_macos(guest: &GuestOs) -> bool {
+    *guest == GuestOs::Macos
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -180,11 +201,35 @@ impl Image {
         Ok(Self {
             digest: crate::driver::bundle::digest(&bundle)?,
             bundle,
+            guest: GuestOs::Macos,
+        })
+    }
+
+    /// The guest a bundle declares: `image.json`'s (vz) or `fake.json`'s `guest`, if any.
+    pub fn declared_guest(bundle: &Path) -> Option<GuestOs> {
+        ["image.json", "fake.json"].iter().find_map(|name| {
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(bundle.join(name)).ok()?).ok()?;
+            serde_json::from_value(value.get("guest")?.clone()).ok()
         })
     }
 }
 
 impl Config {
+    pub fn linux_images(&self) -> std::collections::BTreeSet<String> {
+        self.images
+            .iter()
+            .filter(|(_, image)| image.guest == GuestOs::Linux)
+            .map(|(alias, _)| alias.clone())
+            .collect()
+    }
+    pub fn guest(&self, image: &str) -> Result<GuestOs> {
+        Ok(self
+            .images
+            .get(image)
+            .context("image is not in this worker's trusted catalog")?
+            .guest)
+    }
     pub fn runtimes(&self) -> Result<BTreeMap<String, runtime::Runtime>> {
         self.platforms
             .iter()
@@ -194,6 +239,15 @@ impl Config {
                     .images
                     .get(alias)
                     .context("platform references unknown image")?;
+                let os = match image.guest {
+                    GuestOs::Macos => "macos",
+                    GuestOs::Linux => "linux",
+                };
+                anyhow::ensure!(
+                    platform.os == os,
+                    "image {alias} boots {os}, its platform says {}",
+                    platform.os
+                );
                 let runtime = runtime::Runtime {
                     platform: platform.clone(),
                     image_digest: image.digest.clone(),
@@ -339,14 +393,15 @@ fn create_inner(
             "public_internet VMs need Fleet's host network agent, which is not built yet; use offline"
         );
     }
+    let (memory_mb, disk_gb) = minimums(config.guest(&spec.image)?);
     if spec.cpus == 0
         || spec.cpus > hello.cpu_slots
-        || spec.memory_mb < 4096
+        || spec.memory_mb < memory_mb
         || spec.memory_mb > config.memory_budget_mb
-        || spec.disk_gb < 50
+        || spec.disk_gb < disk_gb
     {
         bail!(
-            "invalid VM resources: CPU must fit the worker, memory at least 4096 MiB within its budget, disk at least 50 GiB"
+            "invalid VM resources: CPU must fit the worker, memory at least {memory_mb} MiB within its budget, disk at least {disk_gb} GiB"
         );
     }
     let used: u64 = list(home)?
@@ -444,22 +499,32 @@ fn admit_vm_excluding(
     exclude: Option<&str>,
 ) -> Result<()> {
     let config = Config::load(home)?;
+    let guest = match exclude {
+        Some(id) => saved_guest(home, id),
+        None => config.guest(&spec.image)?,
+    };
     let claims = list(home)?;
     let active: Vec<_> = claims
         .iter()
         .filter(|i| exclude != Some(i.record.id.as_str()) && i.reserves_compute())
         .collect();
-    if !active.is_empty()
-        && (spec.gpu == Gpu::Exclusive
-            || active.iter().any(|i| i.record.spec.gpu == Gpu::Exclusive))
-    {
-        bail!(
-            "exclusive GPU use conflicts with another VM reservation; all coexisting VMs must use shared GPU mode"
-        );
-    }
+    let macos: Vec<_> = active
+        .iter()
+        .filter(|i| saved_guest(home, &i.record.id) == GuestOs::Macos)
+        .collect();
     let (threads, gpu) = job_usage(home, None)?;
-    if gpu {
-        bail!("GPU is reserved by a native job");
+    if guest == GuestOs::Macos {
+        if !macos.is_empty()
+            && (spec.gpu == Gpu::Exclusive
+                || macos.iter().any(|i| i.record.spec.gpu == Gpu::Exclusive))
+        {
+            bail!(
+                "exclusive GPU use conflicts with another VM reservation; all coexisting macOS VMs must use shared GPU mode"
+            );
+        }
+        if gpu {
+            bail!("GPU is reserved by a native job");
+        }
     }
     let vm_threads = active.iter().fold(u64::from(spec.cpus), |used, i| {
         used.saturating_add(u64::from(i.record.spec.cpus))
@@ -474,15 +539,29 @@ fn admit_vm_excluding(
     {
         bail!("insufficient VM memory budget");
     }
-    if active.len() >= MACOS_VM_LIMIT {
+    if guest == GuestOs::Macos && macos.len() >= MACOS_VM_LIMIT {
         bail!(
             "macOS VM limit reached: at most {MACOS_VM_LIMIT} active reservations per worker; wait for a VM to be confirmed stopped"
         );
     }
-    if let Some(process) = external_gpu(home) {
+    if guest == GuestOs::Macos
+        && let Some(process) = external_gpu(home)
+    {
         bail!("GPU is busy outside Fleet: {process}");
     }
     Ok(())
+}
+
+/// The guest of an existing instance, from the catalog saved when it was created. Unknown
+/// counts as macOS, the more constrained guest.
+fn saved_guest(home: &Path, id: &str) -> GuestOs {
+    (|| -> Option<GuestOs> {
+        let dir = directory(home, id).ok()?;
+        let config: Config = jobs::read_json(&dir.join("runtime.json")).ok()??;
+        let record: Record = jobs::read_json(&dir.join("desired.json")).ok()??;
+        Some(config.images.get(&record.spec.image)?.guest)
+    })()
+    .unwrap_or(GuestOs::Macos)
 }
 
 /// Old job records did not carry placement. Treat those as GPU jobs conservatively.
@@ -525,7 +604,11 @@ pub fn admit_job(
     if active.is_empty() {
         return Ok(());
     }
-    if gpu.unwrap_or(true) {
+    if gpu.unwrap_or(true)
+        && active
+            .iter()
+            .any(|i| saved_guest(home, &i.record.id) == GuestOs::Macos)
+    {
         bail!("GPU is reserved by a VM instance");
     }
     let vm_threads = active.iter().fold(0u64, |used, i| {

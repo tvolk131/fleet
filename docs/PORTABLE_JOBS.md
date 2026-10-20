@@ -24,8 +24,9 @@ real digest of your approved bundle from `fleet image digest`; a job's `runtime.
 again at launch. Worker identity, budgets and image aliases remain immutable. Runtime declarations and
 capabilities can be added to an existing idle worker using the procedure below. A job requires its image alias on the destination, with the same digest and platform;
 required capabilities must be a subset of those declared for that image. Capability names are trusted
-operator declarations, not hardware attestation or minimum performance guarantees. The guest helper
-also verifies macOS/ARM before executing the application.
+operator declarations, not hardware attestation or minimum performance guarantees. Platforms are
+`macos/aarch64` or `linux/aarch64`, and must match the image's guest. The guest helper also verifies
+the guest's OS and architecture before executing the application.
 
 ### Enable runtimes on an existing worker
 

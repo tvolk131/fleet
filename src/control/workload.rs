@@ -1,6 +1,6 @@
 //! Committed placement and worker observations. Bulk logs and files stay off the Raft log.
 use super::{Reply, State, network::Peer};
-use crate::{instances, jobs};
+use crate::{driver::GuestOs, instances, jobs};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,6 +21,9 @@ pub struct Registration {
     pub incarnation: String,
     pub budget: Budget,
     pub images: BTreeSet<String>,
+    /// The `images` that boot Linux; the rest boot macOS.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub linux_images: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub runtimes: BTreeMap<String, super::portable::Runtime>,
     pub tags: BTreeSet<String>,
@@ -218,8 +221,19 @@ impl Registration {
         next.validate()?;
         Ok(next)
     }
+    pub fn guest(&self, image: &str) -> GuestOs {
+        if self.linux_images.contains(image) {
+            GuestOs::Linux
+        } else {
+            GuestOs::Macos
+        }
+    }
     pub fn validate(&self) -> Result<()> {
         self.peer.validate()?;
+        ensure!(
+            self.linux_images.is_subset(&self.images),
+            "Linux image not advertised"
+        );
         for (image, runtime) in &self.runtimes {
             ensure!(self.images.contains(image), "runtime image not advertised");
             runtime.validate()?;
@@ -306,15 +320,20 @@ impl Workload {
                         .context("image platform is not advertised")?,
                 )?;
             }
+            let guest = worker.guest(&vm.image);
+            let (memory_mb, disk_gb) = instances::minimums(guest);
             ensure!(
-                vm.cpus > 0 && vm.memory_mb >= 4096 && vm.disk_gb >= 50,
+                vm.cpus > 0 && vm.memory_mb >= memory_mb && vm.disk_gb >= disk_gb,
                 "invalid VM resources"
             );
             ensure!(
                 worker.images.contains(&vm.image),
                 "image is not in the enrolled worker catalog"
             );
-            ensure!(worker.budget.vm_slots > 0, "worker does not accept VMs");
+            ensure!(
+                guest == GuestOs::Linux || worker.budget.vm_slots > 0,
+                "worker does not accept macOS VMs"
+            );
         }
         Ok(())
     }
@@ -632,9 +651,12 @@ impl State {
                 if a.compute_reserved() {
                     cpu += u64::from(vm.cpus);
                     memory += u64::from(vm.memory_mb);
-                    vms += 1;
-                    gpu_users += 1;
-                    exclusive |= vm.gpu == instances::Gpu::Exclusive;
+                    // Linux guests have no GPU and are not subject to Apple's macOS limit.
+                    if worker.guest(&vm.image) == GuestOs::Macos {
+                        vms += 1;
+                        gpu_users += 1;
+                        exclusive |= vm.gpu == instances::Gpu::Exclusive;
+                    }
                 }
             } else if let Workload::Job {
                 spec,

@@ -13,15 +13,24 @@ image bundles, VM memory/disk budgets, a free-space reserve, optional [portable]
 
 ```json
 {
-  "images": {"macos": {"bundle": "/absolute/images/macos", "digest": "blake3:<64 hex>"}},
+  "images": {
+    "macos": {"bundle": "/absolute/images/macos", "digest": "blake3:<64 hex>"},
+    "linux": {"bundle": "/absolute/images/linux", "digest": "blake3:<64 hex>", "guest": "linux"}
+  },
   "memory_budget_mb": 16384, "disk_budget_gb": 200, "min_free_disk_gb": 20
 }
 ```
 
+Each image boots a macOS guest unless its entry says `"guest": "linux"`; the driver refuses a bundle
+whose own `image.json` declares a different guest.
+
 An image bundle is a flat directory (for `vz`: `image.json`, hardware model, auxiliary storage and
-`disk.img`). `fleet image digest BUNDLE` prints its catalog entry; `fleet image import-tart TART_VM_DIR
+`disk.img`; for Linux: a kernel, optionally an initrd, kernel command line and disk).
+`fleet image digest BUNDLE` prints its catalog entry, including the bundle's guest; `fleet image import-tart TART_VM_DIR
 BUNDLE` converts an existing Tart VM directory with APFS clones. Install the guest agent into macOS
-images with `sudo contrib/install-guest-agent.sh BUNDLE FLEET_GUEST`. Bundles are not yet distributed
+images with `sudo contrib/install-guest-agent.sh BUNDLE FLEET_GUEST`; a Linux image runs `fleet-guest
+--agent` (built for `aarch64-unknown-linux-musl`) from its own init, as root or with passwordless
+`sudo poweroff`. Bundles are not yet distributed
 between workers: place each one on every worker that uses it. The worker verifies the bundle against
 its digest before provisioning each instance, caching the result in `image-digests.json` by file
 stamps so it re-hashes only changed bundles (about 27 s for a 50 GB image in a release build). It rechecks host resources
@@ -55,12 +64,15 @@ remain an internal backend used by VM jobs.
 Fleet accounts for native jobs, persistent VMs, and disposable job VMs together. Pending work reserves
 capacity, and stopping/unknown workloads retain reservations until cleanup is confirmed. vCPU counts,
 RAM size, configured disk capacity, and VM slots must fit worker enrollment and backend admission.
-Apple's macOS virtualization limit is represented by the worker's VM-slot budget.
+Apple's macOS virtualization limit is represented by the worker's VM-slot budget. Linux guests do not
+use VM slots: they need only CPU, memory and disk, and may be as small as 256 MiB of memory and 1 GiB
+of disk (macOS: 4096 MiB and 50 GiB).
 
 The driver sets guest RAM and grows the instance's raw disk to `disk_gb`. vCPUs are scheduled by the host; they are not pinned physical
 cores. Disk growth/admission and host free-space guards are distinct from guest filesystem use.
 `gpu: "exclusive"` reserves Fleet GPU admission for one workload; `gpu: "shared"` permits best-effort
-coexistence. Every macOS guest can access its virtual GPU. Fleet does not partition GPU compute or VRAM,
+coexistence. Every macOS guest can access its virtual GPU; Linux guests have none, ignore `gpu`, and
+never conflict with GPU reservations. Fleet does not partition GPU compute or VRAM,
 and unrelated host processes can still contend for hardware. Native GPU jobs reserve exclusive Fleet
 GPU use. Keep the Mac dedicated to Fleet for predictable admission accounting.
 

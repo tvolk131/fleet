@@ -8,7 +8,14 @@ All roles use the same qualified Fleet version. See [normal setup](NORMAL_FLEET.
 ## Submission
 
 Configure the worker's pinned image catalog as described in [VM instances](VM_INSTANCES.md).
-The image needs Fleet's guest agent (`contrib/install-guest-agent.sh`). Install the matching `fleet-guest` executable beside the host Fleet binary; Fleet copies it into each VM through the agent. No guest interpreter is required.
+The image needs Fleet's guest agent (`contrib/install-guest-agent.sh`). Install the matching `fleet-guest` executable beside the host Fleet binary; Fleet copies it into each VM through the agent. For Linux images, also install a `fleet-guest` built for the guest as `fleet-guest-linux`:
+
+```sh
+cargo build --release --locked -p fleet-guest --target aarch64-unknown-linux-musl
+cp target/aarch64-unknown-linux-musl/release/fleet-guest "$(dirname "$(command -v fleet)")/fleet-guest-linux"
+```
+
+No guest interpreter is required; installing the helper uses the guest's `/bin/sh`.
 
 ```json
 {
@@ -38,7 +45,7 @@ if the original files change. There is no direct scheduling fallback when the co
 Arguments and environment are data, with no implicit shell. The guest runs as its image's guest-agent
 user in a fresh working directory. Relative executables refer to staged files. No host directories are
 mounted. Fleet reserves the full VM vCPU/RAM/disk allocation; GPU exclusivity is Fleet admission policy,
-not hardware partitioning. Every macOS VM has GPU access. Jobs share capacity with persistent instances
+not hardware partitioning. Every macOS VM has GPU access; Linux VMs have none. Jobs share capacity with persistent instances
 and native workloads; a job's VM is counted only once. There is no automatic preemption or rerun.
 
 ## Metrics and output

@@ -23,6 +23,7 @@ fn setup() -> (State, String) {
             vm_slots: 2,
         },
         images: BTreeSet::from(["macos".into()]),
+        linux_images: BTreeSet::new(),
         runtimes: Default::default(),
         tags: Default::default(),
     };

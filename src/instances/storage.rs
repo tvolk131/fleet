@@ -106,8 +106,11 @@ pub fn report(home: &Path) -> Result<Report> {
         });
     }
     let mut images = Usage::default();
-    for image in config.images.values() {
-        let u = usage(&image.bundle, None, deadline, &mut entries)?;
+    // Aliases may share a bundle.
+    let bundles: std::collections::BTreeSet<_> =
+        config.images.values().map(|i| &i.bundle).collect();
+    for bundle in bundles {
+        let u = usage(bundle, None, deadline, &mut entries)?;
         images.logical_bytes = images.logical_bytes.saturating_add(u.logical_bytes);
         images.allocated_bytes = images.allocated_bytes.saturating_add(u.allocated_bytes);
         images.files += u.files;

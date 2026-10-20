@@ -590,11 +590,13 @@ async fn run(args: Args) -> Result<()> {
                     bundle
                 }
             };
-            let digest = fleet::driver::bundle::digest(&bundle)?;
-            println!(
-                "{}",
-                serde_json::json!({"bundle": bundle.canonicalize()?, "digest": digest})
-            );
+            let entry = fleet::instances::Image {
+                digest: fleet::driver::bundle::digest(&bundle)?,
+                guest: fleet::instances::Image::declared_guest(&bundle)
+                    .unwrap_or(fleet::driver::GuestOs::Macos),
+                bundle: bundle.canonicalize()?,
+            };
+            println!("{}", serde_json::to_string(&entry)?);
             return Ok(());
         }
         Command::Client {

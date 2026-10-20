@@ -139,15 +139,34 @@ pub fn handle(
     }
 }
 
+/// Powers the guest off through its init: `shutdown -h now` on macOS, `poweroff` on Linux
+/// (systemd and busybox both provide it). Through `sudo -n` unless the agent runs as root.
+/// A Linux guest without `poweroff` (one whose init is the agent) is synced and powered off by
+/// the kernel.
 fn shutdown() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let argv = ["/sbin/shutdown", "-h", "now"];
+    #[cfg(target_os = "linux")]
+    let argv = match ["/sbin/poweroff", "/usr/sbin/poweroff", "/bin/poweroff"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+    {
+        Some(poweroff) => vec![poweroff],
+        None if unsafe { libc::geteuid() } == 0 => unsafe {
+            libc::sync();
+            libc::reboot(libc::RB_POWER_OFF);
+            bail!("powering off failed: {}", std::io::Error::last_os_error())
+        },
+        None => bail!("the guest has no poweroff"),
+    };
     let mut command = if unsafe { libc::geteuid() } == 0 {
-        Command::new("/sbin/shutdown")
+        Command::new(argv[0])
     } else {
         let mut sudo = Command::new("/usr/bin/sudo");
-        sudo.args(["-n", "/sbin/shutdown"]);
+        sudo.args(["-n", argv[0]]);
         sudo
     };
-    let status = command.args(["-h", "now"]).stdin(Stdio::null()).status()?;
+    let status = command.args(&argv[1..]).stdin(Stdio::null()).status()?;
     ensure!(status.success(), "shutdown failed: {status}");
     Ok(())
 }

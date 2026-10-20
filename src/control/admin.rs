@@ -473,6 +473,10 @@ pub async fn run(command: Command) -> Result<()> {
                     .as_ref()
                     .map(|v| v.images.keys().cloned().collect())
                     .unwrap_or_default(),
+                linux_images: vm
+                    .as_ref()
+                    .map(crate::instances::Config::linux_images)
+                    .unwrap_or_default(),
             };
             registration.validate()?;
             let config = WorkerConfig {
