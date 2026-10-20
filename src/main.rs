@@ -287,7 +287,7 @@ enum Command {
         restore: Option<PathBuf>,
     },
     /// Runs a command in a VM through Fleet's guest agent, with this process's stdio, and exits
-    /// with its status. The replacement for `tart exec -i`.
+    /// with its status.
     #[command(hide = true)]
     GuestExec {
         instance_dir: PathBuf,

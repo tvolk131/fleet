@@ -75,7 +75,7 @@ fleet::driver_conformance!(
     #[ignore = "boots real VMs; run tests/vm-guest/build.sh, then pass --ignored"]
 );
 
-/// Fleet's own guest agent, the replacement for `tart exec`, running inside a real VM.
+/// Fleet's guest agent, running inside a real VM.
 #[test]
 #[ignore = "boots real VMs; run tests/vm-guest/build.sh, then pass --ignored"]
 fn guest_agent_runs_commands_over_vsock() {
@@ -118,7 +118,7 @@ fn guest_agent_runs_commands_over_vsock() {
     let (code, _, err) = run(&["/missing"], b"");
     assert_eq!(code, 127, "{}", String::from_utf8_lossy(&err));
 
-    // `fleet guest-exec`, the drop-in for `tart exec -i`, over the same agent.
+    // `fleet guest-exec`, over the same agent.
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_fleet"))
         .arg("guest-exec")
         .arg(h.root.join("instances/agent").canonicalize().unwrap())

@@ -55,20 +55,20 @@ fn vm_spec() -> instances::Spec {
         gpu: instances::Gpu::Shared,
     }
 }
-async fn prepare(c: &mut Cluster, tart: bool) -> (PathBuf, WorkerConfig) {
-    prepare_with_resources(c, tart, 4, 8192).await
+async fn prepare(c: &mut Cluster, vms: bool) -> (PathBuf, WorkerConfig) {
+    prepare_with_resources(c, vms, 4, 8192).await
 }
 async fn prepare_with_resources(
     c: &mut Cluster,
-    tart: bool,
+    vms: bool,
     cpu_slots: u32,
     memory_mb: u32,
 ) -> (PathBuf, WorkerConfig) {
-    prepare_named(c, tart, cpu_slots, memory_mb, "worker-real", false).await
+    prepare_named(c, vms, cpu_slots, memory_mb, "worker-real", false).await
 }
 async fn prepare_named(
     c: &mut Cluster,
-    tart: bool,
+    vms: bool,
     cpu_slots: u32,
     memory_mb: u32,
     id: &str,
@@ -99,9 +99,9 @@ async fn prepare_named(
                 cpu_slots,
                 memory_mb,
                 disk_gb: 200,
-                vm_slots: if tart { 2 } else { 0 },
+                vm_slots: if vms { 2 } else { 0 },
             },
-            images: if tart {
+            images: if vms {
                 BTreeSet::from(["macos".into()])
             } else {
                 BTreeSet::new()
@@ -112,7 +112,7 @@ async fn prepare_named(
         supervisor: env!("CARGO_BIN_EXE_fleet").into(),
     };
     drop(socket);
-    if tart {
+    if vms {
         let backend = home.join("backend");
         std::fs::create_dir_all(&backend).unwrap();
         instances::write(

@@ -21,8 +21,6 @@ use tokio::{io::AsyncReadExt, process::Child};
 pub enum Attachment {
     #[default]
     Host,
-    /// Its wire name dates from when Fleet's VMs ran under Tart.
-    #[serde(rename = "tart")]
     Vm {
         worker_home: PathBuf,
         worker_identity: EndpointId,

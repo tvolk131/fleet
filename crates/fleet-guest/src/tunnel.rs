@@ -441,7 +441,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn orphaned_channel_expires_even_if_tart_keeps_both_pipes_open() {
+    async fn orphaned_channel_expires_even_if_the_host_keeps_both_pipes_open() {
         let (local, _silent_peer) = tokio::io::duplex(4096);
         let (read, write) = tokio::io::split(local);
         let (_, _, channel) = Channel::new(false, 0);

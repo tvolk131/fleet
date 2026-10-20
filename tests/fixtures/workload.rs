@@ -52,7 +52,7 @@ fn main() {
 }
 fn run() -> Result<()> {
     // This executable also runs as a durable guest input. In a real VM the OS
-    // terminates it at shutdown; the process-level Tart double needs the same
+    // terminates it at shutdown; the fake driver's host-process guest needs the same
     // lifetime even when its command-channel parent has already disappeared.
     if let Some(path) = std::env::var_os("FLEET_TEST_VM_LIFETIME") {
         let path = std::path::PathBuf::from(path);

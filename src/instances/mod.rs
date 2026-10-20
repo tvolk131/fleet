@@ -216,14 +216,9 @@ impl Config {
     }
 
     pub fn load(home: &Path) -> Result<Self> {
-        let value: serde_json::Value = jobs::read_json(&home.join("instances.json"))?
+        let config: Self = jobs::read_json(&home.join("instances.json"))
+            .context("invalid instances.json")?
             .context("VM backend disabled: configure the worker's instances.json first")?;
-        if value.get("tart").is_some() || value.get("softnet").is_some() {
-            bail!(
-                "instances.json is from a Tart-based Fleet, which is no longer supported: delete this worker and prepare a new one with image bundles (see docs/VM_INSTANCES.md)"
-            );
-        }
-        let config: Self = serde_json::from_value(value).context("invalid instances.json")?;
         if config.memory_budget_mb == 0 || config.disk_budget_gb == 0 || config.min_free_disk_gb < 5
         {
             bail!("VM budgets must be positive and the free disk guard at least 5 GiB");

@@ -28,7 +28,7 @@ fn driver_root(home: &Path, id: &str) -> Result<PathBuf> {
 }
 
 /// `fleet guest-exec` for the instance's guest, ready for the guest argv to be appended. It
-/// replaces `tart exec -i`: same stdio, same exit code, and killing it ends the guest command.
+/// passes stdio through, exits with the guest command's code, and killing it ends that command.
 pub fn guest_exec(home: &Path, id: &str) -> Result<Command> {
     let mut command = Command::new(super::guest::companion("fleet")?);
     command

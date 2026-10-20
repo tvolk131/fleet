@@ -25,8 +25,7 @@ images with `sudo contrib/install-guest-agent.sh BUNDLE FLEET_GUEST`. Bundles ar
 between workers: place each one on every worker that uses it. The worker verifies the bundle against
 its digest before provisioning each instance, caching the result in `image-digests.json` by file
 stamps so it re-hashes only changed bundles (about 27 s for a 50 GB image in a release build). It rechecks host resources
-and its configured budgets before boot. An `instances.json` from a Tart-based Fleet (with `tart` or
-`softnet` settings) is rejected: delete that worker and prepare a new one.
+and its configured budgets before boot.
 
 For example, save this as `vm.json`:
 
