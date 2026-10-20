@@ -186,9 +186,10 @@ Answered by the spikes below, except 2 (macOS install).
 
 ## Spikes
 
-Throwaway code under `spikes/`, outside the workspace, so nothing in the product depends on it.
+Throwaway code, outside the workspace so nothing in the product depended on it, and deleted once
+the production driver replaced it; only its findings remain, below.
 
-**`spikes/vz-runner`**: one binary that boots an arm64 Linux kernel and initramfs with
+**vz runner**: one binary that boots an arm64 Linux kernel and initramfs with
 `VZLinuxBootLoader`, a serial console to a file, a `VZFileHandleNetworkDeviceAttachment` on a
 socketpair, and a virtio-socket device. Pass when it can:
 
@@ -199,7 +200,7 @@ socketpair, and a virtio-socket device. Pass when it can:
 - pause, `saveMachineStateTo`, exit the process, start a new process and `restoreMachineStateFrom`
   with the same configuration, and find the guest still running (answers question 3).
 
-**`spikes/krun-runner`**: the same checks with libkrun, minus save/restore.
+**krun runner**: the same checks with libkrun, minus save/restore.
 
 The findings get written back into this document, and the trait is changed to fit them before any
 production driver is written.
