@@ -511,6 +511,11 @@ pub fn build(output_dir: &Path) -> Result<()> {
         for file in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
             fs::copy(root.join(file), source.join(file))?;
         }
+        // The vz driver embeds its runner's entitlements.
+        fs::copy(
+            root.join("contrib/vz.entitlements"),
+            source.join("contrib/vz.entitlements"),
+        )?;
         let file = source.join("src/control/version.rs");
         let text = fs::read_to_string(&file)?;
         ensure!(
