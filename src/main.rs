@@ -582,12 +582,17 @@ async fn run(args: Args) -> Result<()> {
             let bundle = match action {
                 ImageCommand::Digest { bundle } => bundle,
                 ImageCommand::ImportTart { tart_vm, bundle } => {
-                    #[cfg(target_os = "macos")]
-                    fleet::driver::vz::import_tart(&tart_vm, &bundle)?;
                     #[cfg(not(target_os = "macos"))]
-                    anyhow::bail!("importing {} needs macOS", tart_vm.display());
+                    anyhow::bail!(
+                        "importing {} into {} needs macOS",
+                        tart_vm.display(),
+                        bundle.display()
+                    );
                     #[cfg(target_os = "macos")]
-                    bundle
+                    {
+                        fleet::driver::vz::import_tart(&tart_vm, &bundle)?;
+                        bundle
+                    }
                 }
             };
             let entry = fleet::instances::Image {
