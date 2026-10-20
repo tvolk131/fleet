@@ -54,7 +54,7 @@ must include the immutable previous released executable as well as an incompatib
 follower replacement, snapshot catch-up, preparation promises, abort and rollback, leader loss during
 activation, same-ID retries, cold quorum restart, and incompatible write/startup refusal without
 changing database bytes. Final output and supervisor identity verify workload continuity. Unit tests
-also cover state-machine readiness and preflight boundaries. Physical host loss and real Tart behavior
+also cover state-machine readiness and preflight boundaries. Physical host loss and real VM behavior
 are separately qualified; local process tests do not claim those guarantees.
 
 CI runs the rolling scenario separately from workload and networking qualification on Linux and macOS.

@@ -16,6 +16,7 @@ use std::{
 };
 
 pub const READY: &str = "fleet-guest-v2";
+pub mod agent;
 pub mod tunnel;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -57,6 +58,11 @@ pub fn main_args(mut args: impl Iterator<Item = String>) -> Result<i32> {
         result?;
         return Ok(0);
     }
+    if first == "--agent" {
+        ensure!(args.next().is_none(), "unexpected arguments");
+        agent::serve(agent::listen_vsock(agent::PORT)?)?;
+        return Ok(0);
+    }
     if first == "--job" {
         let request: Observation =
             serde_json::from_str(&args.next().context("job request required")?)?;
@@ -81,7 +87,7 @@ pub fn main_args(mut args: impl Iterator<Item = String>) -> Result<i32> {
             let mut command = Command::new(&argv[0]);
             command.args(&argv[1..]).envs(env).stdin(Stdio::null());
             // Match the previous helper's start_new_session: the workload has
-            // its own session and process group, independent of Tart's channel.
+            // its own session and process group, independent of the guest agent's channel.
             // setsid is async-signal-safe and this closure does not allocate.
             unsafe {
                 command.pre_exec(|| {

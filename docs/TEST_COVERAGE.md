@@ -2,7 +2,7 @@
 
 Fleet has one normal CLI/GUI and one replicated metadata authority. The obsolete CLI, GUI, standalone
 SQLite scheduler, command/sweep composition helpers, and their installers are removed. Backend code
-still used by current workers remains, including native supervision, Tart controllers, guest operations,
+still used by current workers remains, including native supervision, VM controllers and drivers, guest operations,
 probes, event logs and verified transfers. The one-time [baseline import](BASELINE.md) remains a separate tool.
 
 The retired daemon/process/UI suites are replaced by the following coverage. Tests for behavior that
@@ -25,7 +25,7 @@ is intentionally absent from the current contract are removed rather than recrea
 | Unmodified Garage peering over tunnels | `fleet-qualify garage` verifies discovery, six blocked direct RPC paths, S3 integrity, Garage/adapter restart, controller outage, acknowledged enforcement before/after revocation and revocation-induced loss of quorum in separate Docker namespaces. |
 | Direct scheduling fallback, native pause, automatic preemption/resume/migration, remembered background fetch destinations, run/sweep convenience commands | Removed with the retired client/scheduler. These are not part of the current public contract. |
 
-CI builds `fleet`, `fleet-guest`, `fleet-qualify`, `fleet-import-baseline`, and the isolated Rust Tart/workload fixtures. It runs Rust tests, headless iced-m3
+CI builds `fleet`, `fleet-guest`, `fleet-qualify`, `fleet-import-baseline`, the `fleet-runner-vz` runner and the isolated Rust workload fixture. It runs Rust tests, headless iced-m3
 checks, Clippy, the JSON CLI/service suite, isolated checkpoint backup/restore, and three-replica failure
 scenarios on Linux and macOS. None needs an installed Fleet service or existing training data.
 Historical installations can remain archived on disk; removing their source/entrypoints does not delete
@@ -58,6 +58,6 @@ shared portable-input/reserved-path admission and immutable rejection/correction
 reopen. A terminal-attempt regression verifies sealed checkpoint import retries after transient failure
 and worker restart. The client transport test verifies that responses taking longer than the initial
 one-second replica probe can succeed while a short overall deadline still returns an unknown mutation
-outcome. Existing native/Tart, checkpoint, storage, recovery and membership scenarios run through the same
+outcome. Existing native/VM, checkpoint, storage, recovery and membership scenarios run through the same
 new worker synchronization path. Fixtures use independent temporary homes; they do not open installed
 Fleet state or existing training runs.

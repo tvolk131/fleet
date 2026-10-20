@@ -336,22 +336,23 @@ fn regular_file_helpers_verify_content_and_refuse_conflicts_symlinks_and_oversiz
 fn storage_inventory_distinguishes_sparse_capacity_and_ignores_symlinks() {
     let f = Fixture::new();
     f.create("one");
-    let vm = f.home.join("instance-tart/vms/fleet-one");
+    let vm = f.vm_dir("one");
     fs::create_dir_all(&vm).unwrap();
     fs::File::create(vm.join("disk.img"))
         .unwrap()
         .set_len(1 << 30)
         .unwrap();
-    let cache = f.home.join("instance-tart/cache");
-    fs::create_dir_all(&cache).unwrap();
-    fs::write(cache.join("image"), "abc").unwrap();
-    std::os::unix::fs::symlink(&vm, cache.join("do-not-follow")).unwrap();
+    // The image catalog's bundles are the image cache.
+    let bundle = f.home.join("fake-image");
+    let manifest = fs::metadata(bundle.join("fake.json")).unwrap().len();
+    fs::write(bundle.join("image"), "abc").unwrap();
+    std::os::unix::fs::symlink(&vm, bundle.join("do-not-follow")).unwrap();
     let report = instances::storage::report(&f.home).unwrap();
     assert_eq!(report.reserved_capacity_gb, 50);
     assert_eq!(report.instances[0].disk.logical_bytes, 1 << 30);
     assert!(report.instances[0].disk.allocated_bytes < report.instances[0].disk.logical_bytes);
-    assert_eq!(report.image_cache.logical_bytes, 3);
-    assert_eq!(report.image_cache.files, 1);
+    assert_eq!(report.image_cache.logical_bytes, manifest + 3);
+    assert_eq!(report.image_cache.files, 2);
     assert!(
         report
             .note
@@ -480,12 +481,10 @@ fn a_version_checked_download_rejects_same_size_replacement() {
 fn helper_installation_is_reused_and_recovers_after_guest_temporary_files_disappear() {
     let f = boot();
     assert!(guest::readiness(&f.home, "guest").unwrap().ready);
-    let history = f.home.join("instance-tart/history");
     let installs = || {
-        fs::read_to_string(&history)
-            .unwrap()
-            .lines()
-            .filter(|line| line.contains("fleet-guest-install"))
+        f.history("guest")
+            .iter()
+            .filter(|event| event.starts_with("spawn ") && event.contains("fleet-guest-install"))
             .count()
     };
     assert_eq!(installs(), 1);
@@ -497,7 +496,9 @@ fn helper_installation_is_reused_and_recovers_after_guest_temporary_files_disapp
     assert_eq!(done(&f, "once").state, O::Succeeded);
     assert!(guest::readiness(&f.home, "guest").unwrap().ready);
     assert_eq!(installs(), 1);
-    fs::remove_dir_all(f.home.join("instance-tart/vms/fleet-guest/guest-helpers")).unwrap();
+    let tmp = f.vm_dir("guest").join("guest/tmp");
+    fs::remove_dir_all(&tmp).unwrap();
+    fs::create_dir(&tmp).unwrap();
     assert!(!guest::readiness(&f.home, "guest").unwrap().ready);
     assert!(guest::readiness(&f.home, "guest").unwrap().ready);
     assert_eq!(installs(), 2);

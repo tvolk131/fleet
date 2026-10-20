@@ -511,6 +511,11 @@ pub fn build(output_dir: &Path) -> Result<()> {
         for file in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
             fs::copy(root.join(file), source.join(file))?;
         }
+        // The vz driver embeds its runner's entitlements.
+        fs::copy(
+            root.join("contrib/vz.entitlements"),
+            source.join("contrib/vz.entitlements"),
+        )?;
         let file = source.join("src/control/version.rs");
         let text = fs::read_to_string(&file)?;
         ensure!(
@@ -568,9 +573,10 @@ pub fn build(output_dir: &Path) -> Result<()> {
         )?;
         hashes.insert(name.into(), json!(digest(&output_dir.join(name))?));
     }
-    for name in ["fleet-fake-tart", "fleet-test-workload"] {
-        fs::copy(tool(name), output_dir.join(name))?;
-    }
+    fs::copy(
+        tool("fleet-test-workload"),
+        output_dir.join("fleet-test-workload"),
+    )?;
     let report = json!({"family":fleet::control::FAMILY,"synthetic_future_releases":true,"snapshot_after_entries":100,"ranges":{"baseline":[BASE,BASE],"candidate":[BASE,NEXT],"unsupported":[NEXT+1,NEXT+2]},"sha256":hashes});
     save(&output_dir.join("builds.json"), &report)?;
     fs::remove_dir_all(&scratch)?;

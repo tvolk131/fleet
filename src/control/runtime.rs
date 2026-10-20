@@ -613,7 +613,8 @@ impl Worker {
         ensure!(
             vm.memory_budget_mb == config.registration.budget.memory_mb
                 && vm.disk_budget_gb == config.registration.budget.disk_gb
-                && vm.images.keys().cloned().collect::<BTreeSet<_>>() == config.registration.images,
+                && vm.images.keys().cloned().collect::<BTreeSet<_>>() == config.registration.images
+                && vm.linux_images() == config.registration.linux_images,
             "runtime update cannot change budgets or image aliases"
         );
         let runtimes = vm.runtimes()?;
@@ -786,8 +787,9 @@ impl Worker {
                 vm.memory_budget_mb == config.registration.budget.memory_mb
                     && vm.disk_budget_gb == config.registration.budget.disk_gb
                     && vm.images.keys().cloned().collect::<BTreeSet<_>>()
-                        == config.registration.images,
-                "Tart configuration and enrollment budgets/catalog differ"
+                        == config.registration.images
+                    && vm.linux_images() == config.registration.linux_images,
+                "VM configuration and enrollment budgets/catalog differ"
             );
         }
         hello.cpu_slots = config.registration.budget.cpu_slots;

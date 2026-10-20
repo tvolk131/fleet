@@ -6,6 +6,7 @@ pub mod blobs;
 pub mod checkpoint;
 #[cfg(feature = "control-plane")]
 pub mod control;
+pub mod driver;
 pub mod events;
 #[cfg(feature = "gui")]
 pub mod gui;

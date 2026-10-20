@@ -376,7 +376,7 @@ impl Runner {
         let request: fleet_guest::Observation = serde_json::from_value(value)?;
         Ok(guest::Spec::Exec {
             argv: vec![
-                guest::helper_guest_path()?,
+                guest::helper_guest_path(&self.home, &self.status.instance)?,
                 "--job".into(),
                 serde_json::to_string(&request)?,
             ],

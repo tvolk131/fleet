@@ -1,4 +1,4 @@
-//! Bounded, half-close preserving streams over Tart's private guest channel.
+//! Bounded, half-close preserving streams over the private guest-agent channel.
 //! No keys, host addresses, or authorization decisions live in the guest.
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -226,7 +226,7 @@ impl Channel {
                     if let Some(id)=opened && let Some(s)=streams.get(&id) { s.credit.add_permits(WINDOW); }
                 }
                 _ = expiry.tick() => {
-                    // Tart can leave guest stdin open when its host command dies.
+                    // Guest stdin can stay open after its host command dies.
                     // Expire that orphan even when the guest has no active streams.
                     ensure!(received.elapsed() < idle, "guest channel heartbeat expired");
                     if sent_heartbeat.elapsed() >= idle / 5 {
@@ -441,7 +441,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn orphaned_channel_expires_even_if_tart_keeps_both_pipes_open() {
+    async fn orphaned_channel_expires_even_if_the_host_keeps_both_pipes_open() {
         let (local, _silent_peer) = tokio::io::duplex(4096);
         let (read, write) = tokio::io::split(local);
         let (_, _, channel) = Channel::new(false, 0);

@@ -109,13 +109,13 @@ pub enum Command {
         cpu_slots: u32,
         #[arg(long)]
         memory_mb: u32,
-        /// Trusted Tart configuration to copy into this worker's separate backend home.
+        /// Trusted VM configuration (instances.json) to copy into this worker's separate backend home.
         #[arg(long)]
         instances: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:0")]
         bind: std::net::SocketAddr,
     },
-    /// Add runtime capabilities to a stopped idle worker from its local Tart config; emit a consensus request.
+    /// Add runtime capabilities to a stopped idle worker from its local VM config; emit a consensus request.
     PrepareWorkerRuntimes {
         #[arg(long)]
         home: PathBuf,
@@ -389,7 +389,7 @@ pub async fn run(command: Command) -> Result<()> {
                 ("shared_blob_cache", "blobs"),
                 ("restored_checkpoints", "restored"),
                 ("job_homes_including_logs_and_captures", "backend/jobs"),
-                ("vm_images_and_disks", "backend/instance-tart"),
+                ("vm_disks", "backend/instances"),
             ] {
                 categories.insert(label, super::storage::usage(&home.join(path))?);
             }
@@ -445,7 +445,7 @@ pub async fn run(command: Command) -> Result<()> {
             if let Some(vm) = &vm {
                 ensure!(
                     vm.memory_budget_mb == memory_mb,
-                    "Tart and worker memory budgets must match"
+                    "VM and worker memory budgets must match"
                 );
                 crate::instances::write(&home.join("backend/instances.json"), vm)?;
             }
@@ -472,6 +472,10 @@ pub async fn run(command: Command) -> Result<()> {
                 images: vm
                     .as_ref()
                     .map(|v| v.images.keys().cloned().collect())
+                    .unwrap_or_default(),
+                linux_images: vm
+                    .as_ref()
+                    .map(crate::instances::Config::linux_images)
                     .unwrap_or_default(),
             };
             registration.validate()?;

@@ -1,6 +1,6 @@
 # VM service attachments
 
-Persistent Tart VMs use the same named TCP services, explicit permissions, iroh
+Persistent VMs use the same named TCP services, explicit permissions, iroh
 transport, durable policy cache and enforcement reports as host services. The
 control-plane catalog authorizes adapter identities; the trusted operator binds
 each identity to its local host or VM socket namespace.
@@ -14,7 +14,8 @@ process may own a VM attachment at a time. Replacement requires stopping the old
 process and explicitly preparing the new identity.
 
 An application connects to a configured loopback port **inside its VM**. A Rust
-helper carries the stream over Tart's private guest channel to the host adapter,
+helper carries the stream over Fleet's private guest channel (the guest agent's vsock
+port) to the host adapter,
 which resolves only a route from its committed policy. The destination checks the
 authenticated iroh identity and named-service permission before connecting to a
 fixed loopback socket in its own attachment. Same-host VM traffic uses the same
@@ -23,13 +24,13 @@ authenticated path and permission checks.
 Guests receive socket addresses and bounded route indices, never adapter or
 control-plane keys. Guest root can replace its helper or emit hostile protocol
 frames; it cannot choose a host TCP destination, claim another VM's identity or
-disable host-side authorization. The host, worker and Tart remain trusted.
+disable host-side authorization. The host, worker and VM driver remain trusted.
 Guest-reported readiness is not attestation or application health verification.
 
-There are no Tart/Softnet changes, LAN bridging, publicly published ports, host
-shares or new guest NIC allow rules. `offline` denies NIC application traffic;
-an explicitly attached VM can additionally use its granted service channels.
-`public_internet` retains its existing LAN/host restrictions. For no application
+There is no LAN bridging, publicly published ports, host shares or guest NIC
+allow rules. `offline` denies NIC application traffic; an explicitly attached VM
+can additionally use its granted service channels. `public_internet` is
+unavailable until Fleet's host network agent exists. For no application
 connectivity, use `offline` without a service attachment.
 
 ## Worker-managed attachments
@@ -89,15 +90,15 @@ not a remotely scheduled worker task or GUI operation.
 ## Lifecycle and upgrades
 
 A policy change tears down and joins old host forwarding tasks, then kills and
-reaps the Tart channel process before starting its replacement. All guest route
+reaps the guest channel process before starting its replacement. All guest route
 listeners must bind before the attachment reports applied. Bind conflicts,
 missing helpers, invalid frames, stopped VMs and changed revisions fail forwarding
 closed and appear in enforcement status. Restart retries against the same
 immutable VM binding. Failure never substitutes host sockets.
 
 The private guest channel sends heartbeats and closes after ten seconds without
-receiving a frame. This releases helper-owned ports if Tart leaves guest stdin
-open after the host adapter dies. Reattachment can therefore take a heartbeat
+receiving a frame. This releases helper-owned ports if the guest command
+channel stays open after the host adapter dies. Reattachment can therefore take a heartbeat
 timeout plus a bind retry. This is channel cleanup, independent of the durable
 policy cache; it is not a control-plane permission lease.
 
@@ -110,7 +111,7 @@ recreating routes.
 VM homes use `tunnel-vm.json`, distinct from the previous host-only `tunnel.json`.
 Older binaries refuse a VM home before they can interpret its sockets as host
 sockets. Host homes and the generation-three consensus schema are unchanged.
-Fleet installs its matching content-addressed helper through Tart, without a guest
+Fleet installs its matching content-addressed helper through the guest agent, without a guest
 interpreter or additional guest network privileges.
 
 ## Bounds and qualification
@@ -136,8 +137,8 @@ on Linux and macOS. The fake backend shares host namespaces and does not prove
 hypervisor or network isolation. It models two small logical workers so the
 fixture fits CI host admission limits; fake VMs do not allocate guest RAM.
 
-Omit `--fake` and provide `--instances` and `--image-cache` for two real offline
-Tart VMs. This uses private clones, refuses active installed jobs, checks that
+Omit `--fake` and provide `--instances` with a `vz` catalog for two real offline
+VMs. Each gets its own clone of the image bundle; the fixture refuses active installed jobs, checks that
 guest listeners do not bind on the host or appear in another VM, and deletes only
 fixture VMs. Both real VMs run on one worker with sufficient CPU and RAM budgets.
 `--baseline-binary` tests the previous host-only adapter against a

@@ -17,6 +17,13 @@ struct Args {
     command: Command,
 }
 #[derive(Subcommand)]
+enum ImageCommand {
+    /// Prints a bundle's content digest, which a worker's instances.json pins.
+    Digest { bundle: PathBuf },
+    /// Makes a bundle from a macOS VM directory created by Tart and prints its digest.
+    ImportTart { tart_vm: PathBuf, bundle: PathBuf },
+}
+#[derive(Subcommand)]
 enum VersionCommand {
     Prepare {
         target: u32,
@@ -70,6 +77,11 @@ enum Command {
     Storage {
         #[command(subcommand)]
         action: StorageCommand,
+    },
+    /// VM image bundles. See docs/VM_INSTANCES.md.
+    Image {
+        #[command(subcommand)]
+        action: ImageCommand,
     },
     Artifacts {
         #[arg(long)]
@@ -263,6 +275,24 @@ enum Command {
     #[command(hide = true)]
     Supervise {
         dir: PathBuf,
+    },
+    /// One VM's runner process, started detached by a driver. See `docs/VM_DRIVERS.md`.
+    #[command(hide = true)]
+    DriverRunner {
+        backend: String,
+        dir: PathBuf,
+        #[arg(long)]
+        lock_fd: Option<i32>,
+        #[arg(long)]
+        restore: Option<PathBuf>,
+    },
+    /// Runs a command in a VM through Fleet's guest agent, with this process's stdio, and exits
+    /// with its status.
+    #[command(hide = true)]
+    GuestExec {
+        instance_dir: PathBuf,
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
     },
     #[command(hide = true)]
     InstanceController {
@@ -548,6 +578,32 @@ async fn run(args: Args) -> Result<()> {
             None => return Ok(()),
         },
         Command::Cluster { action } => return fleet::control::admin::run(action).await,
+        Command::Image { action } => {
+            let bundle = match action {
+                ImageCommand::Digest { bundle } => bundle,
+                ImageCommand::ImportTart { tart_vm, bundle } => {
+                    #[cfg(not(target_os = "macos"))]
+                    anyhow::bail!(
+                        "importing {} into {} needs macOS",
+                        tart_vm.display(),
+                        bundle.display()
+                    );
+                    #[cfg(target_os = "macos")]
+                    {
+                        fleet::driver::vz::import_tart(&tart_vm, &bundle)?;
+                        bundle
+                    }
+                }
+            };
+            let entry = fleet::instances::Image {
+                digest: fleet::driver::bundle::digest(&bundle)?,
+                guest: fleet::instances::Image::declared_guest(&bundle)
+                    .unwrap_or(fleet::driver::GuestOs::Macos),
+                bundle: bundle.canonicalize()?,
+            };
+            println!("{}", serde_json::to_string(&entry)?);
+            return Ok(());
+        }
         Command::Client {
             action: ClientCommand::Import { config, key },
         } => {
@@ -631,6 +687,33 @@ async fn run(args: Args) -> Result<()> {
             };
         }
         Command::Supervise { dir } => return fleet::supervise::run(&dir),
+        Command::DriverRunner {
+            backend,
+            dir,
+            lock_fd,
+            restore,
+        } => {
+            let args = fleet::driver::runner::Args {
+                dir,
+                lock_fd,
+                restore,
+            };
+            return match backend.as_str() {
+                "fake" => fleet::driver::fake::run(args),
+                other => anyhow::bail!("unknown driver backend {other:?}"),
+            };
+        }
+        Command::GuestExec { instance_dir, argv } => {
+            let stream = fleet::driver::connect_guest(&instance_dir, fleet::driver::AGENT_PORT)?;
+            let code = fleet_guest::agent::client(
+                stream,
+                &argv,
+                std::io::stdin(),
+                std::io::stdout().lock(),
+                std::io::stderr().lock(),
+            )?;
+            std::process::exit(code);
+        }
         Command::InstanceController { instance_home, id } => {
             return fleet::instances::run_controller(&instance_home, &id);
         }

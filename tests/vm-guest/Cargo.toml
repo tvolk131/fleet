@@ -1,0 +1,16 @@
+[package]
+name = "fleet-test-guest"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Built for aarch64-unknown-linux-musl by build.sh, never as part of the Fleet workspace.
+[workspace]
+
+[dependencies]
+libc = "0.2"
+fleet-guest = { path = "../../crates/fleet-guest" }
+
+[profile.release]
+opt-level = "s"
+strip = true

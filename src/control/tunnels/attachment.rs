@@ -21,7 +21,7 @@ use tokio::{io::AsyncReadExt, process::Child};
 pub enum Attachment {
     #[default]
     Host,
-    Tart {
+    Vm {
         worker_home: PathBuf,
         worker_identity: EndpointId,
         worker_incarnation: String,
@@ -32,7 +32,7 @@ pub enum Attachment {
 }
 impl Attachment {
     pub fn lock(&self) -> Result<Option<instances::Lock>> {
-        let Self::Tart {
+        let Self::Vm {
             worker_home,
             instance,
             ..
@@ -69,7 +69,7 @@ impl Attachment {
             record.job.is_none(),
             "attach persistent instances; disposable job attachments are not supported yet"
         );
-        Ok(Self::Tart {
+        Ok(Self::Vm {
             worker_home,
             worker_identity: config.registration.peer.identity,
             worker_incarnation: config.registration.incarnation,
@@ -78,7 +78,7 @@ impl Attachment {
         })
     }
     pub fn check(&self, cluster: &str) -> Result<Option<u64>> {
-        let Self::Tart {
+        let Self::Vm {
             worker_home,
             worker_identity,
             worker_incarnation,
@@ -113,7 +113,7 @@ impl Attachment {
         let revision = self
             .check(&view.cluster)?
             .context("expected VM attachment")?;
-        let Self::Tart {
+        let Self::Vm {
             worker_home,
             instance,
             ..
@@ -141,8 +141,8 @@ impl Attachment {
         config.validate()?;
         let backend = worker_home.join("backend");
         let id = instance.clone();
-        // Helper installation is bounded and operates only through the fixed Tart
-        // executable and generated guest path. No guest-provided host command runs.
+        // Helper installation is bounded and operates only through Fleet's guest agent
+        // and a generated guest path. No guest-provided host command runs.
         let mut command =
             tokio::task::spawn_blocking(move || instances::guest::command(&backend, &id)).await??;
         ensure!(
@@ -235,7 +235,7 @@ pub struct Guest {
 }
 impl Guest {
     pub async fn shutdown(&mut self) {
-        // Join the host Tart process before acknowledging enforcement. A guest
+        // Join the host guest-exec process before acknowledging enforcement. A guest
         // can retain arbitrary local listeners, but its old host channel is gone.
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;

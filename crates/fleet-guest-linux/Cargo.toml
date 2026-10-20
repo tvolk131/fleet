@@ -1,0 +1,17 @@
+[package]
+name = "fleet-guest-linux"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# `fleet-guest` for aarch64 Linux guests, installed beside Fleet as `fleet-guest-linux`:
+#   cd crates/fleet-guest-linux && cargo build --release --locked --target aarch64-unknown-linux-musl
+# Never part of the Fleet workspace, so host builds cannot produce a host binary under this name.
+[workspace]
+
+[dependencies]
+fleet-guest = { path = "../fleet-guest" }
+
+[profile.release]
+opt-level = "s"
+strip = true

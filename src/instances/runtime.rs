@@ -1,5 +1,5 @@
 //! Pinned guest platform and capabilities shared by worker admission and the control plane.
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -14,8 +14,8 @@ pub struct Platform {
 impl Platform {
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.os == "macos" && self.arch == "aarch64",
-            "portable jobs require macos/aarch64 guests"
+            matches!(self.os.as_str(), "macos" | "linux") && self.arch == "aarch64",
+            "portable jobs require macos/aarch64 or linux/aarch64 guests"
         );
         ensure!(
             self.capabilities.len() <= 64
@@ -33,24 +33,13 @@ impl Platform {
 #[serde(deny_unknown_fields)]
 pub struct Runtime {
     pub platform: Platform,
-    /// sha256: followed by the exact immutable OCI manifest digest, independent of catalog alias.
+    /// The image bundle's content digest (`crate::driver::bundle`), independent of catalog alias.
     pub image_digest: String,
 }
 impl Runtime {
     pub fn validate(&self) -> Result<()> {
         self.platform.validate()?;
-        let digest = self
-            .image_digest
-            .strip_prefix("sha256:")
-            .context("image digest must start with sha256:")?;
-        ensure!(
-            digest.len() == 64
-                && digest
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-            "invalid image digest"
-        );
-        Ok(())
+        crate::driver::bundle::validate(&self.image_digest)
     }
     pub fn accepts(&self, available: &Self) -> Result<()> {
         self.validate()?;

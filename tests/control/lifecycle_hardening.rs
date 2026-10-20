@@ -18,7 +18,7 @@ fn all_job_admission_paths_reject_missing_portable_bundles_and_reserved_inputs()
             arch: "aarch64".into(),
             capabilities: BTreeSet::new(),
         },
-        image_digest: format!("sha256:{}", "a".repeat(64)),
+        image_digest: format!("blake3:{}", "a".repeat(64)),
     };
     worker.runtimes.insert("macos".into(), runtime.clone());
     let mut submission = queue_tests::queued("portable");

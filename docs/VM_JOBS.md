@@ -1,14 +1,24 @@
 # VM jobs
 
-A job with a `vm` specification runs in a disposable Tart VM. The replicated control plane owns the
+A job with a `vm` specification runs in a disposable VM. The replicated control plane owns the
 logical job and its attempts; the worker stages verified inputs, executes the command, captures outputs,
 and confirms VM deletion before releasing the reservation. Native jobs use the trusted process backend.
 All roles use the same qualified Fleet version. See [normal setup](NORMAL_FLEET.md).
 
 ## Submission
 
-Configure the worker's pinned image catalog and Softnet as described in [VM instances](VM_INSTANCES.md).
-The image needs Tart's guest agent. Install the matching `fleet-guest` executable beside the host Fleet binary; Fleet copies it into each VM through Tart's command channel. No guest interpreter is required.
+Configure the worker's pinned image catalog as described in [VM instances](VM_INSTANCES.md).
+The image needs Fleet's guest agent (`contrib/install-guest-agent.sh`). Install the matching `fleet-guest` executable beside the host Fleet binary; Fleet copies it into each VM through the agent. For Linux images, also install a `fleet-guest` built for the guest as `fleet-guest-linux`:
+
+```sh
+rustup target add aarch64-unknown-linux-musl
+(cd crates/fleet-guest-linux && cargo build --release --locked --target aarch64-unknown-linux-musl)
+cp crates/fleet-guest-linux/target/aarch64-unknown-linux-musl/release/fleet-guest-linux "$(dirname "$(command -v fleet)")/"
+```
+
+CI builds it the same way and ships it in the binaries archive.
+
+No guest interpreter is required; installing the helper uses the guest's `/bin/sh`.
 
 ```json
 {
@@ -38,7 +48,7 @@ if the original files change. There is no direct scheduling fallback when the co
 Arguments and environment are data, with no implicit shell. The guest runs as its image's guest-agent
 user in a fresh working directory. Relative executables refer to staged files. No host directories are
 mounted. Fleet reserves the full VM vCPU/RAM/disk allocation; GPU exclusivity is Fleet admission policy,
-not hardware partitioning. Every macOS VM has GPU access. Jobs share capacity with persistent instances
+not hardware partitioning. Every macOS VM has GPU access; Linux VMs have none. Jobs share capacity with persistent instances
 and native workloads; a job's VM is counted only once. There is no automatic preemption or rerun.
 
 ## Metrics and output
@@ -59,7 +69,7 @@ Programs can write JSON-lines metrics and ordinary files without an SDK or netwo
 ```
 
 Add these fields to the job definition. The worker observes bounded guest output manifests and probe
-samples through Tart's local guest channel. Host-side checks reject unsafe paths, symlinks, oversized
+samples through the guest agent's vsock channel. Host-side checks reject unsafe paths, symlinks, oversized
 files, and malformed metric data. Same-size output replacements are distinguished by content/version;
 unchanged files are not downloaded again. The worker's numbered event log supports reconnection from a
 saved cursor. Logs and metrics remain outside Raft; the current GUI displays them through the worker data API.
@@ -72,11 +82,11 @@ the worker.
 ## Completion and recovery
 
 Timeout, cancellation, guest failure, and output validation failure all require VM cleanup before a
-terminal observation releases capacity. Cancellation during image cloning does not wait for the full
-download. A supervisor restart reconciles existing guest operations; an uncertain execution is never
+terminal observation releases capacity. Cancellation during image verification or cloning does not wait for
+it to finish. A supervisor restart reconciles existing guest operations; an uncertain execution is never
 replayed. Committed outputs survive cancellation. Checkpoints use the explicit
 [checkpoint and resume contract](CHECKPOINT_JOBS.md), with a new attempt after confirmed cleanup.
-[Portable Tart jobs](PORTABLE_JOBS.md) support cooperative cross-worker resume with durable inputs and
+[Portable VM jobs](PORTABLE_JOBS.md) support cooperative cross-worker resume with durable inputs and
 explicit compatibility. Native pause, lost-worker takeover and automatic checkpoint selection/preemption
 are not public job operations.
 

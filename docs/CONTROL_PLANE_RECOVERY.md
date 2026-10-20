@@ -177,13 +177,13 @@ cargo test --features control-plane --locked --test control -- --test-threads=1
 
 The recovery tests cover missing committed history, an unapplied Raft suffix, old request retries,
 released receipts, signed trust changes, old replica rejection, atomic inventory conflicts, quarantined
-workers, native supervisor continuity, persistent Tart fixtures, held VM assignments and normal growth
+workers, native supervisor continuity, persistent fake-driver VMs, held VM assignments and normal growth
 back to three voters. Before admitting learners, a recovered cluster snapshots its seeded state and
 compacts the log prefix. A new replica must receive that snapshot: replaying only the new incarnation's
 log would omit the recovered history. Regression coverage cold-restarts the new majority with the
 original survivor offline and checks historical jobs, receipts, provenance and unknown-request refusal.
 The tests also cover repeated recovery, interrupted worker rebinding, durable launch pause and refusal
-of automatic backend repair during recovery. Tart fixture tests do not claim additional Apple hypervisor qualification.
+of automatic backend repair during recovery. Fake-driver tests do not claim additional Apple hypervisor qualification.
 
 A separate process canary uses the actual CLI, three controller processes, worker SIGKILL, a deliberately
 stale recovery source, a tiny native job, explicit client/worker rebinding, cancellation and verified

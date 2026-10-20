@@ -30,7 +30,7 @@ pub struct JobSpec {
     pub metric_files: Vec<String>,
     #[serde(default)]
     pub history: crate::history::Policy,
-    /// Absent executes as a trusted native process; present provisions one disposable Tart VM.
+    /// Absent executes as a trusted native process; present provisions one disposable VM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm: Option<crate::instances::Spec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

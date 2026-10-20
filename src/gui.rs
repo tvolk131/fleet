@@ -1849,7 +1849,7 @@ mod tests {
         let mut app = sample();
         app.jobs[0]["phase"] = json!("suspended");
         app.jobs[0]["portable"] =
-            json!({"platform":{"os":"macos","arch":"aarch64"},"image_digest":"sha256:example"});
+            json!({"platform":{"os":"macos","arch":"aarch64"},"image_digest":"blake3:example"});
         app.jobs[0]["portable_ready"] = json!(true);
         app.jobs[0]["resume_targets"] =
             json!({"compatible":null,"wrong-image":"VM image digest differs"});

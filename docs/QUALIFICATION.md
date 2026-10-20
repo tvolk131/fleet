@@ -11,7 +11,7 @@ target/debug/fleet-qualify --help
 ```
 
 `fleet-qualify` and `fleet-import-baseline` belong to the unpublished `fleet-tools` workspace package.
-The fake Tart and workload helpers require `qualification`; this feature also enables the explicit
+The workload helper requires `qualification`; this feature also enables the explicit
 local partition-file option on `fleet cluster serve`. Product builds use `--features gui` or the
 default control-plane features, not `--all-features`.
 
@@ -29,8 +29,8 @@ build explicit future-version fixtures and qualify live work, rollback and incom
 The million-receipt snapshot/restore test runs on Linux. Branch pushes with an open PR do not start a
 second identical full workflow; PRs, main pushes and manual dispatch are supported.
 
-Fake Tart tests exercise Fleet's contracts without claiming hypervisor or physical network isolation.
-Real Tart and multi-machine tests remain separate. CI uploads logs and allowlisted reports, never
+Fake-driver tests exercise Fleet's contracts without claiming hypervisor or physical network isolation.
+Real `vz` VM and multi-machine tests remain separate. CI uploads logs and allowlisted reports, never
 fixture homes containing keys or databases. Private local deployment evidence and database backups
 remain ignored under `docs/qualification` or the installation's release directories.
 

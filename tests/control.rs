@@ -1521,6 +1521,7 @@ fn simulation_registration(identity: iroh::EndpointId) -> fleet::control::worklo
             vm_slots: 0,
         },
         images: BTreeSet::new(),
+        linux_images: BTreeSet::new(),
         tags: BTreeSet::new(),
     }
 }
