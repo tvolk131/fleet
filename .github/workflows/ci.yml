@@ -36,13 +36,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Rust toolchain
-        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy --target aarch64-unknown-linux-musl
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
+            crates/fleet-guest-linux/target
           key: fleet-${{ runner.os }}-1.99-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
           restore-keys: fleet-${{ runner.os }}-1.99-${{ hashFiles('Cargo.lock') }}-
       - name: Linux GUI build dependencies
@@ -61,10 +62,14 @@ jobs:
       - name: Million-receipt snapshot and restore qualification
         if: runner.os == 'Linux'
         run: cargo test --all-features --locked --test control indexed::indexed_million_receipts -- --ignored --nocapture --test-threads=1 2>&1 | tee indexed-scale.log
+      - name: Guest helper for Linux VMs
+        working-directory: crates/fleet-guest-linux
+        run: cargo build --release --locked --target aarch64-unknown-linux-musl
       - name: Package headless qualification binaries
         run: |
           cargo build --bin fleet --no-default-features --features control-plane,qualification --locked
-          tar -czf fleet-binaries.tar.gz -C target/debug fleet fleet-guest fleet-runner-vz fleet-test-workload fleet-qualify fleet-import-baseline
+          cp crates/fleet-guest-linux/target/aarch64-unknown-linux-musl/release/fleet-guest-linux target/debug/
+          tar -czf fleet-binaries.tar.gz -C target/debug fleet fleet-guest fleet-guest-linux fleet-runner-vz fleet-test-workload fleet-qualify fleet-import-baseline
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-${{ matrix.os }}

@@ -11,9 +11,12 @@ Configure the worker's pinned image catalog as described in [VM instances](VM_IN
 The image needs Fleet's guest agent (`contrib/install-guest-agent.sh`). Install the matching `fleet-guest` executable beside the host Fleet binary; Fleet copies it into each VM through the agent. For Linux images, also install a `fleet-guest` built for the guest as `fleet-guest-linux`:
 
 ```sh
-cargo build --release --locked -p fleet-guest --target aarch64-unknown-linux-musl
-cp target/aarch64-unknown-linux-musl/release/fleet-guest "$(dirname "$(command -v fleet)")/fleet-guest-linux"
+rustup target add aarch64-unknown-linux-musl
+(cd crates/fleet-guest-linux && cargo build --release --locked --target aarch64-unknown-linux-musl)
+cp crates/fleet-guest-linux/target/aarch64-unknown-linux-musl/release/fleet-guest-linux "$(dirname "$(command -v fleet)")/"
 ```
+
+CI builds it the same way and ships it in the binaries archive.
 
 No guest interpreter is required; installing the helper uses the guest's `/bin/sh`.
 
